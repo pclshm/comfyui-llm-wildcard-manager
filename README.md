@@ -4,12 +4,13 @@ A small set of ComfyUI nodes that fill `__wildcard__` slots in a template by
 either reusing values from disk or asking an LLM to invent new ones — with
 explicit anti-repetition.
 
-**Three nodes:**
+**Four nodes:**
 
 | Node | Purpose |
 |------|---------|
 | 🎲 LLM Wildcard Resolver       | The core: resolves `__wildcard__` slots using cache + LLM. |
-| 🎲 LLM Wildcard Prompt Config  | Override the LLM system prompt and define category descriptions in-graph. |
+| 🎲 LLM Wildcard Manager        | **Central management.** Pick a generation *direction* from a preset, manage every category description, and inspect the entries currently on disk per category — all in one node. Drop-in replacement for the Prompt Config. |
+| 🎲 LLM Wildcard Prompt Config  | Lower-level alternative to the Manager: override the LLM system prompt and define category descriptions in-graph. |
 | 🎲 LLM Wildcard Report         | Parse the resolver's report into counts (`generated`, `reused`, `errors`, `total`) and a clean summary. |
 
 ## Why this exists
@@ -128,6 +129,60 @@ Full pipeline with prompt config + report:
 Your downstream prompt generator's "Change this prompt:" instruction now
 operates on a freshly varied prompt every queue run, so it can't iterate on
 the same input.
+
+### LLM Wildcard Manager (recommended)
+
+One node to manage everything: category descriptions, the generation
+*direction*, and a live view of every value already on disk per category.
+
+Inputs:
+
+- **`direction`** — combo over a set of pre-baked steering presets (no need to
+  hand-write flair every time):
+  - `none` · `photoreal` · `cinematic` · `editorial` · `vintage_film` · `noir`
+  - `cyberpunk` · `fantasy` · `anime` · `dreamlike` · `minimal` · `sfw_strict`
+- **`extra_flair`** — optional extra steering text appended after the preset.
+- **`system_prompt_override`** — leave empty to use the built-in system prompt.
+- **`categories`** — JSON object of `{name: description}`. Edited via the table
+  UI on the node (so headless / API workflows still work).
+- **`report`** *(optional input)* — wire `LLM Wildcard Resolver.report` into
+  this socket and the latest report renders inside the Manager body. (You will
+  need a *second* Manager instance for this — one upstream of the Resolver to
+  provide `prompts`, one downstream to display the report. ComfyUI graphs are
+  acyclic, so a single instance can't do both at once.)
+
+UI:
+
+- Each category row shows: name · description · entry count · expand button.
+- Click ▸ on a row to inspect every value currently stored on disk for that
+  category. Click **↻ Refresh disk** to re-read the wildcards folder without
+  re-queuing the workflow.
+- The disk path of the wildcards folder is shown at the top so it is always
+  obvious where entries are being written.
+
+Outputs:
+
+- `prompts` — wire to the Resolver's optional `prompts` input. Drop-in
+  replacement for the Prompt Config bundle.
+- `summary` — passthrough of the report text (only meaningful when `report` is
+  wired in).
+
+Recommended wiring:
+
+```
+[LLM Wildcard Manager] --prompts--> [LLM Wildcard Resolver] --report--> [LLM Wildcard Report]
+                                              |
+                                              +--resolved_prompt-->  [CLIP Text Encode]
+```
+
+Or — to centralise both the configuration *and* the report inside Manager
+nodes — use two Manager instances:
+
+```
+[Manager #1 (config)] --prompts--> [Resolver] --report--> [Manager #2 (display)]
+                                          |
+                                          +--resolved_prompt--> [CLIP Text Encode]
+```
 
 ### LLM Wildcard Prompt Config
 

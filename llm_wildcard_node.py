@@ -160,6 +160,88 @@ SYSTEM_PROMPT = (
 )
 
 
+# -----------------------------------------------------------------------------
+# Direction presets — pre-baked "flair" lines so users don't have to write
+# steering text by hand. Selected via a combo on LLMWildcardManager.
+# -----------------------------------------------------------------------------
+DIRECTION_PRESETS: dict[str, str] = {
+    "none": "",
+    "photoreal": "Strict photorealism. Plausible anatomy, realistic light, no stylization.",
+    "cinematic": "Cinematic framing, dramatic lighting, filmic colour grading. Avoid clichés.",
+    "editorial": "Editorial fashion photography aesthetic, polished and magazine-grade.",
+    "vintage_film": "Vintage analog film look — 70s/80s tones, soft grain, slightly faded.",
+    "noir": "Film noir — high-contrast monochrome feel, shadow play, mystery.",
+    "cyberpunk": "Lean cyberpunk neon noir, dystopian futurism, no clichés.",
+    "fantasy": "High fantasy setting, painterly atmosphere, mythic feel.",
+    "anime": "Stylized anime/manga aesthetic, clean lineart, expressive features.",
+    "dreamlike": "Surreal dreamlike atmosphere, ethereal, soft-focus.",
+    "minimal": "Minimal, restrained palette and composition. Nothing busy.",
+    "sfw_strict": "Keep all output strictly SFW. No suggestive phrasing.",
+}
+
+
+# -----------------------------------------------------------------------------
+# Disk snapshot — used by the Manager UI to show every category and its entries
+# -----------------------------------------------------------------------------
+def list_disk_categories() -> dict[str, list[str]]:
+    """Return every wildcard file currently on disk: {name: [values...]}.
+
+    Skips dotfiles and any file that isn't ``.txt``.
+    """
+    out: dict[str, list[str]] = {}
+    if not WILDCARDS_DIR.exists():
+        return out
+    for p in sorted(WILDCARDS_DIR.glob("*.txt")):
+        if p.name.startswith("."):
+            continue
+        out[p.stem] = read_wildcard_file(p.stem)
+    return out
+
+
+def build_manager_snapshot(categories: dict, direction: str = "none",
+                           extra_flair: str = "",
+                           report: str | None = None) -> dict:
+    """Snapshot the manager state for the JS frontend."""
+    disk = list_disk_categories()
+    # Union of: declared categories + DEFAULT_CATEGORIES + categories that
+    # already exist on disk. The UI shows them all so nothing is hidden.
+    names = sorted(set(categories) | set(DEFAULT_CATEGORIES) | set(disk))
+    rows = []
+    for name in names:
+        rows.append({
+            "name": name,
+            "description": categories.get(name, DEFAULT_CATEGORIES.get(name, "")),
+            "entries": disk.get(name, []),
+            "count": len(disk.get(name, [])),
+            "on_disk": name in disk,
+        })
+    return {
+        "wildcards_dir": str(WILDCARDS_DIR),
+        "direction": direction,
+        "direction_text": DIRECTION_PRESETS.get(direction, ""),
+        "extra_flair": extra_flair,
+        "report": report or "",
+        "rows": rows,
+    }
+
+
+# -----------------------------------------------------------------------------
+# Optional ComfyUI server endpoint so the Manager UI can refresh disk state
+# without needing to re-queue the workflow. Safe no-op if the import fails.
+# -----------------------------------------------------------------------------
+try:
+    from server import PromptServer  # type: ignore
+    from aiohttp import web as _aiohttp_web  # type: ignore
+
+    @PromptServer.instance.routes.get("/llm_wildcard/state")
+    async def _llm_wildcard_state(_request):
+        return _aiohttp_web.json_response(
+            build_manager_snapshot(load_category_config())
+        )
+except Exception:  # pragma: no cover — running outside ComfyUI
+    pass
+
+
 def _clean_llm_value(raw: str) -> str:
     if not raw:
         return ""
@@ -532,13 +614,141 @@ class LLMWildcardReport:
         }
 
 
+# =============================================================================
+# Node 4: LLMWildcardManager
+# Central place to manage everything: category descriptions, generated entries
+# (read live from disk), a "direction" preset (so the user doesn't have to
+# write steering text by hand), and an optional report passthrough that gets
+# rendered inside the same node.
+#
+# Wire it into the Resolver's `prompts` socket — it is a drop-in replacement
+# for LLMWildcardPromptConfig and provides the same WILDCARD_PROMPTS bundle.
+# =============================================================================
+class LLMWildcardManager:
+    """ComfyUI node: central management for wildcard categories, entries,
+    direction presets, and (optionally) the resolver's report.
+
+    UI features (rendered by web/llm_wildcard.js):
+      * Direction preset combo — fills in steering text for the LLM.
+      * Categories table — name + description per row, with an expand button
+        that shows the entries currently on disk for that category.
+      * "Refresh from disk" button — re-fetches the disk snapshot via the
+        /llm_wildcard/state endpoint so newly-generated entries appear without
+        needing to re-queue the workflow.
+      * If the optional `report` input is connected, the latest report is
+        rendered inside the node body too.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        directions = list(DIRECTION_PRESETS.keys())
+        return {
+            "required": {
+                "direction": (directions, {"default": "none"}),
+                "extra_flair": ("STRING", {
+                    "multiline": True,
+                    "default": "",
+                    "placeholder": (
+                        "Optional extra steering, appended to the chosen direction.\n"
+                        "Leave empty to use only the preset (or 'none' for default)."
+                    ),
+                }),
+                "system_prompt_override": ("STRING", {
+                    "multiline": True,
+                    "default": "",
+                    "placeholder": (
+                        "Leave empty to use the built-in system prompt. "
+                        "Fill to fully replace it (advanced)."
+                    ),
+                }),
+                "categories": ("STRING", {
+                    "multiline": True,
+                    "default": "{}",
+                    "placeholder": "Edited via the table UI on the node.",
+                }),
+            },
+            "optional": {
+                "report": ("STRING", {"multiline": True, "forceInput": True}),
+            },
+        }
+
+    RETURN_TYPES = ("WILDCARD_PROMPTS", "STRING")
+    RETURN_NAMES = ("prompts", "summary")
+    FUNCTION = "manage"
+    CATEGORY = "prompt/wildcards"
+    OUTPUT_NODE = True
+
+    def manage(self, direction, extra_flair, system_prompt_override,
+               categories, report=None):
+        direction = (direction or "none").strip() or "none"
+        preset = DIRECTION_PRESETS.get(direction, "")
+        extra = (extra_flair or "").strip()
+        flair_parts = [p for p in (preset, extra) if p]
+        flair = "\n".join(flair_parts)
+
+        override = (system_prompt_override or "").strip()
+        base = override if override else SYSTEM_PROMPT
+        effective = base + (
+            f"\n\nAdditional direction from the user:\n{flair}" if flair else ""
+        )
+
+        cats: dict = {}
+        text = (categories or "").strip()
+        if text:
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, dict):
+                    cats = {str(k): str(v) for k, v in parsed.items()
+                            if str(k).strip()}
+                else:
+                    print("[LLMWildcardManager] categories must be a JSON object")
+            except Exception as e:
+                print(f"[LLMWildcardManager] Bad categories JSON: {e}")
+
+        # Persist current categories to disk so the Resolver-only path picks
+        # them up too. We merge with whatever is already there so we never
+        # lose entries the user added through the legacy PromptConfig flow.
+        merged_disk = load_category_config()
+        merged_disk.update(cats)
+        try:
+            CONFIG_PATH.write_text(
+                json.dumps(merged_disk, indent=2), encoding="utf-8"
+            )
+        except Exception as e:
+            print(f"[LLMWildcardManager] Could not persist categories: {e}")
+
+        bundle = {
+            "system_prompt": effective,
+            "flair": flair,
+            "category_overrides": cats,
+        }
+
+        snapshot = build_manager_snapshot(
+            merged_disk, direction=direction, extra_flair=extra, report=report,
+        )
+        summary = (report or "").strip()
+
+        return {
+            # web/llm_wildcard.js reads this to render the table + report.
+            "ui": {"manager_state": [json.dumps(snapshot)]},
+            "result": (bundle, summary),
+        }
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        # Always re-execute so disk state is refreshed in the UI on every run.
+        return float("nan")
+
+
 NODE_CLASS_MAPPINGS = {
     "LLMWildcardResolver": LLMWildcardResolver,
     "LLMWildcardPromptConfig": LLMWildcardPromptConfig,
     "LLMWildcardReport": LLMWildcardReport,
+    "LLMWildcardManager": LLMWildcardManager,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LLMWildcardResolver": "🎲 LLM Wildcard Resolver",
     "LLMWildcardPromptConfig": "🎲 LLM Wildcard Prompt Config",
     "LLMWildcardReport": "🎲 LLM Wildcard Report",
+    "LLMWildcardManager": "🎲 LLM Wildcard Manager",
 }
