@@ -4,12 +4,13 @@ A small set of ComfyUI nodes that fill `__wildcard__` slots in a template by
 either reusing values from disk or asking an LLM to invent new ones — with
 explicit anti-repetition.
 
-**Three nodes:**
+**Four nodes:**
 
 | Node | Purpose |
 |------|---------|
 | 🎲 LLM Wildcard Resolver       | The core: resolves `__wildcard__` slots using cache + LLM. |
-| 🎲 LLM Wildcard Prompt Config  | Override the LLM system prompt and define category descriptions in-graph. |
+| 🎲 LLM Wildcard Manager        | **Central management.** Pick a generation *direction* from a preset, manage every category description, and inspect the entries currently on disk per category — all in one node. Drop-in replacement for the Prompt Config. |
+| 🎲 LLM Wildcard Prompt Config  | Lower-level alternative to the Manager: override the LLM system prompt and define category descriptions in-graph. |
 | 🎲 LLM Wildcard Report         | Parse the resolver's report into counts (`generated`, `reused`, `errors`, `total`) and a clean summary. |
 
 ## Why this exists
@@ -128,6 +129,61 @@ Full pipeline with prompt config + report:
 Your downstream prompt generator's "Change this prompt:" instruction now
 operates on a freshly varied prompt every queue run, so it can't iterate on
 the same input.
+
+### LLM Wildcard Manager (recommended)
+
+One node to manage everything: category descriptions, the generation
+*direction*, and a live view of every value already on disk per category.
+
+Inputs:
+
+- **`direction`** — *free-text with autocomplete*. Pick from the built-in
+  preset keys for one-click steering:
+  - `none` · `photoreal` · `cinematic` · `editorial` · `vintage_film` · `noir`
+  - `cyberpunk` · `fantasy` · `anime` · `dreamlike` · `minimal` · `sfw_strict`
+
+  …or just type your own steering text directly into the field and it will be
+  used verbatim. The hint line under the input tells you which mode you're in.
+- **`extra_flair`** — optional extra steering, appended after the direction.
+- **`system_prompt_override`** — leave empty to use the built-in system prompt.
+- **`categories`** — JSON object of `{name: description}`. Edited via the table
+  UI on the node (so headless / API workflows still work).
+- **`report`** *(optional input)* — wire `LLM Wildcard Resolver.report` here
+  and the report renders inside the Manager body. **You don't need to wire it
+  for the report to show up though** — every Resolver run also writes the
+  latest report to `wildcards/.last_report.txt`, and the Manager picks that
+  up automatically on its next execution or via **↻ Refresh disk**.
+
+UI:
+
+- Each category row shows: name · description · entry-count badge · expand
+  button. Badge colour scales with the entry count (low / mid / high) so
+  you can scan the table at a glance.
+- Click ▸ on a row to inspect every value currently stored on disk for that
+  category. Click **↻ Refresh disk** to re-read the wildcards folder without
+  re-queuing the workflow.
+- The disk path of the wildcards folder is shown at the top so it is always
+  obvious where entries are being written.
+- The latest resolver report (from disk or the wired `report` input) renders
+  in a panel at the bottom of the node.
+
+Outputs:
+
+- `prompts` — wire to the Resolver's optional `prompts` input. Drop-in
+  replacement for the Prompt Config bundle.
+- `summary` — passthrough of the report text shown in the node.
+
+Recommended wiring (a *single* Manager handles both ends):
+
+```
+[LLM Wildcard Manager] --prompts--> [LLM Wildcard Resolver] --resolved_prompt--> [CLIP Text Encode]
+```
+
+That's it — the Resolver writes its report to `wildcards/.last_report.txt`,
+and the Manager shows it on the next run / refresh. No second Manager needed,
+no graph cycle. If you prefer an explicit edge, you can still wire the
+Resolver's `report` output into the Manager's optional `report` input (use a
+separate downstream Manager instance to avoid a cycle).
 
 ### LLM Wildcard Prompt Config
 
