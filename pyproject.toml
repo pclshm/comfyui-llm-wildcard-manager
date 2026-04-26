@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "comfyui-llm-wildcard-manager"
+version = "0.2.0"
+description = "Resolves __wildcard__ slots in ComfyUI prompts via cache + LLM, with per-slot isolation and anti-repetition."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+]
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/YOUR_GITHUB_USER/comfyui-llm-wildcard-manager"
+Issues = "https://github.com/YOUR_GITHUB_USER/comfyui-llm-wildcard-manager/issues"
+
+# https://docs.comfy.org/registry/specifications
+[tool.comfy]
+PublisherId = "TODO_publisher_id"
+DisplayName = "LLM Wildcard Manager"
+Icon = ""
+Tags = ["wildcards", "llm", "ollama", "openai", "prompt"]

@@ -1,0 +1,2 @@
+# No external runtime dependencies — uses only the Python standard library.
+# Listed empty so ComfyUI Manager / package installers see the file.

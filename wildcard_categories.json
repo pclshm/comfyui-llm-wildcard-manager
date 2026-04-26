@@ -1,0 +1,12 @@
+{
+  "hair": "A short visual description of a person's hair: style, length, and color. One concise phrase, no leading article.",
+  "ethnicity": "A single ethnicity or heritage descriptor for a portrait subject. One or two words.",
+  "age": "An age descriptor for a portrait subject, e.g. 'young woman in her 20s' or 'middle-aged woman'.",
+  "activity": "A single sport or active activity, e.g. 'jogging', 'practicing yoga', 'rock climbing'.",
+  "location": "A single outdoor or indoor location suitable for a photoshoot.",
+  "time": "A time-of-day or natural lighting condition.",
+  "weather": "A weather condition, one phrase.",
+  "outfit": "A complete outfit description appropriate to athletic or casual contexts.",
+  "pose": "A pose or body-language description, one phrase.",
+  "style": "A photographic or illustration style modifier set, comma-separated."
+}

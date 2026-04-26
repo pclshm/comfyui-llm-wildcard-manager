@@ -1,0 +1,45 @@
+{
+  "last_node_id": 1,
+  "last_link_id": 0,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "LLMWildcardResolver",
+      "pos": [200, 200],
+      "size": [520, 380],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        { "name": "resolved_prompt", "type": "STRING", "links": null, "slot_index": 0 },
+        { "name": "report",          "type": "STRING", "links": null, "slot_index": 1 }
+      ],
+      "properties": { "Node name for S&R": "LLMWildcardResolver" },
+      "widgets_values": [
+        "Digital illustration of a __age__ __ethnicity__ woman with __hair__, __activity__ at a __location__, __time__, wearing __outfit__, __pose__, __style__, masterpiece, best quality, ultra-detailed",
+        "hybrid",
+        "ollama",
+        "http://localhost:11434",
+        "llama3.1",
+        "",
+        0.9,
+        200,
+        0,
+        ""
+      ]
+    }
+  ],
+  "links": [],
+  "groups": [
+    {
+      "title": "Wire `resolved_prompt` into your CLIPTextEncode (positive prompt).",
+      "bounding": [180, 160, 560, 440],
+      "color": "#3f789e",
+      "font_size": 18
+    }
+  ],
+  "config": {},
+  "extra": {},
+  "version": 0.4
+}
