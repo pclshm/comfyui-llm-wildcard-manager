@@ -192,8 +192,43 @@ function injectStyles() {
             min-width:0; max-width:100%; max-height:140px; overflow:auto;
         }
         .lwm-prompt-panel.lwm-empty { color:#6c7480; font-style:italic; }
+        .lwm-prompt-panel.lwm-error { border-color:#5b2c2c; color:#ff9b9b; }
         .lwm-prompt-panel .lwm-tok { color:#7ec9ff; background:#142235;
             padding:1px 3px; border-radius:3px; }
+        .lwm-status-banner {
+            padding:6px 8px; border-radius:4px; font-size:11.5px;
+            line-height:1.4; border:1px solid #2a2e34; background:#1f2228;
+            color:#cfd3d8;
+        }
+        .lwm-status-banner.lwm-status-parse_failed,
+        .lwm-status-banner.lwm-status-no_prompt,
+        .lwm-status-banner.lwm-status-llm_error {
+            border-color:#5b2c2c; background:#281616; color:#ff9b9b;
+        }
+        .lwm-status-banner.lwm-status-no_wildcards,
+        .lwm-status-banner.lwm-status-salvaged,
+        .lwm-status-banner.lwm-status-fallback_default {
+            border-color:#5b4a2c; background:#2a2316; color:#f5d782;
+        }
+        .lwm-raw-header {
+            cursor:pointer; user-select:none; display:flex; gap:6px;
+            align-items:center;
+        }
+        .lwm-raw-header .lwm-raw-toggle {
+            display:inline-block; transition:transform .12s;
+            width:10px; text-align:center;
+        }
+        .lwm-raw-header.lwm-open .lwm-raw-toggle { transform:rotate(90deg); }
+        .lwm-raw-reply {
+            background:#0f1114; color:#cfd3d8;
+            border:1px solid #262a31; border-radius:4px;
+            padding:6px 8px; font-size:11px; line-height:1.45;
+            font-family: ui-monospace, Menlo, Consolas, monospace;
+            white-space:pre-wrap; word-break:break-word;
+            max-height:240px; overflow:auto; margin:0;
+        }
+        .lwm-raw-reply.lwm-error-border { border-color:#5b2c2c; }
+        .lwm-raw-reply.lwm-empty { color:#6c7480; font-style:italic; }
         .lwm-list { display:flex; flex-direction:column; gap:6px;
             min-width:0; max-width:100%; }
         .lwm-row {
@@ -384,6 +419,32 @@ app.registerExtension({
                 root.appendChild(promptLabel);
                 root.appendChild(promptPanel);
 
+                // ---- status banner (shown only when status != ok) ----
+                const statusBanner = document.createElement("div");
+                statusBanner.className = "lwm-status-banner lwm-fixed";
+                statusBanner.style.display = "none";
+                root.appendChild(statusBanner);
+
+                // ---- raw LLM reply (collapsible) ----
+                const rawHeader = document.createElement("div");
+                rawHeader.className = "lwm-section-label lwm-fixed lwm-raw-header";
+                rawHeader.style.display = "none";
+                rawHeader.innerHTML =
+                    `<span class="lwm-raw-toggle">▸</span>` +
+                    `<span>Last LLM raw reply</span>`;
+                root.appendChild(rawHeader);
+
+                const rawPanel = document.createElement("pre");
+                rawPanel.className = "lwm-raw-reply lwm-fixed";
+                rawPanel.style.display = "none";
+                root.appendChild(rawPanel);
+
+                rawHeader.addEventListener("click", () => {
+                    const open = rawHeader.classList.toggle("lwm-open");
+                    rawPanel.style.display = open ? "block" : "none";
+                    updateManagerSize();
+                });
+
                 // ---- categories toolbar (fixed) ----
                 const headLabel = document.createElement("div");
                 headLabel.className = "lwm-section-label lwm-fixed";
@@ -518,17 +579,65 @@ app.registerExtension({
                     return row;
                 }
 
-                function renderPrompt(template) {
+                const FAILURE_PROMPT_TEXT = {
+                    parse_failed:
+                        "(LLM did not return parseable JSON — see raw reply below)",
+                    no_prompt:
+                        "(LLM JSON had no 'prompt' field — see raw reply below)",
+                    llm_error:
+                        "(LLM call failed — see raw reply below)",
+                };
+
+                function renderPrompt(template, status) {
                     const t = (template || "").trim();
+                    promptPanel.classList.remove("lwm-error");
                     if (!t) {
                         promptPanel.classList.add("lwm-empty");
-                        promptPanel.textContent =
-                            "(no template yet — queue the workflow to generate)";
+                        if (FAILURE_PROMPT_TEXT[status]) {
+                            promptPanel.classList.add("lwm-error");
+                            promptPanel.textContent = FAILURE_PROMPT_TEXT[status];
+                        } else {
+                            promptPanel.textContent =
+                                "(no template yet — queue the workflow to generate)";
+                        }
                     } else {
                         promptPanel.classList.remove("lwm-empty");
                         promptPanel.innerHTML = renderTemplateHTML(t);
                     }
-                    updateManagerSize();
+                }
+
+                function renderStatus(status, message) {
+                    const isFailure =
+                        status &&
+                        status !== "ok" &&
+                        (message || FAILURE_PROMPT_TEXT[status]);
+                    if (!isFailure) {
+                        statusBanner.style.display = "none";
+                        statusBanner.className = "lwm-status-banner lwm-fixed";
+                        return;
+                    }
+                    statusBanner.style.display = "block";
+                    statusBanner.className =
+                        "lwm-status-banner lwm-fixed lwm-status-" + status;
+                    statusBanner.textContent =
+                        message || `LLM call status: ${status}`;
+                }
+
+                function renderRawReply(raw, status) {
+                    const text = String(raw ?? "");
+                    const hasContent = text.trim().length > 0;
+                    rawPanel.classList.remove("lwm-error-border");
+                    if (status && status !== "ok" && hasContent) {
+                        rawPanel.classList.add("lwm-error-border");
+                    }
+                    rawPanel.textContent = text;
+                    rawHeader.style.display = hasContent ? "" : "none";
+                    // Auto-open on failure so the user sees what came back; on
+                    // success, leave it collapsed unless the user opened it.
+                    if (status && status !== "ok" && hasContent) {
+                        rawHeader.classList.add("lwm-open");
+                        rawPanel.style.display = "block";
+                    }
                 }
 
                 function rebuildFromSnapshot(snapshot) {
@@ -537,7 +646,9 @@ app.registerExtension({
                         pathLine.textContent =
                             `wildcards: ${snapshot.wildcards_dir}`;
                     }
-                    renderPrompt(snapshot?.generated_prompt);
+                    renderPrompt(snapshot?.generated_prompt, snapshot?.status);
+                    renderStatus(snapshot?.status, snapshot?.status_message);
+                    renderRawReply(snapshot?.raw_reply, snapshot?.status);
                     for (const r of (snapshot?.rows || [])) {
                         list.appendChild(buildRow({
                             name: r.name,

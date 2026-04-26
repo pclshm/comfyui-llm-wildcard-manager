@@ -39,6 +39,8 @@ CONFIG_PATH = NODE_DIR / "wildcard_categories.json"
 LAST_REPORT_TXT = WILDCARDS_DIR / ".last_report.txt"
 LAST_REPORT_JSON = WILDCARDS_DIR / ".last_report.json"
 LAST_TEMPLATE_PATH = WILDCARDS_DIR / ".last_template.txt"
+LAST_REPLY_PATH = WILDCARDS_DIR / ".last_reply.json"
+LAST_RESOLVER_PATH = WILDCARDS_DIR / ".last_resolver.json"
 
 
 # -----------------------------------------------------------------------------
@@ -132,7 +134,12 @@ def _http_post_json(url: str, payload: dict, headers: dict, timeout: int = 120) 
     return json.loads(body)
 
 
-def _call_ollama(endpoint: str, model: str, system: str, user: str, temperature: float) -> str:
+def _call_ollama(endpoint: str, model: str, system: str, user: str, temperature: float,
+                 request_json: bool = False, seed: int = 0,
+                 json_schema: dict | None = None) -> str:
+    options = {"temperature": float(temperature)}
+    if seed:
+        options["seed"] = int(seed)
     payload = {
         "model": model,
         "messages": [
@@ -140,15 +147,23 @@ def _call_ollama(endpoint: str, model: str, system: str, user: str, temperature:
             {"role": "user", "content": user},
         ],
         "stream": False,
-        "options": {"temperature": float(temperature)},
+        "options": options,
     }
+    if json_schema is not None:
+        # Ollama 0.5+ accepts a full JSON schema in `format` and grammar-constrains
+        # output to it. Stronger guarantee than the bare "json" mode below.
+        payload["format"] = json_schema
+    elif request_json:
+        payload["format"] = "json"
     url = endpoint.rstrip("/") + "/api/chat"
     body = _http_post_json(url, payload, {"Content-Type": "application/json"})
     return body.get("message", {}).get("content", "").strip()
 
 
 def _call_openai_compatible(endpoint: str, model: str, system: str, user: str,
-                            temperature: float, api_key: str) -> str:
+                            temperature: float, api_key: str,
+                            request_json: bool = False, seed: int = 0,
+                            json_schema: dict | None = None) -> str:
     payload = {
         "model": model or "local-model",
         "messages": [
@@ -157,6 +172,31 @@ def _call_openai_compatible(endpoint: str, model: str, system: str, user: str,
         ],
         "temperature": float(temperature),
     }
+    if seed:
+        payload["seed"] = int(seed)
+    if json_schema is not None:
+        # Send the schema via BOTH paths so any local OpenAI-compat server
+        # gets a strict grammar regardless of which path it honours:
+        #   * llama.cpp's native top-level `json_schema` reliably builds and
+        #     attaches a GBNF grammar to the sampler. Some llama.cpp builds
+        #     accept `response_format` but attach a permissive grammar that
+        #     lets the model emit arbitrary top-level keys.
+        #   * Real OpenAI silently ignores unknown body fields, so the
+        #     top-level `json_schema` is harmless there and `response_format`
+        #     drives its native structured-outputs path.
+        # This means the user no longer has to pick the right backend — both
+        # `llamacpp` and `openai_compatible` get strict enforcement on
+        # llama.cpp servers, and real OpenAI keeps working too.
+        payload["json_schema"] = json_schema
+        payload["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "wildcard_template",
+                "schema": json_schema,
+            },
+        }
+    elif request_json:
+        payload["response_format"] = {"type": "json_object"}
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -166,7 +206,9 @@ def _call_openai_compatible(endpoint: str, model: str, system: str, user: str,
 
 
 def _server_call(server: dict, system: str, user: str,
-                 temperature_override: float | None = None) -> str:
+                 temperature_override: float | None = None,
+                 request_json: bool = False, seed: int = 0,
+                 json_schema: dict | None = None) -> str:
     backend = server.get("backend", "ollama")
     endpoint = server.get("endpoint", "http://localhost:11434")
     model = server.get("model", "")
@@ -175,8 +217,12 @@ def _server_call(server: dict, system: str, user: str,
                  if temperature_override is not None
                  else server.get("temperature", 0.9))
     if backend == "ollama":
-        return _call_ollama(endpoint, model, system, user, temp)
-    return _call_openai_compatible(endpoint, model, system, user, temp, api_key)
+        return _call_ollama(endpoint, model, system, user, temp,
+                            request_json=request_json, seed=seed,
+                            json_schema=json_schema)
+    return _call_openai_compatible(endpoint, model, system, user, temp, api_key,
+                                   request_json=request_json, seed=seed,
+                                   json_schema=json_schema)
 
 
 # -----------------------------------------------------------------------------
@@ -228,31 +274,111 @@ RESOLVER_SYSTEM_PROMPT = (
 
 
 MANAGER_SYSTEM_PROMPT = (
-    "You design a stable-diffusion prompt TEMPLATE that contains ComfyUI wildcard placeholders.\n\n"
-    "The user gives you an example prompt or a high-level idea. You produce:\n"
-    "  1. A prompt template — the user's idea rewritten with __snake_case__ wildcard\n"
-    "     placeholders inserted in the parts that should vary across runs.\n"
-    "  2. A description for each wildcard placeholder, telling a downstream LLM what\n"
-    "     KIND of value belongs there (shape, not specifics).\n\n"
-    "Output ONLY a single JSON object, no markdown fences, no prose, no explanation:\n"
+    "TASK\n"
+    "Rewrite the user's prompt idea by REPLACING noun phrases with\n"
+    "__wildcard__ placeholders. Output a single JSON object — no markdown\n"
+    "fences, no prose before or after, no commentary.\n\n"
+    "CRITICAL CONSTRAINT (failure to follow = invalid output):\n"
+    "  The `prompt` string MUST literally contain at least 3 placeholders\n"
+    "  shaped like __snake_case_name__ (double underscore + name + double\n"
+    "  underscore). If your output contains zero `__` substrings, you have\n"
+    "  failed the task.\n\n"
+    "EXACT OUTPUT SHAPE (only these two top-level keys are allowed):\n"
     "{\n"
-    "  \"prompt\": \"the prompt template with __wildcard__ placeholders inline\",\n"
+    "  \"prompt\": \"<the user's idea, but with __wildcards__ inserted>\",\n"
     "  \"categories\": {\n"
-    "    \"category_name\": \"What shape of value belongs here.\",\n"
-    "    ...\n"
+    "    \"<wildcard_name>\": \"<short shape-of-value description>\"\n"
     "  }\n"
     "}\n\n"
-    "Strict rules:\n"
-    "- Wildcards in `prompt` look like __snake_case_name__ (double underscore each side).\n"
-    "- Every wildcard appearing in `prompt` MUST have a matching key in `categories`.\n"
-    "- Every key in `categories` MUST appear in `prompt` at least once.\n"
-    "- Keep descriptions short and shape-focused (\"a single weather condition\"),\n"
-    "  not example-specific (\"sunny afternoon\").\n"
-    "- Choose categories that actually align with the variance the user wants. Don't\n"
-    "  invent placeholders for parts the user clearly wants fixed.\n"
-    "- Reuse common category names where they fit (hair, age, outfit, location, ...)\n"
-    "  so the wildcard files build up reusable libraries across prompts."
+    "EXAMPLE 1\n"
+    "INPUT: A portrait of a woman doing an outdoor activity, photorealistic, masterpiece.\n"
+    "OUTPUT:\n"
+    "{\n"
+    "  \"prompt\": \"A portrait of a __age__ __ethnicity__ woman with __hair__, "
+    "__activity__ at a __location__, __time__, wearing __outfit__, __pose__, "
+    "__style__, photorealistic, masterpiece\",\n"
+    "  \"categories\": {\n"
+    "    \"age\": \"An age descriptor.\",\n"
+    "    \"ethnicity\": \"A heritage descriptor.\",\n"
+    "    \"hair\": \"Hair style, length, and color.\",\n"
+    "    \"activity\": \"A single active activity.\",\n"
+    "    \"location\": \"An indoor or outdoor location.\",\n"
+    "    \"time\": \"A time-of-day or lighting condition.\",\n"
+    "    \"outfit\": \"An outfit description.\",\n"
+    "    \"pose\": \"A pose or body-language description.\",\n"
+    "    \"style\": \"Photographic or illustration style modifiers.\"\n"
+    "  }\n"
+    "}\n\n"
+    "EXAMPLE 2\n"
+    "INPUT: A cyberpunk samurai walking through neon-lit streets at night.\n"
+    "OUTPUT:\n"
+    "{\n"
+    "  \"prompt\": \"A __era__ __character_class__ __action__ through __setting__ at __time__\",\n"
+    "  \"categories\": {\n"
+    "    \"era\": \"An era or genre descriptor.\",\n"
+    "    \"character_class\": \"A character archetype.\",\n"
+    "    \"action\": \"What the character is doing.\",\n"
+    "    \"setting\": \"The environment or streetscape.\",\n"
+    "    \"time\": \"Time-of-day or atmospheric phase.\"\n"
+    "  }\n"
+    "}\n\n"
+    "WRONG OUTPUTS — do NOT do any of these:\n"
+    "  WRONG: {\"prompt\": \"A polished version of the user's idea.\"}\n"
+    "         (no __wildcards__ — failed the critical constraint)\n"
+    "  WRONG: {\"subject\": \"woman\", \"style\": \"photorealistic\"}\n"
+    "         (flat keys instead of {prompt, categories})\n"
+    "  WRONG: {\"prompt\": \"...\", \"style\": \"...\", \"lighting\": \"...\"}\n"
+    "         (extra top-level keys forbidden — those belong inside prompt or categories)\n"
+    "  WRONG: {\"prompt\": \"...\", \"negative_prompt\": \"...\",\n"
+    "          \"parameters\": {...}, \"wildcard_slots_used\": [\"subject_action\", ...]}\n"
+    "         (this is an image-gen API payload, NOT a wildcard template. The\n"
+    "          wildcards must be inserted INTO the prompt string as literal\n"
+    "          __snake_case_name__ tokens — never listed in a separate array,\n"
+    "          and never accompanied by negative_prompt / parameters / steps /\n"
+    "          guidance_scale / aspect_ratio / seed / etc.)\n\n"
+    "STRICT RULES\n"
+    "1. The `prompt` string MUST contain `__name__` placeholders. At least 3.\n"
+    "2. Do NOT just polish or rewrite the user's idea — you MUST insert\n"
+    "   __wildcards__ where the variable parts are.\n"
+    "3. Wildcards look like __snake_case_name__ (double underscore each side).\n"
+    "4. Every wildcard in `prompt` MUST have a matching key in `categories`.\n"
+    "5. Every key in `categories` MUST appear in `prompt` at least once.\n"
+    "6. The ONLY top-level keys allowed are `prompt` and `categories`.\n"
+    "7. Keep category descriptions short and shape-focused, not specifics.\n"
+    "8. Reuse common category names (hair, age, outfit, location, time,\n"
+    "   activity, style, pose, ...) to build up reusable wildcard libraries."
 )
+
+
+# Strict JSON schema for the Manager's reply. Sent to the backend so the
+# server grammar-constrains output and the model can't invent extra top-level
+# keys (negative_prompt, parameters, wildcard_slots_used, seed, ...) the way
+# json_object mode allows.
+#
+# The `pattern` on `prompt` forces the grammar to require at least one
+# __snake_case__ substring. Without this, weaker models exhibit "schema
+# collapse" — they satisfy the {prompt, categories} shape but emit a plain
+# polished sentence with zero placeholders, treating categories as filled-in
+# values instead of placeholder descriptions. The grammar literally cannot
+# accept a prompt string missing the underscore tokens.
+MANAGER_JSON_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "prompt": {
+            "type": "string",
+            # llama.cpp's schema-to-grammar converter requires the pattern to
+            # be anchored with ^ and $. The `[\s\S]*` (instead of `.*`) lets
+            # the prompt span newlines, since `.` excludes \n in its regex.
+            "pattern": "^[\\s\\S]*__[A-Za-z][A-Za-z0-9_-]*__[\\s\\S]*$",
+        },
+        "categories": {
+            "type": "object",
+            "additionalProperties": {"type": "string"},
+        },
+    },
+    "required": ["prompt", "categories"],
+    "additionalProperties": False,
+}
 
 
 # -----------------------------------------------------------------------------
@@ -269,15 +395,73 @@ def _strip_code_fences(text: str) -> str:
     return t.strip()
 
 
+_THINK_RE = re.compile(r"<think\b[^>]*>[\s\S]*?</think\s*>", re.IGNORECASE)
+
+
+def _balanced_json_object(source: str) -> dict | None:
+    """Walk `source` and return the first balanced {...} that parses as a dict.
+
+    Brace counting respects JSON string literals (so `{` inside a quoted value
+    doesn't increase depth). Skipping past mismatched braces lets us recover
+    when the model emits prose before the JSON.
+    """
+    i = 0
+    n = len(source)
+    while i < n:
+        start = source.find("{", i)
+        if start < 0:
+            return None
+        depth = 0
+        in_string = False
+        escape = False
+        end = -1
+        for j in range(start, n):
+            ch = source[j]
+            if escape:
+                escape = False
+                continue
+            if ch == "\\" and in_string:
+                escape = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = j
+                    break
+        if end < 0:
+            return None
+        candidate = source[start:end + 1]
+        try:
+            v = json.loads(candidate)
+            if isinstance(v, dict):
+                return v
+        except Exception:
+            pass
+        i = start + 1
+    return None
+
+
 def _extract_json_object(text: str) -> dict | None:
     """Try hard to pull a JSON object out of an LLM reply.
 
-    Order: direct json.loads, fence-stripped json.loads, regex of {...}.
-    Returns the parsed dict or None.
+    Order: strip <think> reasoning blocks, direct json.loads, fence-stripped
+    json.loads, then balanced-brace extraction (handles prose-before-JSON
+    and trailing prose-after-JSON without grabbing nested objects).
     """
     if not text:
         return None
-    candidates = [text, _strip_code_fences(text)]
+    cleaned = _THINK_RE.sub("", text).strip()
+
+    candidates = [cleaned, _strip_code_fences(cleaned)]
+    if cleaned != text.strip():
+        candidates.extend([text, _strip_code_fences(text)])
     for c in candidates:
         try:
             v = json.loads(c)
@@ -285,15 +469,11 @@ def _extract_json_object(text: str) -> dict | None:
                 return v
         except Exception:
             pass
-    # last resort: find the outermost {...} block
-    m = re.search(r"\{[\s\S]*\}", text)
-    if m:
-        try:
-            v = json.loads(m.group(0))
-            if isinstance(v, dict):
-                return v
-        except Exception:
-            pass
+
+    for source in (cleaned, text):
+        v = _balanced_json_object(source)
+        if v is not None:
+            return v
     return None
 
 
@@ -321,6 +501,178 @@ def extract_wildcard_names(template: str) -> list[str]:
     return seen
 
 
+_KEY_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+
+
+def _salvage_flat_template(base_text: str, flat: dict
+                           ) -> tuple[str, dict[str, str]] | None:
+    """Reconstruct a template from a flat {key: value, ...} LLM reply.
+
+    Many models ignore the {prompt, categories} schema and instead respond with
+    a flat object that *correctly* names the variables — `subject: "woman"`,
+    `activity: "outdoor activity"`, `style: "photorealistic"`. If those values
+    appear in the user's idea, we can splice each one back in as `__key__` and
+    end up with a perfectly usable template.
+
+    Returns (template, categories) on success, None if nothing matched.
+    """
+    if not base_text or not isinstance(flat, dict):
+        return None
+    base_text = base_text.strip()
+    if not base_text:
+        return None
+
+    candidates: list[tuple[str, str]] = []
+    for raw_k, raw_v in flat.items():
+        if not isinstance(raw_v, str):
+            continue
+        v = raw_v.strip()
+        if len(v) < 2:
+            continue
+        k = re.sub(r"[^a-z0-9_]+", "_", str(raw_k).lower()).strip("_")
+        if not k or not _KEY_RE.match(k):
+            continue
+        if k == "prompt":
+            continue  # the literal sentence, not a wildcard slot
+        candidates.append((k, v))
+    if not candidates:
+        return None
+    # Longest value first so "outdoor activity" beats "activity" etc.
+    candidates.sort(key=lambda kv: -len(kv[1]))
+
+    # Segment-walk the base text. Each segment is either ("text", str) or
+    # ("wild", key). We only search inside text segments, so once a span has
+    # been wildcarded we won't re-match a substring of it.
+    segments: list[tuple[str, str]] = [("text", base_text)]
+    for key, value in candidates:
+        new_segments: list[tuple[str, str]] = []
+        replaced = False
+        for kind, content in segments:
+            if replaced or kind != "text":
+                new_segments.append((kind, content))
+                continue
+            idx = content.lower().find(value.lower())
+            if idx < 0:
+                new_segments.append((kind, content))
+                continue
+            before = content[:idx]
+            after = content[idx + len(value):]
+            if before:
+                new_segments.append(("text", before))
+            new_segments.append(("wild", key))
+            if after:
+                new_segments.append(("text", after))
+            replaced = True
+        segments = new_segments
+
+    used: list[str] = []
+    parts: list[str] = []
+    for kind, content in segments:
+        if kind == "text":
+            parts.append(content)
+        else:
+            parts.append(f"__{content}__")
+            if content not in used:
+                used.append(content)
+    if not used:
+        return None
+    template = "".join(parts)
+    cats = {k: f"A value for the '{k}' wildcard category." for k in used}
+    return template, cats
+
+
+# Heuristic patterns for the next salvage tier — when the LLM gives us a
+# polished sentence with no flat keys, pattern-match common nouns and inject
+# the matching default-category wildcard. Order matters: longer / more
+# specific phrases first, broad subject words last.
+_HEURISTIC_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"\boutdoor activity\b", re.I), "activity"),
+    (re.compile(r"\bindoor activity\b", re.I), "activity"),
+    (re.compile(
+        r"\b(?:jogging|running|swimming|climbing|hiking|cycling|dancing|"
+        r"skiing|surfing|reading|painting|gardening|practicing\s+yoga)\b",
+        re.I), "activity"),
+    (re.compile(
+        r"\b(?:photorealistic|hyperrealistic|cinematic|anime|cartoon|"
+        r"illustration|watercolour|watercolor|oil\s+painting|sketch|noir|"
+        r"dreamlike|vintage)\b", re.I), "style"),
+    (re.compile(
+        r"\b(?:sunrise|sunset|midnight|twilight|dawn|dusk|noon|morning|"
+        r"afternoon|evening|night)\b", re.I), "time"),
+    (re.compile(
+        r"\b(?:beach|forest|mountain|park|garden|rooftop|cafe|library|"
+        r"studio|street|alley|meadow|lake|river|desert|coast|harbour|harbor)\b",
+        re.I), "location"),
+    (re.compile(
+        r"\b(?:rainy|sunny|cloudy|stormy|foggy|misty|snowy|windy)\b",
+        re.I), "weather"),
+    # subject is broad — keep it last so more specific matches win first.
+    (re.compile(r"\b(?:woman|man|girl|boy|person|lady|guy|model)\b",
+                re.I), "subject"),
+]
+
+_HEURISTIC_DESCRIPTIONS = {
+    "subject": (
+        "The portrait subject (e.g. 'woman', 'man', 'older gentleman'). "
+        "One concise phrase."
+    ),
+}
+
+
+def _heuristic_salvage(base_text: str
+                       ) -> tuple[str, dict[str, str]] | None:
+    """Pattern-match common nouns in `base_text` and replace each with the
+    matching default-category wildcard. Returns (template, categories) on
+    success, None if no patterns matched."""
+    if not base_text or not base_text.strip():
+        return None
+    out = base_text
+    used: list[str] = []
+    for pattern, name in _HEURISTIC_PATTERNS:
+        if name in used:
+            continue
+        m = pattern.search(out)
+        if not m:
+            continue
+        # Don't overwrite an already-inserted wildcard.
+        span = out[m.start():m.end()]
+        if "__" in span:
+            continue
+        out = out[:m.start()] + f"__{name}__" + out[m.end():]
+        used.append(name)
+    if not used:
+        return None
+    cats = {}
+    for n in used:
+        cats[n] = (
+            DEFAULT_CATEGORIES.get(n)
+            or _HEURISTIC_DESCRIPTIONS.get(n)
+            or f"A value for the '{n}' wildcard category."
+        )
+    return out, cats
+
+
+_DEFAULT_FALLBACK_TEMPLATE = (
+    "A portrait of a __age__ __ethnicity__ __subject__ with __hair__, "
+    "__activity__ at a __location__, __time__, __weather__, wearing "
+    "__outfit__, __pose__, __style__"
+)
+
+
+def _default_template_fallback() -> tuple[str, dict[str, str]]:
+    """Last resort — return a generic template using DEFAULT_CATEGORIES so
+    the downstream Resolver always has wildcards to fill, even when the LLM
+    completely failed to produce a usable structure."""
+    cats: dict[str, str] = {}
+    for name in extract_wildcard_names(_DEFAULT_FALLBACK_TEMPLATE):
+        cats[name] = (
+            DEFAULT_CATEGORIES.get(name)
+            or _HEURISTIC_DESCRIPTIONS.get(name)
+            or f"A value for the '{name}' wildcard category."
+        )
+    return _DEFAULT_FALLBACK_TEMPLATE, cats
+
+
 # -----------------------------------------------------------------------------
 # LLM operations
 # -----------------------------------------------------------------------------
@@ -340,32 +692,95 @@ def llm_generate_value(category: str, description: str, existing: list[str],
 
 
 def llm_design_template(example_prompt: str, direction_text: str, extra_flair: str,
-                        server: dict, system_prompt_override: str | None = None
-                        ) -> tuple[str, dict[str, str], str]:
+                        server: dict, system_prompt_override: str | None = None,
+                        seed: int = 0
+                        ) -> tuple[str, dict[str, str], str, str]:
     """Ask the LLM to produce a prompt template + a description per wildcard.
 
-    Returns (template, categories, raw_reply). On parse failure returns
-    (best-effort template fallback, {}, raw_reply).
+    Returns (template, categories, raw_reply, status). status is one of:
+      "ok"           — JSON parsed and `prompt` non-empty.
+      "parse_failed" — could not extract a JSON object from the reply.
+      "no_prompt"    — JSON parsed but `prompt` was missing/empty.
+    No silent fallback to example_prompt — the Manager surfaces the failure
+    so the user can see the raw reply and fix the LLM/system prompt.
     """
     base = (system_prompt_override or "").strip() or MANAGER_SYSTEM_PROMPT
     flair_lines = [s for s in (direction_text or "", extra_flair or "") if s.strip()]
     if flair_lines:
         base = base + "\n\nAdditional direction from the user:\n" + "\n".join(flair_lines)
 
-    user = (
-        "User idea / example prompt:\n"
-        f"{(example_prompt or '').strip() or '(no example provided)'}\n\n"
-        "Now produce the JSON object."
-    )
+    user_parts = [
+        "User idea / example prompt:",
+        (example_prompt or "").strip() or "(no example provided)",
+    ]
+    if seed:
+        # Belt-and-suspenders: also nudge the model textually, since some local
+        # backends ignore the sampling seed in their /chat options.
+        # Avoid the literal word "seed" in the user-visible text — it cues some
+        # models to emit an image-gen-style payload with a top-level "seed" key.
+        user_parts.append(
+            f"\nVariation token: {seed}. Treat this token as inspiration for "
+            "fresh phrasing and a different mix of wildcard slots — produce a "
+            "meaningfully different template than you would for any other token."
+        )
+    user_parts.append("\nNow produce the JSON object.")
+    user = "\n".join(user_parts)
 
-    raw = _server_call(server, base, user)
+    raw = _server_call(server, base, user, request_json=True, seed=seed,
+                       json_schema=MANAGER_JSON_SCHEMA)
     parsed = _extract_json_object(raw)
     if not parsed:
-        # fall back: try to use the raw reply as the template directly
-        return ((example_prompt or "").strip(), {}, raw)
+        return ("", {}, raw, "parse_failed")
 
     template = str(parsed.get("prompt") or "").strip()
     categories_raw = parsed.get("categories")
+
+    # Layered salvage. Order: (1) flat-key splice, (2) heuristic noun match,
+    # (3) generic default template. Each tier runs only if the previous one
+    # didn't produce a template with __wildcards__. This guarantees the
+    # downstream Resolver always has slots to fill, even with a dumb LLM.
+    salvage_kind = ""
+
+    def _has_wildcards(t: str) -> bool:
+        return bool(extract_wildcard_names(t or ""))
+
+    # Tier 1 — flat-key salvage from the LLM reply.
+    if not _has_wildcards(template) or not isinstance(categories_raw, dict):
+        candidates = []
+        for base_text in (template, (example_prompt or "").strip()):
+            base_text = (base_text or "").strip()
+            if not base_text:
+                continue
+            r = _salvage_flat_template(base_text, parsed)
+            if r is None:
+                continue
+            candidates.append((len(extract_wildcard_names(r[0])), r))
+        if candidates:
+            candidates.sort(key=lambda x: -x[0])
+            template, categories_raw = candidates[0][1]
+            salvage_kind = "flat"
+
+    # Tier 2 — heuristic noun-pattern salvage on the LLM prompt or user idea.
+    if not _has_wildcards(template):
+        candidates = []
+        for base_text in (template, (example_prompt or "").strip()):
+            base_text = (base_text or "").strip()
+            if not base_text:
+                continue
+            r = _heuristic_salvage(base_text)
+            if r is None:
+                continue
+            candidates.append((len(extract_wildcard_names(r[0])), r))
+        if candidates:
+            candidates.sort(key=lambda x: -x[0])
+            template, categories_raw = candidates[0][1]
+            salvage_kind = "heuristic"
+
+    # Tier 3 — generic default template. Always succeeds.
+    if not _has_wildcards(template):
+        template, categories_raw = _default_template_fallback()
+        salvage_kind = "default"
+
     categories: dict[str, str] = {}
     if isinstance(categories_raw, dict):
         for k, v in categories_raw.items():
@@ -374,11 +789,16 @@ def llm_design_template(example_prompt: str, direction_text: str, extra_flair: s
                 categories[ks] = str(v).strip()
 
     # final consistency pass — every wildcard in template must have a description.
-    used = extract_wildcard_names(template)
-    for name in used:
+    for name in extract_wildcard_names(template):
         categories.setdefault(name, f"A value for the '{name}' wildcard.")
 
-    return (template, categories, raw)
+    if salvage_kind == "default":
+        status = "fallback_default"
+    elif salvage_kind:
+        status = "salvaged"
+    else:
+        status = "ok"
+    return (template, categories, raw, status)
 
 
 # -----------------------------------------------------------------------------
@@ -480,9 +900,12 @@ def build_manager_snapshot(effective_categories: dict, *,
                            extra_flair: str = "",
                            generated_prompt: str = "",
                            user_overrides: dict | None = None) -> dict:
+    # The category list shown by the UI tracks the *current* template plus any
+    # user override. We deliberately do NOT union in every disk file — that
+    # would make the list look identical across runs regardless of the prompt.
     disk = list_disk_categories()
     user_overrides = user_overrides or {}
-    names = sorted(set(effective_categories) | set(user_overrides) | set(disk))
+    names = sorted(set(effective_categories) | set(user_overrides))
     rows = []
     for name in names:
         rows.append({
@@ -515,14 +938,31 @@ try:
 
     @PromptServer.instance.routes.get("/llm_wildcard/state")
     async def _llm_wildcard_state(_request):
-        cats = load_category_config()
+        all_cats = load_category_config()
         last_template = ""
         if LAST_TEMPLATE_PATH.exists():
             try:
                 last_template = LAST_TEMPLATE_PATH.read_text(encoding="utf-8")
             except Exception:
                 pass
-        snap = build_manager_snapshot(cats, generated_prompt=last_template)
+
+        # Scope the rebuilt UI to wildcards in the last template, matching the
+        # post-execute snapshot. Avoids the "same list every reload" bug.
+        used = set(extract_wildcard_names(last_template))
+        display_cats = {n: all_cats.get(n, DEFAULT_CATEGORIES.get(n, ""))
+                        for n in sorted(used)}
+
+        snap = build_manager_snapshot(display_cats, generated_prompt=last_template)
+
+        if LAST_REPLY_PATH.exists():
+            try:
+                payload = json.loads(LAST_REPLY_PATH.read_text(encoding="utf-8"))
+                snap["raw_reply"] = payload.get("raw_reply", "")
+                snap["status"] = payload.get("status", "ok")
+                snap["status_message"] = payload.get("status_message", "")
+            except Exception:
+                pass
+
         return _aiohttp_web.json_response(snap)
 
     @PromptServer.instance.routes.get("/llm_wildcard/last_report")
@@ -533,6 +973,20 @@ try:
                        "using_custom_prompt": False}
         payload["text"] = read_last_report_text()
         return _aiohttp_web.json_response(payload)
+
+    @PromptServer.instance.routes.get("/llm_wildcard/last_resolver")
+    async def _llm_wildcard_last_resolver(_request):
+        empty = {"template": "", "resolved": "", "records": [],
+                 "tallies": _tally([])}
+        if not LAST_RESOLVER_PATH.exists():
+            return _aiohttp_web.json_response(empty)
+        try:
+            data = json.loads(LAST_RESOLVER_PATH.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                data = empty
+        except Exception:
+            data = empty
+        return _aiohttp_web.json_response(data)
 except Exception:  # pragma: no cover — running outside ComfyUI
     pass
 
@@ -679,30 +1133,58 @@ class LLMWildcardManager:
             except Exception as e:
                 print(f"[LLMWildcardManager] Bad categories JSON: {e}")
 
-        # Call the LLM to design the template + suggest descriptions.
+        # Effective sampling seed for the LLM. seed=0 means "fresh roll every
+        # queue", so pick a non-deterministic one — otherwise the model would
+        # see the same input each queue and likely emit the same template.
+        # seed!=0 is passed through verbatim so reproducibility is preserved.
         try:
-            template, suggested_cats, raw_reply = llm_design_template(
+            seed_int = int(seed)
+        except Exception:
+            seed_int = 0
+        if seed_int == 0:
+            effective_seed = random.SystemRandom().randrange(1, 2**31)
+        else:
+            effective_seed = seed_int
+
+        # Call the LLM to design the template + suggest descriptions.
+        status = "ok"
+        status_message = ""
+        try:
+            template, suggested_cats, raw_reply, status = llm_design_template(
                 example_prompt=example_prompt or "",
                 direction_text=direction_text,
                 extra_flair=extra,
                 server=server,
                 system_prompt_override=override or None,
+                seed=effective_seed,
             )
         except Exception as e:
             print(f"[LLMWildcardManager] LLM call failed: {e}")
             template = ""
             suggested_cats = {}
-            raw_reply = f"(error: {e})"
+            raw_reply = f"(exception calling LLM: {e})"
+            status = "llm_error"
+            status_message = str(e)
 
-        # Fall back to last successful template if the call produced nothing.
-        if not template:
-            if LAST_TEMPLATE_PATH.exists():
-                try:
-                    template = LAST_TEMPLATE_PATH.read_text(encoding="utf-8")
-                except Exception:
-                    template = ""
-            if not template:
-                template = (example_prompt or "").strip()
+        if status == "parse_failed":
+            status_message = (
+                "LLM did not return a parseable JSON object. "
+                "See the raw reply panel below."
+            )
+        elif status == "salvaged":
+            status_message = (
+                "LLM didn't follow the schema, but I rebuilt a template by "
+                "matching its output back into your idea. Edit the prompt "
+                "above if the wildcards landed in the wrong place."
+            )
+        elif status == "fallback_default":
+            status_message = (
+                "LLM never produced a usable template (even after pattern "
+                "salvage). Falling back to a generic default template using "
+                "the built-in categories. For better results, switch to a "
+                "stronger model (e.g. qwen2.5:7b, llama3.1:8b-instruct, "
+                "gemma2:9b) in your LLM Server Config."
+            )
 
         # Effective category descriptions: defaults < disk < LLM-suggested < user.
         merged_disk = load_category_config()
@@ -717,13 +1199,24 @@ class LLMWildcardManager:
         merged_disk.update(user_overrides)
         save_category_config(merged_disk)
 
-        # Persist the last successful template too, so the /state endpoint can
-        # show it after a refresh.
-        if template:
+        # Persist the last successful template only on real success — never
+        # mask a failure by stashing example_prompt or a malformed reply.
+        if template and status in ("ok", "salvaged", "fallback_default"):
             try:
                 LAST_TEMPLATE_PATH.write_text(template, encoding="utf-8")
             except Exception as e:
                 print(f"[LLMWildcardManager] Could not persist template: {e}")
+
+        # Persist the raw reply + status so the UI can show it after reload.
+        try:
+            LAST_REPLY_PATH.write_text(json.dumps({
+                "raw_reply": raw_reply,
+                "status": status,
+                "status_message": status_message,
+                "template": template,
+            }, indent=2), encoding="utf-8")
+        except Exception as e:
+            print(f"[LLMWildcardManager] Could not persist last reply: {e}")
 
         # Build the bundle handed to the Resolver. Effective categories include
         # everything we know — that's what the Resolver should use as descriptions.
@@ -750,11 +1243,13 @@ class LLMWildcardManager:
             generated_prompt=template,
             user_overrides=user_overrides,
         )
+        snapshot["raw_reply"] = raw_reply
+        snapshot["status"] = status
+        snapshot["status_message"] = status_message
 
         return {
             "ui": {
                 "manager_state": [json.dumps(snapshot)],
-                "raw_reply": [raw_reply],
             },
             "result": (template, bundle),
         }
@@ -804,6 +1299,7 @@ class LLMWildcardResolver:
     RETURN_NAMES = ("resolved_prompt", "report")
     FUNCTION = "resolve"
     CATEGORY = "prompt/wildcards"
+    OUTPUT_NODE = True
 
     def resolve(self, server, template, mode, max_per_category, seed, fix_seed,
                 prompts=None):
@@ -892,7 +1388,23 @@ class LLMWildcardResolver:
                                using_custom_prompt=bool(custom_system_prompt))
         write_last_report(report, records, flair=flair_text,
                           using_custom_prompt=bool(custom_system_prompt))
-        return (resolved, report)
+
+        snapshot = {
+            "template": template or "",
+            "resolved": resolved or "",
+            "records": records,
+            "tallies": _tally(records),
+        }
+        try:
+            LAST_RESOLVER_PATH.write_text(
+                json.dumps(snapshot, indent=2), encoding="utf-8")
+        except Exception as e:
+            print(f"[LLMWildcardResolver] Could not persist last resolver state: {e}")
+
+        return {
+            "ui": {"resolver_state": [json.dumps(snapshot)]},
+            "result": (resolved, report),
+        }
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
