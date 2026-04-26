@@ -48,11 +48,16 @@ function injectManagerStyles() {
     if (document.getElementById("lwm-styles")) return;
     const css = `
         .lwm-root { display:flex; flex-direction:column; gap:10px;
-            padding:6px; box-sizing:border-box; width:100%;
-            max-width:100%; min-width:0; overflow:hidden;
+            padding:6px; box-sizing:border-box; width:100%; height:100%;
+            max-width:100%; min-width:0;
+            overflow-x:hidden; overflow-y:auto;
             font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI",
                 Roboto, sans-serif; color:#dcdcdc;
         }
+        .lwm-root::-webkit-scrollbar { width:8px; }
+        .lwm-root::-webkit-scrollbar-thumb {
+            background:#2c3138; border-radius:4px; }
+        .lwm-root::-webkit-scrollbar-thumb:hover { background:#3a4250; }
         .lwm-root * { box-sizing:border-box; }
         .lwm-section-label { font-size:10px; letter-spacing:.06em;
             text-transform:uppercase; color:#7d8693; margin:2px 2px -2px; }
@@ -603,7 +608,7 @@ app.registerExtension({
                 rebuildFromWidgetOnly();
 
                 node.addDOMWidget("manager_view", "div", root, { serialize: false });
-                node.size = [Math.max(node.size[0], 560), Math.max(node.size[1], 520)];
+                node.size = [Math.max(node.size[0], 560), Math.max(node.size[1], 640)];
 
                 const onConfigure = node.onConfigure;
                 node.onConfigure = function (info) {
