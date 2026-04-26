@@ -49,18 +49,23 @@ function injectManagerStyles() {
     const css = `
         .lwm-root { display:flex; flex-direction:column; gap:10px;
             padding:6px; box-sizing:border-box; width:100%;
+            max-width:100%; min-width:0; overflow:hidden;
             font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI",
                 Roboto, sans-serif; color:#dcdcdc;
         }
+        .lwm-root * { box-sizing:border-box; }
         .lwm-section-label { font-size:10px; letter-spacing:.06em;
             text-transform:uppercase; color:#7d8693; margin:2px 2px -2px; }
-        .lwm-toolbar { display:flex; gap:6px; align-items:center; }
+        .lwm-toolbar { display:flex; gap:6px; align-items:center;
+            min-width:0; max-width:100%; }
+        .lwm-toolbar > * { min-width:0; }
         .lwm-toolbar .lwm-spacer { flex:1 1 auto; }
         .lwm-input, .lwm-textarea {
             background:#16181b; color:#e6e6e6;
             border:1px solid #2e3338; border-radius:4px;
             padding:6px 8px; font-size:12px; outline:none;
-            box-sizing:border-box; transition:border-color .12s, box-shadow .12s;
+            box-sizing:border-box; min-width:0; max-width:100%;
+            transition:border-color .12s, box-shadow .12s;
         }
         .lwm-input:focus, .lwm-textarea:focus {
             border-color:#4d8cd0; box-shadow:0 0 0 2px rgba(77,140,208,.18);
@@ -79,19 +84,25 @@ function injectManagerStyles() {
         .lwm-btn-danger:hover { background:#7a3a3a; }
         .lwm-btn-icon { width:26px; padding:5px 0; text-align:center; }
         .lwm-pathline { font-size:10px; color:#6c7480;
-            font-family: ui-monospace, Menlo, Consolas, monospace; }
+            font-family: ui-monospace, Menlo, Consolas, monospace;
+            min-width:0; overflow:hidden; text-overflow:ellipsis;
+            white-space:nowrap; }
         .lwm-direction-hint { font-size:10px; color:#9aa3ad; margin:-4px 2px 0;
             font-style:italic; min-height:1em; }
-        .lwm-list { display:flex; flex-direction:column; gap:6px; }
+        .lwm-list { display:flex; flex-direction:column; gap:6px;
+            min-width:0; max-width:100%; }
         .lwm-row {
             display:flex; flex-direction:column;
             background: linear-gradient(180deg,#1d2025,#181a1e);
             border:1px solid #2a2e34; border-radius:5px;
             padding:6px 6px 4px;
+            min-width:0; max-width:100%;
             transition:border-color .12s, background .12s;
         }
         .lwm-row:hover { border-color:#3a4250; }
-        .lwm-row-head { display:flex; gap:6px; align-items:center; }
+        .lwm-row-head { display:flex; gap:6px; align-items:center;
+            min-width:0; max-width:100%; }
+        .lwm-row-head > * { min-width:0; }
         .lwm-expand { width:24px; height:24px; flex:0 0 24px;
             background:#22262b; color:#cfd3d8;
             border:1px solid #2e3338; border-radius:4px;
@@ -100,8 +111,8 @@ function injectManagerStyles() {
         }
         .lwm-expand:hover { background:#2c3138; }
         .lwm-expand.lwm-open { transform:rotate(90deg); }
-        .lwm-name { flex:0 0 27%; }
-        .lwm-desc { flex:1 1 auto; }
+        .lwm-name { flex:0 1 27%; min-width:0; }
+        .lwm-desc { flex:1 1 auto; min-width:0; }
         .lwm-badge {
             flex:0 0 38px; text-align:center; font-size:11px;
             font-family: ui-monospace, Menlo, Consolas, monospace;
@@ -113,6 +124,7 @@ function injectManagerStyles() {
         .lwm-badge.lwm-badge-high   { color:#f5d782; border-color:#5b4a2c; background:#2a2316; }
         .lwm-entries {
             overflow:hidden; max-height:0;
+            max-width:100%; min-width:0;
             transition:max-height .18s ease, margin-top .18s ease, padding .18s ease;
             background:#0f1114; color:#cfd3d8;
             border:1px solid transparent; border-radius:4px;
@@ -166,6 +178,7 @@ app.registerExtension({
                     ta.spellcheck = false;
                     Object.assign(ta.style, {
                         width: "100%",
+                        maxWidth: "100%",
                         minHeight: "260px",
                         fontFamily: "ui-monospace, Menlo, Consolas, monospace",
                         fontSize: "11px",
@@ -219,6 +232,9 @@ app.registerExtension({
                     padding: "4px",
                     boxSizing: "border-box",
                     width: "100%",
+                    maxWidth: "100%",
+                    minWidth: "0",
+                    overflow: "hidden",
                 });
 
                 const header = document.createElement("div");
@@ -275,6 +291,8 @@ app.registerExtension({
                         fontSize: "12px",
                         outline: "none",
                         boxSizing: "border-box",
+                        minWidth: "0",
+                        maxWidth: "100%",
                     });
                 }
                 function buildRow(name = "", desc = "") {
@@ -283,13 +301,15 @@ app.registerExtension({
                         display: "flex",
                         gap: "4px",
                         alignItems: "center",
+                        minWidth: "0",
+                        maxWidth: "100%",
                     });
 
                     const nameI = document.createElement("input");
                     nameI.type = "text";
                     nameI.placeholder = "name";
                     nameI.value = name;
-                    nameI.style.flex = "0 0 32%";
+                    nameI.style.flex = "0 1 32%";
                     styleInput(nameI);
                     row._nameInput = nameI;
 
