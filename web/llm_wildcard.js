@@ -387,9 +387,13 @@ app.registerExtension({
 
                 const jsonWidget = node.widgets.find(w => w.name === "categories");
                 const directionWidget = node.widgets.find(w => w.name === "direction");
+                const extraFlairWidget = node.widgets.find(w => w.name === "extra_flair");
+                const systemPromptWidget = node.widgets.find(w => w.name === "system_prompt_override");
                 if (!jsonWidget) return;
                 hideWidget(node, jsonWidget);
                 if (directionWidget) hideWidget(node, directionWidget);
+                if (extraFlairWidget) hideWidget(node, extraFlairWidget);
+                if (systemPromptWidget) hideWidget(node, systemPromptWidget);
 
                 // ----- root layout -----
                 const root = document.createElement("div");
@@ -440,6 +444,41 @@ app.registerExtension({
                     setDirHint();
                     node.setDirtyCanvas(true, true);
                 });
+
+                // ----- extra flair textarea (was a separate built-in widget) -----
+                function makeTextareaSection(labelText, placeholder, widget, minH) {
+                    const label = document.createElement("div");
+                    label.className = "lwm-section-label";
+                    label.textContent = labelText;
+                    root.appendChild(label);
+
+                    const ta = document.createElement("textarea");
+                    ta.className = "lwm-textarea";
+                    ta.placeholder = placeholder;
+                    ta.style.minHeight = minH;
+                    ta.style.whiteSpace = "pre-wrap";
+                    ta.style.wordBreak = "break-word";
+                    ta.value = widget?.value || "";
+                    ta.addEventListener("input", () => {
+                        if (widget) widget.value = ta.value;
+                        node.setDirtyCanvas(true, true);
+                    });
+                    root.appendChild(ta);
+                    return ta;
+                }
+
+                const flairTA = makeTextareaSection(
+                    "Extra steering (appended after direction)",
+                    "Optional extra steering, appended after the direction.",
+                    extraFlairWidget,
+                    "60px",
+                );
+                const sysPromptTA = makeTextareaSection(
+                    "System prompt override (advanced — leave empty for default)",
+                    "Leave empty to use the built-in system prompt.",
+                    systemPromptWidget,
+                    "60px",
+                );
 
                 // ----- toolbar: header + refresh + add -----
                 const headLabel = document.createElement("div");
@@ -661,13 +700,15 @@ app.registerExtension({
                 setDirHint();
 
                 node.addDOMWidget("manager_view", "div", root, { serialize: false });
-                node.size = [Math.max(node.size[0], 620), Math.max(node.size[1], 520)];
+                node.size = [Math.max(node.size[0], 620), Math.max(node.size[1], 680)];
 
                 const onConfigure = node.onConfigure;
                 node.onConfigure = function (info) {
                     onConfigure?.apply(this, arguments);
                     setTimeout(() => {
                         if (directionWidget) dirInput.value = directionWidget.value || "none";
+                        if (extraFlairWidget) flairTA.value = extraFlairWidget.value || "";
+                        if (systemPromptWidget) sysPromptTA.value = systemPromptWidget.value || "";
                         rebuildFromWidgetOnly();
                         refreshFromServer();
                     }, 0);
