@@ -162,7 +162,9 @@ SYSTEM_PROMPT = (
 
 # -----------------------------------------------------------------------------
 # Direction presets — pre-baked "flair" lines so users don't have to write
-# steering text by hand. Selected via a combo on LLMWildcardManager.
+# steering text by hand. The Manager exposes them as autocomplete suggestions
+# but accepts free text too: anything that isn't a known preset key is treated
+# as raw steering text.
 # -----------------------------------------------------------------------------
 DIRECTION_PRESETS: dict[str, str] = {
     "none": "",
@@ -178,6 +180,47 @@ DIRECTION_PRESETS: dict[str, str] = {
     "minimal": "Minimal, restrained palette and composition. Nothing busy.",
     "sfw_strict": "Keep all output strictly SFW. No suggestive phrasing.",
 }
+
+
+def resolve_direction(direction: str) -> str:
+    """Map a direction string to its steering text.
+
+    Known preset keys expand to their canonical preset text. Anything else is
+    returned verbatim — so users can type custom steering directly into the
+    direction field without needing to fall back to ``extra_flair``.
+    """
+    if direction is None:
+        return ""
+    key = direction.strip()
+    if not key:
+        return ""
+    if key in DIRECTION_PRESETS:
+        return DIRECTION_PRESETS[key]
+    return key
+
+
+# -----------------------------------------------------------------------------
+# Report relay — the Resolver writes its latest report here on every run so
+# the Manager can show it without needing a graph edge back from the Resolver
+# (ComfyUI graphs are acyclic).
+# -----------------------------------------------------------------------------
+LAST_REPORT_PATH = WILDCARDS_DIR / ".last_report.txt"
+
+
+def write_last_report(text: str) -> None:
+    try:
+        LAST_REPORT_PATH.write_text(text or "", encoding="utf-8")
+    except Exception as e:
+        print(f"[LLMWildcard] Could not write last report: {e}")
+
+
+def read_last_report() -> str:
+    if not LAST_REPORT_PATH.exists():
+        return ""
+    try:
+        return LAST_REPORT_PATH.read_text(encoding="utf-8")
+    except Exception:
+        return ""
 
 
 # -----------------------------------------------------------------------------
@@ -215,12 +258,16 @@ def build_manager_snapshot(categories: dict, direction: str = "none",
             "count": len(disk.get(name, [])),
             "on_disk": name in disk,
         })
+    # If no explicit report was passed in, fall back to the on-disk relay so
+    # the Manager always shows the latest report after a Resolver run.
+    final_report = (report or "").strip() or read_last_report()
     return {
         "wildcards_dir": str(WILDCARDS_DIR),
         "direction": direction,
-        "direction_text": DIRECTION_PRESETS.get(direction, ""),
+        "direction_text": resolve_direction(direction),
+        "direction_presets": DIRECTION_PRESETS,
         "extra_flair": extra_flair,
-        "report": report or "",
+        "report": final_report,
         "rows": rows,
     }
 
@@ -479,6 +526,9 @@ class LLMWildcardResolver:
         resolved = WILDCARD_RE.sub(resolve_slot, template)
         report = format_report(records, flair=flair_text,
                                using_custom_prompt=bool(custom_system_prompt))
+        # Relay the report to disk so the Manager can pick it up without an
+        # explicit graph edge (which would form a cycle).
+        write_last_report(report)
         return (resolved, report)
 
     @classmethod
@@ -641,16 +691,21 @@ class LLMWildcardManager:
 
     @classmethod
     def INPUT_TYPES(cls):
-        directions = list(DIRECTION_PRESETS.keys())
         return {
             "required": {
-                "direction": (directions, {"default": "none"}),
+                # Free-text STRING (rendered as autocomplete in the UI).
+                # Known preset keys expand to their canonical text; anything
+                # else is used as-is. Lets the user type custom directions.
+                "direction": ("STRING", {
+                    "default": "none",
+                    "placeholder": "preset key (e.g. 'cinematic') or any custom steering text",
+                }),
                 "extra_flair": ("STRING", {
                     "multiline": True,
                     "default": "",
                     "placeholder": (
-                        "Optional extra steering, appended to the chosen direction.\n"
-                        "Leave empty to use only the preset (or 'none' for default)."
+                        "Optional extra steering, appended after the direction.\n"
+                        "Leave empty to use only the direction value."
                     ),
                 }),
                 "system_prompt_override": ("STRING", {
@@ -680,8 +735,8 @@ class LLMWildcardManager:
 
     def manage(self, direction, extra_flair, system_prompt_override,
                categories, report=None):
-        direction = (direction or "none").strip() or "none"
-        preset = DIRECTION_PRESETS.get(direction, "")
+        direction = (direction or "").strip() or "none"
+        preset = resolve_direction(direction)
         extra = (extra_flair or "").strip()
         flair_parts = [p for p in (preset, extra) if p]
         flair = "\n".join(flair_parts)

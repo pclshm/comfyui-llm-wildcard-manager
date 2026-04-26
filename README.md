@@ -137,52 +137,53 @@ One node to manage everything: category descriptions, the generation
 
 Inputs:
 
-- **`direction`** — combo over a set of pre-baked steering presets (no need to
-  hand-write flair every time):
+- **`direction`** — *free-text with autocomplete*. Pick from the built-in
+  preset keys for one-click steering:
   - `none` · `photoreal` · `cinematic` · `editorial` · `vintage_film` · `noir`
   - `cyberpunk` · `fantasy` · `anime` · `dreamlike` · `minimal` · `sfw_strict`
-- **`extra_flair`** — optional extra steering text appended after the preset.
+
+  …or just type your own steering text directly into the field and it will be
+  used verbatim. The hint line under the input tells you which mode you're in.
+- **`extra_flair`** — optional extra steering, appended after the direction.
 - **`system_prompt_override`** — leave empty to use the built-in system prompt.
 - **`categories`** — JSON object of `{name: description}`. Edited via the table
   UI on the node (so headless / API workflows still work).
-- **`report`** *(optional input)* — wire `LLM Wildcard Resolver.report` into
-  this socket and the latest report renders inside the Manager body. (You will
-  need a *second* Manager instance for this — one upstream of the Resolver to
-  provide `prompts`, one downstream to display the report. ComfyUI graphs are
-  acyclic, so a single instance can't do both at once.)
+- **`report`** *(optional input)* — wire `LLM Wildcard Resolver.report` here
+  and the report renders inside the Manager body. **You don't need to wire it
+  for the report to show up though** — every Resolver run also writes the
+  latest report to `wildcards/.last_report.txt`, and the Manager picks that
+  up automatically on its next execution or via **↻ Refresh disk**.
 
 UI:
 
-- Each category row shows: name · description · entry count · expand button.
+- Each category row shows: name · description · entry-count badge · expand
+  button. Badge colour scales with the entry count (low / mid / high) so
+  you can scan the table at a glance.
 - Click ▸ on a row to inspect every value currently stored on disk for that
   category. Click **↻ Refresh disk** to re-read the wildcards folder without
   re-queuing the workflow.
 - The disk path of the wildcards folder is shown at the top so it is always
   obvious where entries are being written.
+- The latest resolver report (from disk or the wired `report` input) renders
+  in a panel at the bottom of the node.
 
 Outputs:
 
 - `prompts` — wire to the Resolver's optional `prompts` input. Drop-in
   replacement for the Prompt Config bundle.
-- `summary` — passthrough of the report text (only meaningful when `report` is
-  wired in).
+- `summary` — passthrough of the report text shown in the node.
 
-Recommended wiring:
-
-```
-[LLM Wildcard Manager] --prompts--> [LLM Wildcard Resolver] --report--> [LLM Wildcard Report]
-                                              |
-                                              +--resolved_prompt-->  [CLIP Text Encode]
-```
-
-Or — to centralise both the configuration *and* the report inside Manager
-nodes — use two Manager instances:
+Recommended wiring (a *single* Manager handles both ends):
 
 ```
-[Manager #1 (config)] --prompts--> [Resolver] --report--> [Manager #2 (display)]
-                                          |
-                                          +--resolved_prompt--> [CLIP Text Encode]
+[LLM Wildcard Manager] --prompts--> [LLM Wildcard Resolver] --resolved_prompt--> [CLIP Text Encode]
 ```
+
+That's it — the Resolver writes its report to `wildcards/.last_report.txt`,
+and the Manager shows it on the next run / refresh. No second Manager needed,
+no graph cycle. If you prefer an explicit edge, you can still wire the
+Resolver's `report` output into the Manager's optional `report` input (use a
+separate downstream Manager instance to avoid a cycle).
 
 ### LLM Wildcard Prompt Config
 
