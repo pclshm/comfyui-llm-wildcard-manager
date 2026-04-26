@@ -1,32 +1,31 @@
 # 🎲 LLM Wildcard Manager for ComfyUI
 
-A small set of ComfyUI nodes that fill `__wildcard__` slots in a template by
-either reusing values from disk or asking an LLM to invent new ones — with
-explicit anti-repetition.
+A small set of ComfyUI nodes that let an LLM **design a prompt template
+with `__wildcard__` placeholders** and then **fill those placeholders one at
+a time, in isolation, with explicit anti-repetition** — backed by reusable
+on-disk wildcard files.
 
 **Four nodes:**
 
-| Node | Purpose |
-|------|---------|
-| 🎲 LLM Wildcard Resolver       | The core: resolves `__wildcard__` slots using cache + LLM. |
-| 🎲 LLM Wildcard Manager        | **Central management.** Pick a generation *direction* from a preset, manage every category description, and inspect the entries currently on disk per category — all in one node. Drop-in replacement for the Prompt Config. |
-| 🎲 LLM Wildcard Prompt Config  | Lower-level alternative to the Manager: override the LLM system prompt and define category descriptions in-graph. |
-| 🎲 LLM Wildcard Report         | Parse the resolver's report into counts (`generated`, `reused`, `errors`, `total`) and a clean summary. |
+| Node                         | Purpose |
+|------------------------------|---------|
+| 🎲 LLM Server Config         | Single place to configure the LLM backend (endpoint, model, key, temperature). Wired into both Manager and Resolver. |
+| 🎲 LLM Wildcard Manager      | Designs the prompt template. Asks the LLM to rewrite your idea as a template with `__wildcard__` placeholders, plus a description for each placeholder. |
+| 🎲 LLM Wildcard Resolver     | Fills `__wildcard__` slots: reuses values from disk or asks the LLM for a fresh, anti-repetition value (one slot at a time). |
+| 🎲 LLM Wildcard Report       | Renders the resolver's per-slot results as a structured collapsible view + raw text panel. Outputs counters for routing. |
 
 ## Why this exists
 
 When you ask an LLM to "enhance this prompt," it sees the whole prompt and
-anchors on it. Run it twice and you get two near-identical outputs. This node
-flips the model: instead of enhancing the *prompt*, it generates one *wildcard
-value at a time*, in isolation, with the existing values listed as forbidden.
-The downstream prompt then has genuinely fresh variance to feed into your
-prompt-enhancer.
+anchors on it. Run it twice and you get two near-identical outputs.
+
+This pack flips that: the **Manager** turns your idea into a template with
+small variable parts (`__hair__`, `__location__`, …), and the **Resolver**
+fills each variable part with a fresh value the LLM has never produced for
+that category before. The downstream prompt has genuine variance instead of
+being a re-skin of the same sentence.
 
 ## Install
-
-### Via ComfyUI Manager (recommended once published)
-
-Search for **LLM Wildcard Manager** in ComfyUI Manager and click Install.
 
 ### Manual
 
@@ -37,15 +36,36 @@ git clone https://github.com/YOUR_GITHUB_USER/comfyui-llm-wildcard-manager
 
 No extra Python deps — uses stdlib `urllib`.
 
-Restart ComfyUI. The node appears under **prompt → wildcards → 🎲 LLM Wildcard Resolver**.
+Restart ComfyUI. Nodes appear under **prompt → wildcards**.
 
-An example workflow is included in [`example_workflows/`](example_workflows/llm_wildcard_basic.json).
+A starter workflow is in [`example_workflows/llm_wildcard_basic.json`](example_workflows/llm_wildcard_basic.json).
+
+> **Upgrading from 0.2.x:** the 0.3 release replaces `LLMWildcardPromptConfig`
+> with the new Manager + Server Config split. Saved workflows that referenced
+> the old PromptConfig node, or the Resolver's old backend/endpoint/model
+> widgets, will need re-wiring. Open the new example workflow as a starting
+> point.
+
+## Recommended wiring
+
+```
+[LLM Server Config] --server--> [LLM Wildcard Manager] --prompt_template--> [LLM Wildcard Resolver] --resolved_prompt--> [CLIP Text Encode]
+                  \--server-----------------------------/                  \--report------> [LLM Wildcard Report]
+                                              \--prompts---------/
+```
+
+The **Server Config** is wired into both Manager and Resolver so endpoint
+settings live in one node. The Manager hands the Resolver both:
+
+- `prompt_template` — the template the Manager designed (wire to `template`).
+- `prompts` — a bundle with the system prompt + flair + per-category
+  descriptions (wire to the optional `prompts` socket).
 
 ## Wildcard files
 
 Stored in `ComfyUI/wildcards/<name>.txt`, one value per line. Compatible with
-the Impact Pack and Santodan Wildcard Manager file format. The node creates
-files automatically as it generates.
+the Impact Pack and Santodan Wildcard Manager file formats. The Resolver
+creates files automatically as it generates new values.
 
 ## Template syntax
 
@@ -54,7 +74,7 @@ __hair__       reuse a stored value (or generate if file empty / mode=force_new)
 __!hair__      force LLM to generate a new value, append to file
 ```
 
-## Modes
+## Modes (Resolver)
 
 | Mode             | Behavior                                                   |
 |------------------|------------------------------------------------------------|
@@ -62,15 +82,13 @@ __!hair__      force LLM to generate a new value, append to file
 | `force_new`      | Every slot is regenerated and appended to its file.        |
 | `hybrid`         | Reuse by default; only `__!name__` slots force generation. |
 
-## Backends
+## Backends (Server Config)
 
 - **ollama** — `endpoint = http://localhost:11434`, `model = llama3.1` (or any pulled model), `api_key` blank.
-- **llamacpp** — `endpoint = http://localhost:8080/v1`, `model` can be left blank (llama.cpp serves whatever GGUF you loaded), `api_key` blank.
-- **openai_compatible** — works with OpenAI, LM Studio, vLLM, OpenRouter, etc. Set `endpoint` to the base URL ending in `/v1` (e.g. `https://api.openai.com/v1`), set `model`, set `api_key`.
+- **llamacpp** — `endpoint = http://localhost:8080/v1`, `model` can be left blank, `api_key` blank.
+- **openai_compatible** — works with OpenAI, LM Studio, vLLM, OpenRouter, etc. Set `endpoint` to the base URL ending in `/v1`, set `model`, set `api_key`.
 
 ### Using llama.cpp in Docker
-
-The official server image:
 
 ```
 docker run --rm -p 8080:8080 \
@@ -79,7 +97,7 @@ docker run --rm -p 8080:8080 \
   -m /models/your-model.gguf -c 4096 --host 0.0.0.0 --port 8080
 ```
 
-In the node, set `backend = llamacpp` and `endpoint = http://localhost:8080/v1`.
+In the Server Config node, set `backend = llamacpp` and `endpoint = http://localhost:8080/v1`.
 
 **Networking gotchas:**
 - If **ComfyUI also runs in Docker**, `localhost` inside the ComfyUI container points to itself, not to the llama.cpp container. Use one of:
@@ -95,141 +113,130 @@ curl http://localhost:8080/v1/chat/completions \
   -d '{"model":"local-model","messages":[{"role":"user","content":"say hi"}]}'
 ```
 
-If that returns JSON with a `choices[0].message.content`, the node will work.
+If that returns JSON with `choices[0].message.content`, the nodes will work.
 
-## Category overrides
+## Node reference
 
-The optional `category_overrides` input takes a JSON object mapping wildcard
-names to descriptions. Use this to teach the LLM what shape of value belongs
-in a custom category without editing `wildcard_categories.json`:
+### 🎲 LLM Server Config
 
-```json
-{
-  "lens": "A camera lens descriptor like '85mm f/1.4' or 'wide-angle 24mm'",
-  "mood": "A single mood/atmosphere word"
-}
-```
+The single source of truth for LLM settings. One output: `server` (a
+`LLM_SERVER` bundle). Wire into both Manager and Resolver.
 
-## Wiring it into your workflow
+Fields: `backend`, `endpoint`, `model`, `api_key`, `temperature`.
 
-Minimal:
+### 🎲 LLM Wildcard Manager
 
-```
-[LLM Wildcard Resolver]  --resolved_prompt-->  [CLIP Text Encode]
-```
-
-Full pipeline with prompt config + report:
-
-```
-[LLM Wildcard Prompt Config] --prompts-->  [LLM Wildcard Resolver] --report-->  [LLM Wildcard Report]
-                                                  |
-                                                  +--resolved_prompt-->  [CLIP Text Encode]
-```
-
-Your downstream prompt generator's "Change this prompt:" instruction now
-operates on a freshly varied prompt every queue run, so it can't iterate on
-the same input.
-
-### LLM Wildcard Manager (recommended)
-
-One node to manage everything: category descriptions, the generation
-*direction*, and a live view of every value already on disk per category.
+Designs the prompt template. On each run it asks the LLM to rewrite your
+`example_prompt` as a template with `__wildcard__` placeholders, and to
+return a description for each placeholder it invented.
 
 Inputs:
 
-- **`direction`** — *free-text with autocomplete*. Pick from the built-in
-  preset keys for one-click steering:
-  - `none` · `photoreal` · `cinematic` · `editorial` · `vintage_film` · `noir`
-  - `cyberpunk` · `fantasy` · `anime` · `dreamlike` · `minimal` · `sfw_strict`
-
-  …or just type your own steering text directly into the field and it will be
-  used verbatim. The hint line under the input tells you which mode you're in.
+- **`server`** — wire from the Server Config.
+- **`example_prompt`** — your idea. The Manager turns this into a template
+  with variable parts replaced by `__wildcards__`.
+- **`seed`** — `0` re-rolls the template every queue run (new template, new
+  category set). Non-zero is reproducible: same inputs → same template.
+- **`direction`** — *free-text with autocomplete*. Pick a built-in preset
+  (`photoreal`, `cinematic`, `editorial`, `vintage_film`, `noir`, `cyberpunk`,
+  `fantasy`, `anime`, `dreamlike`, `minimal`, `sfw_strict`) or type your own
+  steering text directly.
 - **`extra_flair`** — optional extra steering, appended after the direction.
-- **`system_prompt_override`** — leave empty to use the built-in system prompt.
-- **`categories`** — JSON object of `{name: description}`. Edited via the table
-  UI on the node (so headless / API workflows still work).
-- **`report`** *(optional input)* — wire `LLM Wildcard Resolver.report` here
-  and the report renders inside the Manager body. **You don't need to wire it
-  for the report to show up though** — every Resolver run also writes the
-  latest report to `wildcards/.last_report.txt`, and the Manager picks that
-  up automatically on its next execution or via **↻ Refresh disk**.
-
-UI:
-
-- Each category row shows: name · description · entry-count badge · expand
-  button. Badge colour scales with the entry count (low / mid / high) so
-  you can scan the table at a glance.
-- Click ▸ on a row to inspect every value currently stored on disk for that
-  category. Click **↻ Refresh disk** to re-read the wildcards folder without
-  re-queuing the workflow.
-- The disk path of the wildcards folder is shown at the top so it is always
-  obvious where entries are being written.
-- The latest resolver report (from disk or the wired `report` input) renders
-  in a panel at the bottom of the node.
+- **`system_prompt_override`** — leave empty for the built-in template-design
+  system prompt; fill to fully replace it (advanced).
+- **`categories`** — JSON object of `{name: description}`. **User overrides
+  only.** Edited via the table UI on the node. User overrides win over
+  LLM-suggested descriptions.
 
 Outputs:
 
-- `prompts` — wire to the Resolver's optional `prompts` input. Drop-in
-  replacement for the Prompt Config bundle.
-- `summary` — passthrough of the report text shown in the node.
+- **`prompt_template`** — wire into the Resolver's `template` input.
+- **`prompts`** — `WILDCARD_PROMPTS` bundle. Wire into the Resolver's
+  optional `prompts` input. Carries the system prompt, flair, and the merged
+  category descriptions.
 
-Recommended wiring (a *single* Manager handles both ends):
+UI:
 
-```
-[LLM Wildcard Manager] --prompts--> [LLM Wildcard Resolver] --resolved_prompt--> [CLIP Text Encode]
-```
+- **Generated prompt** panel at the top shows the template the LLM produced
+  (with wildcard tokens highlighted).
+- **Categories** table beneath shows every category in the current template
+  + every user override + every category that has entries on disk. Each row:
+  expand chevron · name · description · entry-count badge · OVERRIDE tag if
+  user-edited · remove button.
+- **↻ Refresh disk** re-reads the wildcards folder without re-queuing.
+- **+ Add category** appends a fresh override row.
+- The disk path of the wildcards folder is shown so you always know where
+  values are written.
 
-That's it — the Resolver writes its report to `wildcards/.last_report.txt`,
-and the Manager shows it on the next run / refresh. No second Manager needed,
-no graph cycle. If you prefer an explicit edge, you can still wire the
-Resolver's `report` output into the Manager's optional `report` input (use a
-separate downstream Manager instance to avoid a cycle).
+### 🎲 LLM Wildcard Resolver
 
-### LLM Wildcard Prompt Config
+Fills `__wildcard__` slots in the template.
 
-Three fields:
+Inputs:
 
-- **`flair`** — a short steering phrase *appended* to the default LLM system prompt. Use this 95% of the time. Examples:
-  - `Lean cyberpunk neon noir, no clichés.`
-  - `Subjects must always be European-ish.`
-  - `Keep outputs strictly SFW.`
-- **`system_prompt_override`** — full replacement of the built-in system prompt. Leave empty unless you really need to change the rules of the game.
-- **`category overrides`** — a clickable add/remove table. Each row is *name* + *description sent to the LLM*. Examples:
-  - `lens` → `A camera lens descriptor like '85mm f/1.4'`
-  - `mood` → `A single mood/atmosphere word`
+- **`server`** — wire from the Server Config.
+- **`template`** — wire from the Manager's `prompt_template`, or type your
+  own template directly into the widget.
+- **`mode`** — `hybrid` (recommended), `reuse_existing`, or `force_new`.
+- **`max_per_category`** — soft cap. Once a category file hits this many
+  entries, the resolver stops appending and starts reusing.
+- **`seed`** — random seed for the choice between existing values.
+- **`fix_seed`** — when **off** (default), every queue run re-rolls the
+  fills (regardless of seed). When **on**, the resolver is fully
+  deterministic: same template + same seed = same final values.
+- **`prompts`** *(optional input)* — wire from the Manager. Carries the
+  system prompt + flair + category descriptions used per-slot.
 
-The table is backed by a JSON string under the hood, so headless / API workflows keep working — just edit the JSON directly if no UI is available.
+Outputs:
 
-Wire `prompts` into the resolver's optional `prompts` input. Anything left blank falls back to defaults.
+- **`resolved_prompt`** — the final template with all wildcards replaced.
+  Wire into your CLIP Text Encode positive input.
+- **`report`** — full text report. Wire into the Report node.
 
-### LLM Wildcard Report
+### 🎲 LLM Wildcard Report
 
-Wire the resolver's `report` output into this node's `report` input. The full report is rendered **inside the node body** (read-only textarea, resizable) and re-emitted as outputs:
+Renders the resolver's run results inside the node body and re-emits parsed
+counters for routing.
+
+Inputs:
+
+- **`report`** — wire from the Resolver's `report` output.
+
+Outputs:
 
 | Output      | Type   | Meaning                                                        |
 |-------------|--------|----------------------------------------------------------------|
 | `summary`   | STRING | The complete report text.                                      |
-| `generated` | INT    | Count of slots that produced new values (and were appended).   |
-| `reused`    | INT    | Count of slots that reused an existing value (incl. cap-hits). |
-| `errors`    | INT    | Count of slots where the LLM call failed.                      |
+| `generated` | INT    | Slots that produced new values (and were appended).            |
+| `reused`    | INT    | Slots that reused an existing value (incl. cap-hits).          |
+| `errors`    | INT    | Slots where the LLM call failed.                               |
 | `total`     | INT    | Total wildcard slots resolved.                                 |
 
-For each slot you'll see: status, final value, pool size, the prompt sent to the LLM (category, description, forbidden count, model, temperature), the LLM's raw reply, and any retry / error details. Useful for debugging a model that keeps producing the wrong shape of output.
+UI:
 
-Useful for routing: e.g. only save the workflow image when `errors == 0`.
+- Header bar with `total / generated / reused / errors` counters.
+- One row per slot: status badge · name · final value (truncated). Click the
+  expand chevron to reveal the prompt sent to the LLM, the LLM's raw reply,
+  any retry, and any error.
+- **Raw report** textarea at the bottom for copy-paste.
+
+Useful for routing — e.g. only save the workflow image when `errors == 0`.
 
 ## Anti-repetition guarantees
 
-Each LLM call receives:
+Each per-slot LLM call receives:
 1. Only the category name and category description.
 2. The full list of existing values flagged as **forbidden / do not paraphrase**.
 3. No other context from the surrounding prompt.
 
-If the model returns a duplicate anyway, the node retries once with a higher
-temperature.
+If the model returns a duplicate anyway, the Resolver retries once with a
+higher temperature.
 
-## Seed behavior
+## Seed behavior at a glance
 
-- `seed = 0` — fresh randomness every queue run.
-- `seed != 0` — reproducible cache picks (the LLM call itself is still
-  non-deterministic unless your backend supports a seed parameter).
+| Where         | Setting              | Effect                                                                |
+|---------------|----------------------|-----------------------------------------------------------------------|
+| Manager       | `seed = 0`           | Re-roll the prompt template + category set every queue run.           |
+| Manager       | `seed != 0`          | Reproducible: same inputs + same seed → same template + categories.   |
+| Resolver      | `fix_seed = false`   | Re-roll the per-slot fills every queue run (regardless of seed).      |
+| Resolver      | `fix_seed = true`    | Fully deterministic: same template + same seed → same final values.   |
