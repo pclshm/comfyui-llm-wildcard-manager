@@ -163,7 +163,9 @@ def _call_ollama(endpoint: str, model: str, system: str, user: str, temperature:
 def _call_openai_compatible(endpoint: str, model: str, system: str, user: str,
                             temperature: float, api_key: str,
                             request_json: bool = False, seed: int = 0,
-                            json_schema: dict | None = None) -> str:
+                            json_schema: dict | None = None,
+                            grammar: str | None = None,
+                            backend: str = "openai_compatible") -> str:
     payload = {
         "model": model or "local-model",
         "messages": [
@@ -174,19 +176,20 @@ def _call_openai_compatible(endpoint: str, model: str, system: str, user: str,
     }
     if seed:
         payload["seed"] = int(seed)
-    if json_schema is not None:
-        # Send the schema via BOTH paths so any local OpenAI-compat server
-        # gets a strict grammar regardless of which path it honours:
-        #   * llama.cpp's native top-level `json_schema` reliably builds and
-        #     attaches a GBNF grammar to the sampler. Some llama.cpp builds
-        #     accept `response_format` but attach a permissive grammar that
-        #     lets the model emit arbitrary top-level keys.
-        #   * Real OpenAI silently ignores unknown body fields, so the
-        #     top-level `json_schema` is harmless there and `response_format`
-        #     drives its native structured-outputs path.
-        # This means the user no longer has to pick the right backend — both
-        # `llamacpp` and `openai_compatible` get strict enforcement on
-        # llama.cpp servers, and real OpenAI keeps working too.
+
+    # Enforcement path is mutually exclusive on llama.cpp: sending `grammar`
+    # alongside `json_schema` (or `response_format`, which it converts to
+    # json_schema internally) trips a "Cannot use both json_schema and grammar"
+    # 500 server-side. So branch on backend:
+    #   * llamacpp     → raw GBNF via `grammar` (most reliable across builds;
+    #                    bypasses the schema-to-grammar converter, which has
+    #                    historically produced permissive grammars).
+    #   * openai_compat → `response_format` (+ top-level `json_schema` for the
+    #                    rare older OpenAI-compat server that reads it natively;
+    #                    real OpenAI ignores unknown fields).
+    if backend == "llamacpp" and grammar:
+        payload["grammar"] = grammar
+    elif json_schema is not None:
         payload["json_schema"] = json_schema
         payload["response_format"] = {
             "type": "json_schema",
@@ -201,6 +204,13 @@ def _call_openai_compatible(endpoint: str, model: str, system: str, user: str,
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     url = endpoint.rstrip("/") + "/chat/completions"
+    print(
+        f"[LLMWildcard DEBUG] backend={backend!r} url={url!r} "
+        f"payload_keys={sorted(payload.keys())} "
+        f"grammar_set={'grammar' in payload} "
+        f"json_schema_set={'json_schema' in payload} "
+        f"response_format_set={'response_format' in payload}"
+    )
     body = _http_post_json(url, payload, headers)
     return body["choices"][0]["message"]["content"].strip()
 
@@ -208,7 +218,8 @@ def _call_openai_compatible(endpoint: str, model: str, system: str, user: str,
 def _server_call(server: dict, system: str, user: str,
                  temperature_override: float | None = None,
                  request_json: bool = False, seed: int = 0,
-                 json_schema: dict | None = None) -> str:
+                 json_schema: dict | None = None,
+                 grammar: str | None = None) -> str:
     backend = server.get("backend", "ollama")
     endpoint = server.get("endpoint", "http://localhost:11434")
     model = server.get("model", "")
@@ -217,12 +228,14 @@ def _server_call(server: dict, system: str, user: str,
                  if temperature_override is not None
                  else server.get("temperature", 0.9))
     if backend == "ollama":
+        # Ollama has no `grammar` field — schema is the only enforcement path.
         return _call_ollama(endpoint, model, system, user, temp,
                             request_json=request_json, seed=seed,
                             json_schema=json_schema)
     return _call_openai_compatible(endpoint, model, system, user, temp, api_key,
                                    request_json=request_json, seed=seed,
-                                   json_schema=json_schema)
+                                   json_schema=json_schema, grammar=grammar,
+                                   backend=backend)
 
 
 # -----------------------------------------------------------------------------
@@ -359,8 +372,7 @@ MANAGER_SYSTEM_PROMPT = (
 # __snake_case__ substring. Without this, weaker models exhibit "schema
 # collapse" — they satisfy the {prompt, categories} shape but emit a plain
 # polished sentence with zero placeholders, treating categories as filled-in
-# values instead of placeholder descriptions. The grammar literally cannot
-# accept a prompt string missing the underscore tokens.
+# values instead of placeholder descriptions.
 MANAGER_JSON_SCHEMA: dict = {
     "type": "object",
     "properties": {
@@ -379,6 +391,43 @@ MANAGER_JSON_SCHEMA: dict = {
     "required": ["prompt", "categories"],
     "additionalProperties": False,
 }
+
+
+# Raw GBNF grammar mirroring MANAGER_JSON_SCHEMA. Sent via llama.cpp's native
+# `grammar` field — the only enforcement path that has worked reliably across
+# llama.cpp builds for the user. The schema-to-grammar converter has historically
+# produced permissive grammars (extra top-level keys leak through, the prompt's
+# pattern requirement is dropped, ...). Hand-written GBNF bypasses that and
+# guarantees:
+#   1. exactly two top-level keys, in order: "prompt" and "categories"
+#   2. the prompt string contains at least one __snake_case_name__ substring
+#      (the prefix rule rejects any sequence containing a stray "__" before the
+#      wildcard, forcing the model to emit a real placeholder)
+#   3. categories is an object mapping snake_case keys to strings
+MANAGER_GBNF = r'''
+root ::= "{" ws "\"prompt\"" ws ":" ws prompt-string ws "," ws "\"categories\"" ws ":" ws cat-obj ws "}"
+
+prompt-string ::= "\"" pre-segs "__" wname "__" post-segs "\""
+
+pre-segs ::= ( pre-char | "_" non-und )*
+pre-char ::= [^"\\_\x7F\x00-\x1F]
+non-und ::= [^_"\\\x7F\x00-\x1F]
+
+wname ::= [a-zA-Z] [a-zA-Z0-9_-]*
+
+post-segs ::= post-char*
+post-char ::= [^"\\\x7F\x00-\x1F] | escape
+
+escape ::= "\\" ( ["\\bfnrt] | "u" [0-9a-fA-F]{4} )
+
+cat-obj ::= "{" ws "}" | "{" ws cat-entry (ws "," ws cat-entry)* ws "}"
+cat-entry ::= cat-key ws ":" ws cat-value
+cat-key ::= "\"" [a-z] [a-z0-9_]* "\""
+cat-value ::= "\"" val-char* "\""
+val-char ::= [^"\\\x7F\x00-\x1F] | escape
+
+ws ::= [ \t\n\r]*
+'''.strip()
 
 
 # -----------------------------------------------------------------------------
@@ -727,7 +776,7 @@ def llm_design_template(example_prompt: str, direction_text: str, extra_flair: s
     user = "\n".join(user_parts)
 
     raw = _server_call(server, base, user, request_json=True, seed=seed,
-                       json_schema=MANAGER_JSON_SCHEMA)
+                       json_schema=MANAGER_JSON_SCHEMA, grammar=MANAGER_GBNF)
     parsed = _extract_json_object(raw)
     if not parsed:
         return ("", {}, raw, "parse_failed")
