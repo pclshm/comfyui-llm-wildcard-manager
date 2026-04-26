@@ -43,23 +43,103 @@ function hideWidget(node, widget) {
     if (widget.element) widget.element.style.display = "none";
 }
 
+// Shrink ComfyUI's multiline STRING widget. Default sizing is ~120px which
+// stacks 3 of them into ~360px of header before the DOM widget gets any
+// space. Cap at `height` and resize the textarea inside to match.
+function shrinkMultilineWidget(node, name, height = 56) {
+    const w = node.widgets?.find(x => x.name === name);
+    if (!w) return;
+    w.computeSize = function (width) { return [width, height]; };
+    // ComfyUI's multiline widget exposes the textarea as `inputEl`.
+    const ta = w.inputEl || w.element;
+    if (ta) {
+        ta.style.height = `${height - 8}px`;
+        ta.style.minHeight = `${height - 8}px`;
+        ta.style.resize = "none";
+    }
+    // Some ComfyUI versions also key off `computedHeight`.
+    w.computedHeight = height;
+}
+
+// Pin a DOM widget's rendered height to a stable constant. Default behavior
+// (`element.scrollHeight`) grows with content and pushes the widget past the
+// visible node frame. Anchoring to a constant breaks the feedback loop.
+function pinWidgetHeight(domWidget, height) {
+    if (!domWidget) return;
+    domWidget.computeSize = function (width) { return [width, height]; };
+    domWidget.computedHeight = height;
+}
+
+// Build a single-line editable div that mimics an <input type="text"> but
+// isn't a form field — password managers (Dashlane, 1Password, LastPass,
+// Bitwarden) don't autofill into contenteditable divs. The data-* attributes
+// are extra belt-and-suspenders for managers that scan beyond <input>.
+function makeEditable(placeholder, value) {
+    const el = document.createElement("div");
+    el.setAttribute("contenteditable", "plaintext-only");
+    // Firefox doesn't support plaintext-only — fall back to plain editable.
+    if (el.contentEditable !== "plaintext-only") {
+        el.setAttribute("contenteditable", "true");
+    }
+    el.dataset.placeholder = placeholder;
+    el.spellcheck = false;
+    el.setAttribute("data-form-type", "other");
+    el.setAttribute("data-1p-ignore", "true");
+    el.setAttribute("data-lpignore", "true");
+    el.setAttribute("data-bwignore", "true");
+    if (value) el.textContent = value;
+    el.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") { e.preventDefault(); el.blur(); }
+    });
+    // For the contenteditable=true fallback, scrub HTML on paste.
+    el.addEventListener("paste", (e) => {
+        if (el.getAttribute("contenteditable") === "plaintext-only") return;
+        e.preventDefault();
+        const text = (e.clipboardData || window.clipboardData).getData("text/plain");
+        const sel = window.getSelection();
+        if (sel?.rangeCount) {
+            const range = sel.getRangeAt(0);
+            range.deleteContents();
+            range.insertNode(document.createTextNode(text));
+            range.collapse(false);
+            sel.removeAllRanges();
+            sel.addRange(range);
+        } else {
+            el.textContent = (el.textContent || "") + text;
+        }
+    });
+    return el;
+}
+
 // One-time CSS for the Manager + Report. Scoped to `.lwm-*` so it can't bleed
 // into the rest of ComfyUI.
 function injectStyles() {
     if (document.getElementById("lwm-styles")) return;
     const css = `
-        .lwm-root { display:flex; flex-direction:column; gap:10px;
+        /* Root fills the widget container exactly and never overflows; the
+           scroll area is delegated to .lwm-scroll inside. The classic flex
+           pattern: flex column with overflow:hidden, plus a child with
+           flex:1 1 auto + min-height:0 + overflow:auto. */
+        .lwm-root { display:flex; flex-direction:column; gap:8px;
             padding:6px; box-sizing:border-box; width:100%; height:100%;
-            max-width:100%; min-width:0;
-            overflow-x:hidden; overflow-y:auto;
+            max-width:100%; min-width:0; min-height:0;
+            overflow:hidden;
             font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI",
                 Roboto, sans-serif; color:#dcdcdc;
         }
-        .lwm-root::-webkit-scrollbar { width:8px; }
-        .lwm-root::-webkit-scrollbar-thumb {
-            background:#2c3138; border-radius:4px; }
-        .lwm-root::-webkit-scrollbar-thumb:hover { background:#3a4250; }
+        /* Manager variant: height tracks content so the node grows with the
+           list instead of clipping it. No internal scroll on the categories. */
+        .lwm-root.lwm-root-fit { height:auto; overflow:visible; }
         .lwm-root * { box-sizing:border-box; }
+        .lwm-fixed { flex:0 0 auto; min-height:0; }
+        .lwm-scroll { flex:1 1 auto; min-height:0; min-width:0;
+            overflow-y:auto; overflow-x:hidden; padding-right:2px; }
+        .lwm-scroll.lwm-cap-cats   { max-height:260px; }
+        .lwm-scroll.lwm-cap-slots  { max-height:240px; }
+        .lwm-scroll::-webkit-scrollbar { width:8px; }
+        .lwm-scroll::-webkit-scrollbar-thumb {
+            background:#2c3138; border-radius:4px; }
+        .lwm-scroll::-webkit-scrollbar-thumb:hover { background:#3a4250; }
         .lwm-section-label { font-size:10px; letter-spacing:.06em;
             text-transform:uppercase; color:#7d8693; margin:2px 2px -2px; }
         .lwm-toolbar { display:flex; gap:6px; align-items:center;
@@ -75,6 +155,16 @@ function injectStyles() {
         }
         .lwm-input:focus, .lwm-textarea:focus {
             border-color:#4d8cd0; box-shadow:0 0 0 2px rgba(77,140,208,.18);
+        }
+        /* Contenteditable inputs (used instead of <input> in the manager so
+           password managers like Dashlane don't try to autofill them). */
+        .lwm-input[contenteditable] {
+            white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+            cursor:text; line-height:1.3;
+        }
+        .lwm-input[contenteditable]:empty::before {
+            content: attr(data-placeholder);
+            color:#5a606a; pointer-events:none;
         }
         .lwm-textarea { width:100%; resize:none;
             font-family: ui-monospace, Menlo, Consolas, monospace;
@@ -205,8 +295,10 @@ function injectStyles() {
         }
         .lwm-detail-row { margin-bottom:2px; }
         .lwm-detail-key { color:#7d8693; }
-        .lwm-flex-fill { flex:1 1 auto; min-height:120px;
+        .lwm-flex-fill { flex:1 1 auto; min-height:0;
             display:flex; flex-direction:column; min-width:0; }
+        .lwm-flex-fill > textarea {
+            flex:1 1 auto; min-height:0; height:100%; width:100%; }
         .lwm-entries::-webkit-scrollbar, .lwm-textarea::-webkit-scrollbar,
         .lwm-prompt-panel::-webkit-scrollbar, .lwm-slot-detail::-webkit-scrollbar {
             width:8px; height:8px; }
@@ -267,29 +359,40 @@ app.registerExtension({
                 if (!jsonWidget) return;
                 hideWidget(node, jsonWidget);
 
-                const root = document.createElement("div");
-                root.className = "lwm-root";
+                // Shrink the oversized multiline STRING widgets so the node
+                // header doesn't eat all the space before the DOM table.
+                shrinkMultilineWidget(node, "example_prompt", 64);
+                shrinkMultilineWidget(node, "extra_flair", 48);
+                shrinkMultilineWidget(node, "system_prompt_override", 48);
 
-                // ---- generated prompt panel ----
+                const root = document.createElement("div");
+                root.className = "lwm-root lwm-root-fit";
+
+                // Forward declaration — set to its real impl after the DOM
+                // widget exists. Helpers below call it on changes that affect
+                // the rendered height.
+                let updateManagerSize = () => {};
+
+                // ---- generated prompt panel (fixed at top) ----
                 const promptLabel = document.createElement("div");
-                promptLabel.className = "lwm-section-label";
+                promptLabel.className = "lwm-section-label lwm-fixed";
                 promptLabel.textContent = "Generated prompt template";
                 const promptPanel = document.createElement("div");
-                promptPanel.className = "lwm-prompt-panel lwm-empty";
+                promptPanel.className = "lwm-prompt-panel lwm-empty lwm-fixed";
                 promptPanel.textContent =
                     "(no template yet — queue the workflow to generate)";
                 root.appendChild(promptLabel);
                 root.appendChild(promptPanel);
 
-                // ---- categories toolbar ----
+                // ---- categories toolbar (fixed) ----
                 const headLabel = document.createElement("div");
-                headLabel.className = "lwm-section-label";
+                headLabel.className = "lwm-section-label lwm-fixed";
                 headLabel.textContent =
                     "Categories — descriptions sent to the LLM + entries on disk";
                 root.appendChild(headLabel);
 
                 const toolbar = document.createElement("div");
-                toolbar.className = "lwm-toolbar";
+                toolbar.className = "lwm-toolbar lwm-fixed";
 
                 const pathLine = document.createElement("div");
                 pathLine.className = "lwm-pathline";
@@ -310,6 +413,9 @@ app.registerExtension({
                 toolbar.appendChild(addBtn);
                 root.appendChild(toolbar);
 
+                // ---- categories list ----
+                // No scroll wrapper: the node itself grows to fit every row,
+                // so the list never produces an internal scrollbar.
                 const list = document.createElement("div");
                 list.className = "lwm-list";
                 root.appendChild(list);
@@ -317,8 +423,8 @@ app.registerExtension({
                 // ---- helpers ----
                 function readRows() {
                     return Array.from(list.children).map(row => ({
-                        name: row._nameInput.value,
-                        desc: row._descInput.value,
+                        name: row._nameInput.textContent ?? "",
+                        desc: row._descInput.textContent ?? "",
                     }));
                 }
                 function commit() {
@@ -344,18 +450,13 @@ app.registerExtension({
                     expandBtn.textContent = "▸";
                     expandBtn.title = "Show entries on disk";
 
-                    const nameI = document.createElement("input");
-                    nameI.type = "text";
-                    nameI.placeholder = "name";
-                    nameI.value = name;
-                    nameI.className = "lwm-input lwm-name";
+                    const nameI = makeEditable("name", name);
+                    nameI.classList.add("lwm-input", "lwm-name");
                     row._nameInput = nameI;
 
-                    const descI = document.createElement("input");
-                    descI.type = "text";
-                    descI.placeholder = "description sent to the LLM";
-                    descI.value = desc;
-                    descI.className = "lwm-input lwm-desc";
+                    const descI = makeEditable(
+                        "description sent to the LLM", desc);
+                    descI.classList.add("lwm-input", "lwm-desc");
                     row._descInput = descI;
 
                     const badge = document.createElement("span");
@@ -403,6 +504,7 @@ app.registerExtension({
                     expandBtn.addEventListener("click", () => {
                         const open = entriesPanel.classList.toggle("lwm-open");
                         expandBtn.classList.toggle("lwm-open", open);
+                        updateManagerSize();
                     });
 
                     nameI.addEventListener("input", commit);
@@ -410,6 +512,7 @@ app.registerExtension({
                     rmBtn.addEventListener("click", () => {
                         row.remove();
                         commit();
+                        updateManagerSize();
                     });
 
                     return row;
@@ -421,10 +524,11 @@ app.registerExtension({
                         promptPanel.classList.add("lwm-empty");
                         promptPanel.textContent =
                             "(no template yet — queue the workflow to generate)";
-                        return;
+                    } else {
+                        promptPanel.classList.remove("lwm-empty");
+                        promptPanel.innerHTML = renderTemplateHTML(t);
                     }
-                    promptPanel.classList.remove("lwm-empty");
-                    promptPanel.innerHTML = renderTemplateHTML(t);
+                    updateManagerSize();
                 }
 
                 function rebuildFromSnapshot(snapshot) {
@@ -445,6 +549,7 @@ app.registerExtension({
                         }));
                     }
                     if (!list.children.length) list.appendChild(buildRow());
+                    updateManagerSize();
                 }
 
                 function rebuildFromWidgetOnly() {
@@ -455,6 +560,7 @@ app.registerExtension({
                             name: n, desc: d, user_override: true,
                         }));
                     }
+                    updateManagerSize();
                 }
 
                 async function refreshFromServer() {
@@ -473,15 +579,38 @@ app.registerExtension({
                 addBtn.addEventListener("click", () => {
                     list.appendChild(buildRow({ user_override: true }));
                     commit();
+                    updateManagerSize();
                 });
 
                 rebuildFromWidgetOnly();
 
-                node.addDOMWidget("manager_view", "div", root, { serialize: false });
-                node.size = [
-                    Math.max(node.size[0], 580),
-                    Math.max(node.size[1], 660),
-                ];
+                const managerWidget = node.addDOMWidget(
+                    "manager_view", "div", root, { serialize: false });
+                node.size = [Math.max(node.size[0], 580), node.size[1]];
+
+                // Dynamic sizing: measure the rendered content height after
+                // the next frame, then resize the widget + node to match. The
+                // RAF guard collapses bursts of changes into one resize and
+                // ensures we measure after layout settles.
+                let _sizingPending = false;
+                updateManagerSize = function () {
+                    if (_sizingPending) return;
+                    _sizingPending = true;
+                    requestAnimationFrame(() => {
+                        _sizingPending = false;
+                        const h = Math.ceil(root.scrollHeight) + 8;
+                        const prev = managerWidget.computedHeight || 0;
+                        if (Math.abs(prev - h) < 2) return;
+                        managerWidget.computeSize =
+                            (width) => [width, h];
+                        managerWidget.computedHeight = h;
+                        const min = node.computeSize();
+                        const w = Math.max(node.size[0], min[0], 580);
+                        node.setSize([w, min[1]]);
+                        node.setDirtyCanvas(true, true);
+                    });
+                };
+                updateManagerSize();
 
                 const onConfigure = node.onConfigure;
                 node.onConfigure = function (info) {
@@ -522,32 +651,36 @@ app.registerExtension({
                 root.className = "lwm-root";
 
                 const header = document.createElement("div");
-                header.className = "lwm-report-header";
+                header.className = "lwm-report-header lwm-fixed";
                 header.textContent = "(no report yet)";
                 root.appendChild(header);
 
                 const slotsLabel = document.createElement("div");
-                slotsLabel.className = "lwm-section-label";
+                slotsLabel.className = "lwm-section-label lwm-fixed";
                 slotsLabel.textContent = "Per-slot details";
                 root.appendChild(slotsLabel);
 
+                // slots list lives in its own scroll container so the node
+                // body never overflows past the visible footer.
+                const slotsScroll = document.createElement("div");
+                slotsScroll.className = "lwm-scroll lwm-cap-slots";
                 const slots = document.createElement("div");
                 slots.className = "lwm-list";
-                root.appendChild(slots);
+                slotsScroll.appendChild(slots);
+                root.appendChild(slotsScroll);
 
                 const rawLabel = document.createElement("div");
-                rawLabel.className = "lwm-section-label";
+                rawLabel.className = "lwm-section-label lwm-fixed";
                 rawLabel.textContent = "Raw report";
                 root.appendChild(rawLabel);
 
                 const rawWrap = document.createElement("div");
                 rawWrap.className = "lwm-flex-fill";
+                rawWrap.style.flex = "0 0 160px";
                 const rawTA = document.createElement("textarea");
                 rawTA.readOnly = true;
                 rawTA.spellcheck = false;
                 rawTA.className = "lwm-textarea";
-                rawTA.style.flex = "1 1 auto";
-                rawTA.style.minHeight = "100%";
                 rawWrap.appendChild(rawTA);
                 root.appendChild(rawWrap);
 
@@ -650,11 +783,13 @@ app.registerExtension({
                     for (const r of records) slots.appendChild(buildSlot(r));
                 }
 
-                node.addDOMWidget("report_view", "div", root, { serialize: false });
-                node.size = [
-                    Math.max(node.size[0], 560),
-                    Math.max(node.size[1], 480),
-                ];
+                // Header (~36) + label (~16) + slots scroll cap (240) +
+                // label (~16) + raw textarea (160) + gaps ≈ 480.
+                const REPORT_DOM_HEIGHT = 480;
+                const reportWidget = node.addDOMWidget(
+                    "report_view", "div", root, { serialize: false });
+                pinWidgetHeight(reportWidget, REPORT_DOM_HEIGHT);
+                node.size = [Math.max(node.size[0], 560), node.size[1]];
 
                 node._renderReport = (payload) => {
                     renderTallies(payload?.tallies, payload?.raw);
