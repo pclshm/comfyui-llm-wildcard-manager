@@ -87,8 +87,6 @@ function injectManagerStyles() {
             font-family: ui-monospace, Menlo, Consolas, monospace;
             min-width:0; overflow:hidden; text-overflow:ellipsis;
             white-space:nowrap; }
-        .lwm-direction-hint { font-size:10px; color:#9aa3ad; margin:-4px 2px 0;
-            font-style:italic; min-height:1em; }
         .lwm-list { display:flex; flex-direction:column; gap:6px;
             min-width:0; max-width:100%; }
         .lwm-row {
@@ -386,104 +384,16 @@ app.registerExtension({
                 const node = this;
 
                 const jsonWidget = node.widgets.find(w => w.name === "categories");
-                const directionWidget = node.widgets.find(w => w.name === "direction");
-                const flairWidget = node.widgets.find(w => w.name === "extra_flair");
-                const sysPromptWidget = node.widgets.find(w => w.name === "system_prompt_override");
                 if (!jsonWidget) return;
-                // Hide every underlying widget so the Manager DOM widget is the
-                // sole visible content. Otherwise multiline textareas overlay
-                // the canvas above the DOM widget and push the direction input
-                // outside the node bounds.
+                // Only the categories JSON widget is replaced by the DOM table.
+                // direction / extra_flair / system_prompt_override remain as
+                // standard ComfyUI widgets so they render inside the node
+                // frame and don't overlay the canvas.
                 hideWidget(node, jsonWidget);
-                if (directionWidget) hideWidget(node, directionWidget);
-                if (flairWidget) hideWidget(node, flairWidget);
-                if (sysPromptWidget) hideWidget(node, sysPromptWidget);
 
                 // ----- root layout -----
                 const root = document.createElement("div");
                 root.className = "lwm-root";
-
-                // ----- direction: free-text input + datalist of presets -----
-                const dirSectionLabel = document.createElement("div");
-                dirSectionLabel.className = "lwm-section-label";
-                dirSectionLabel.textContent = "Direction (preset key or custom steering)";
-                root.appendChild(dirSectionLabel);
-
-                const dirRow = document.createElement("div");
-                dirRow.className = "lwm-toolbar";
-                const dirInput = document.createElement("input");
-                dirInput.type = "text";
-                dirInput.className = "lwm-input";
-                dirInput.style.flex = "1 1 auto";
-                dirInput.setAttribute("list", `lwm-dir-presets-${node.id ?? Math.random().toString(36).slice(2)}`);
-                dirInput.placeholder = "e.g. cinematic — or type your own steering text";
-                dirInput.value = directionWidget?.value || "none";
-
-                const datalist = document.createElement("datalist");
-                datalist.id = dirInput.getAttribute("list");
-                dirRow.appendChild(dirInput);
-                dirRow.appendChild(datalist);
-                root.appendChild(dirRow);
-
-                const dirHint = document.createElement("div");
-                dirHint.className = "lwm-direction-hint";
-                root.appendChild(dirHint);
-
-                let knownPresets = {};
-                function setDirHint() {
-                    const v = (dirInput.value || "").trim();
-                    if (!v || v === "none") {
-                        dirHint.textContent = "no extra steering";
-                        return;
-                    }
-                    if (v in knownPresets) {
-                        const t = knownPresets[v];
-                        dirHint.textContent = t ? `preset → ${t}` : "preset → (no extra steering)";
-                    } else {
-                        dirHint.textContent = "custom steering — sent to the LLM as written";
-                    }
-                }
-                dirInput.addEventListener("input", () => {
-                    if (directionWidget) directionWidget.value = dirInput.value;
-                    setDirHint();
-                    node.setDirtyCanvas(true, true);
-                });
-
-                // ----- extra flair (multiline) -----
-                const flairLabel = document.createElement("div");
-                flairLabel.className = "lwm-section-label";
-                flairLabel.textContent = "Extra flair (appended after the direction)";
-                root.appendChild(flairLabel);
-
-                const flairTA = document.createElement("textarea");
-                flairTA.className = "lwm-textarea";
-                flairTA.rows = 2;
-                flairTA.placeholder =
-                    "Optional extra steering, appended after the direction.";
-                flairTA.value = flairWidget?.value || "";
-                flairTA.addEventListener("input", () => {
-                    if (flairWidget) flairWidget.value = flairTA.value;
-                    node.setDirtyCanvas(true, true);
-                });
-                root.appendChild(flairTA);
-
-                // ----- system prompt override (multiline, advanced) -----
-                const sysLabel = document.createElement("div");
-                sysLabel.className = "lwm-section-label";
-                sysLabel.textContent = "System prompt override (advanced — leave empty for default)";
-                root.appendChild(sysLabel);
-
-                const sysTA = document.createElement("textarea");
-                sysTA.className = "lwm-textarea";
-                sysTA.rows = 2;
-                sysTA.placeholder =
-                    "Leave empty to use the built-in system prompt. Fill to fully replace it.";
-                sysTA.value = sysPromptWidget?.value || "";
-                sysTA.addEventListener("input", () => {
-                    if (sysPromptWidget) sysPromptWidget.value = sysTA.value;
-                    node.setDirtyCanvas(true, true);
-                });
-                root.appendChild(sysTA);
 
                 // ----- toolbar: header + refresh + add -----
                 const headLabel = document.createElement("div");
@@ -630,17 +540,6 @@ app.registerExtension({
                     if (snapshot?.wildcards_dir) {
                         pathLine.textContent = `wildcards: ${snapshot.wildcards_dir}`;
                     }
-                    if (snapshot?.direction_presets) {
-                        knownPresets = snapshot.direction_presets;
-                        datalist.innerHTML = "";
-                        for (const [k, v] of Object.entries(knownPresets)) {
-                            const opt = document.createElement("option");
-                            opt.value = k;
-                            opt.label = v ? v.slice(0, 80) : "(no extra steering)";
-                            datalist.appendChild(opt);
-                        }
-                        setDirHint();
-                    }
                     const declared = readCategoriesJSON(jsonWidget);
                     const seen = new Set();
                     for (const r of (snapshot?.rows || [])) {
@@ -702,18 +601,14 @@ app.registerExtension({
                 });
 
                 rebuildFromWidgetOnly();
-                setDirHint();
 
                 node.addDOMWidget("manager_view", "div", root, { serialize: false });
-                node.size = [Math.max(node.size[0], 620), Math.max(node.size[1], 640)];
+                node.size = [Math.max(node.size[0], 560), Math.max(node.size[1], 520)];
 
                 const onConfigure = node.onConfigure;
                 node.onConfigure = function (info) {
                     onConfigure?.apply(this, arguments);
                     setTimeout(() => {
-                        if (directionWidget) dirInput.value = directionWidget.value || "none";
-                        if (flairWidget) flairTA.value = flairWidget.value || "";
-                        if (sysPromptWidget) sysTA.value = sysPromptWidget.value || "";
                         rebuildFromWidgetOnly();
                         refreshFromServer();
                     }, 0);
