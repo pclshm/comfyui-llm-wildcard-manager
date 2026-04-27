@@ -135,6 +135,11 @@ Inputs:
 - **`server`** — wire from the Server Config.
 - **`example_prompt`** — your idea. The Manager turns this into a template
   with variable parts replaced by `__wildcards__`.
+- **`lock_template`** — when **on**, the Manager skips the LLM entirely and
+  reuses the last generated template + categories. Re-queue to get fresh
+  random wildcard fills from the Resolver without changing the prompt. When
+  **off** (default), the Manager regenerates every queue (modulated by
+  `seed`).
 - **`seed`** — `0` re-rolls the template every queue run (new template, new
   category set). Non-zero is reproducible: same inputs → same template.
 - **`direction`** — *free-text with autocomplete*. Pick a built-in preset
@@ -244,9 +249,14 @@ higher temperature.
 
 ## Seed behavior at a glance
 
-| Where         | Setting              | Effect                                                                |
-|---------------|----------------------|-----------------------------------------------------------------------|
-| Manager       | `seed = 0`           | Re-roll the prompt template + category set every queue run.           |
-| Manager       | `seed != 0`          | Reproducible: same inputs + same seed → same template + categories.   |
-| Resolver      | `fix_seed = false`   | Re-roll the per-slot fills every queue run (regardless of seed).      |
-| Resolver      | `fix_seed = true`    | Fully deterministic: same template + same seed → same final values.   |
+| Where         | Setting                | Effect                                                                |
+|---------------|------------------------|-----------------------------------------------------------------------|
+| Manager       | `lock_template = true` | Skip the LLM. Reuse the last cached template + categories.            |
+| Manager       | `seed = 0`             | Re-roll the prompt template + category set every queue run.           |
+| Manager       | `seed != 0`            | Reproducible: same inputs + same seed → same template + categories.   |
+| Resolver      | `fix_seed = false`     | Re-roll the per-slot fills every queue run (regardless of seed).      |
+| Resolver      | `fix_seed = true`      | Fully deterministic: same template + same seed → same final values.   |
+
+**Reuse the same prompt with fresh wildcards every queue:** turn on Manager
+`lock_template` and leave Resolver `fix_seed` off. The Manager won't call
+the LLM; the Resolver re-rolls each slot every run.

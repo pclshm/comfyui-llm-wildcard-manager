@@ -245,13 +245,17 @@ function injectStyles() {
         }
         .lwm-status-banner.lwm-status-parse_failed,
         .lwm-status-banner.lwm-status-no_prompt,
-        .lwm-status-banner.lwm-status-llm_error {
+        .lwm-status-banner.lwm-status-llm_error,
+        .lwm-status-banner.lwm-status-no_locked_template {
             border-color:#5b2c2c; background:#281616; color:#ff9b9b;
         }
         .lwm-status-banner.lwm-status-no_wildcards,
         .lwm-status-banner.lwm-status-salvaged,
         .lwm-status-banner.lwm-status-fallback_default {
             border-color:#5b4a2c; background:#2a2316; color:#f5d782;
+        }
+        .lwm-status-banner.lwm-status-locked {
+            border-color:#2c4467; background:#1a2434; color:#9ec5ff;
         }
         .lwm-raw-header {
             cursor:pointer; user-select:none; display:flex; gap:6px;
@@ -669,15 +673,19 @@ app.registerExtension({
                 function renderRawReply(raw, status) {
                     const text = String(raw ?? "");
                     const hasContent = text.trim().length > 0;
+                    // "locked" means the LLM was deliberately skipped — treat
+                    // it as a normal status (no red border, no auto-expand).
+                    const isFailure =
+                        status && status !== "ok" && status !== "locked";
                     rawPanel.classList.remove("lwm-error-border");
-                    if (status && status !== "ok" && hasContent) {
+                    if (isFailure && hasContent) {
                         rawPanel.classList.add("lwm-error-border");
                     }
                     rawPanel.textContent = text;
                     rawHeader.style.display = hasContent ? "" : "none";
                     // Auto-open on failure so the user sees what came back; on
-                    // success, leave it collapsed unless the user opened it.
-                    if (status && status !== "ok" && hasContent) {
+                    // success/locked, leave it collapsed unless the user opened it.
+                    if (isFailure && hasContent) {
                         rawHeader.classList.add("lwm-open");
                         rawPanel.style.display = "block";
                     }

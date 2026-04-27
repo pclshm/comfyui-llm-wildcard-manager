@@ -1002,6 +1002,18 @@ class LLMWildcardManager:
                         "with __wildcard__ placeholders for the variable parts."
                     ),
                 }),
+                # Skip the LLM entirely and reuse the last successful template +
+                # categories. Lets the user re-queue to get fresh wildcard fills
+                # from the Resolver without the Manager rewriting the prompt.
+                "lock_template": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": (
+                        "When ON, skip the LLM and reuse the last generated "
+                        "prompt template + categories. Re-queue to get fresh "
+                        "random wildcards from the Resolver without changing "
+                        "the prompt."
+                    ),
+                }),
                 "seed": ("INT", {"default": 0, "min": 0,
                                  "max": 0xFFFFFFFFFFFFFFFF}),
                 "direction": ("STRING", {
@@ -1064,9 +1076,9 @@ class LLMWildcardManager:
     CATEGORY = "prompt/wildcards"
     OUTPUT_NODE = True
 
-    def manage(self, server, example_prompt, seed, direction, extra_flair,
-               min_categories, max_categories, system_prompt_override,
-               categories):
+    def manage(self, server, example_prompt, lock_template, seed, direction,
+               extra_flair, min_categories, max_categories,
+               system_prompt_override, categories):
         direction = (direction or "").strip() or "none"
         direction_text = resolve_direction(direction)
         extra = (extra_flair or "").strip()
@@ -1124,48 +1136,83 @@ class LLMWildcardManager:
         status_message = ""
         raw_sections: list[tuple[str, str]] = []
 
-        try:
-            # Step 1 — draft the prompt sentence from idea + direction.
-            draft, raw_draft = llm_draft_prompt(
-                example_prompt or "", combined_direction, server,
-                seed=effective_seed,
-            )
-            raw_sections.append(("draft", raw_draft))
+        if lock_template:
+            # Skip the LLM entirely. Reuse the last persisted template +
+            # whatever category descriptions are already on disk. The Resolver
+            # will still re-roll wildcard fills each queue (when fix_seed is
+            # off), so the user gets a stable prompt with fresh randoms.
+            cached = ""
+            if LAST_TEMPLATE_PATH.exists():
+                try:
+                    cached = LAST_TEMPLATE_PATH.read_text(encoding="utf-8").strip()
+                except Exception as e:
+                    print(f"[LLMWildcardManager] Could not read cached template: {e}")
+            if cached:
+                template = cached
+                used_names = extract_wildcard_names(template)
+                status = "locked"
+                status_message = (
+                    "Lock is ON — reusing the last generated template "
+                    "(LLM not called). Toggle off to regenerate."
+                )
+                raw_sections.append((
+                    "locked",
+                    "(LLM calls skipped — template loaded from cache)",
+                ))
+            else:
+                status = "no_locked_template"
+                status_message = (
+                    "Lock is ON but no cached template exists yet. "
+                    "Toggle Lock off and queue once to generate one."
+                )
+                raw_sections.append((
+                    "locked",
+                    "(no cached template — toggle Lock off to generate)",
+                ))
+        else:
+            try:
+                # Step 1 — draft the prompt sentence from idea + direction.
+                draft, raw_draft = llm_draft_prompt(
+                    example_prompt or "", combined_direction, server,
+                    seed=effective_seed,
+                )
+                raw_sections.append(("draft", raw_draft))
 
-            # Step 2 — LLM rewrites the draft with __placeholders__ already
-            # inserted + lists the category names. Doing the wildcard insertion
-            # in the LLM (rather than substring-matching spans afterwards)
-            # avoids losing wildcards to phrasing mismatches; the helper also
-            # runs ensure_wildcard_format to repair any forgotten __ wraps.
-            template, used_names, raw_wildcardify = llm_wildcardify_prompt(
-                draft, server, seed=effective_seed,
-                min_categories=min_cats,
-                max_categories=max_cats,
-            )
-            raw_sections.append(("wildcardify", raw_wildcardify))
+                # Step 2 — LLM rewrites the draft with __placeholders__ already
+                # inserted + lists the category names. Doing the wildcard
+                # insertion in the LLM (rather than substring-matching spans
+                # afterwards) avoids losing wildcards to phrasing mismatches;
+                # the helper also runs ensure_wildcard_format to repair any
+                # forgotten __ wraps.
+                template, used_names, raw_wildcardify = llm_wildcardify_prompt(
+                    draft, server, seed=effective_seed,
+                    min_categories=min_cats,
+                    max_categories=max_cats,
+                )
+                raw_sections.append(("wildcardify", raw_wildcardify))
 
-            # Step 3 — describe each wildcard.
-            descs, raw_describe = llm_describe_wildcards(
-                used_names, server, seed=effective_seed,
-            )
-            raw_sections.append(("describe", raw_describe))
-            suggested_cats = descs
-        except ManagerStepError as e:
-            template = ""
-            used_names = []
-            status = f"failed_{e.step}"
-            status_message = (
-                f"Step '{e.step}' did not return parseable output. "
-                "See the raw reply panel below."
-            )
-            raw_sections.append((e.step + " (failed)", e.raw))
-        except Exception as e:
-            print(f"[LLMWildcardManager] LLM call failed: {e}")
-            template = ""
-            used_names = []
-            status = "llm_error"
-            status_message = str(e)
-            raw_sections.append(("error", f"(exception calling LLM: {e})"))
+                # Step 3 — describe each wildcard.
+                descs, raw_describe = llm_describe_wildcards(
+                    used_names, server, seed=effective_seed,
+                )
+                raw_sections.append(("describe", raw_describe))
+                suggested_cats = descs
+            except ManagerStepError as e:
+                template = ""
+                used_names = []
+                status = f"failed_{e.step}"
+                status_message = (
+                    f"Step '{e.step}' did not return parseable output. "
+                    "See the raw reply panel below."
+                )
+                raw_sections.append((e.step + " (failed)", e.raw))
+            except Exception as e:
+                print(f"[LLMWildcardManager] LLM call failed: {e}")
+                template = ""
+                used_names = []
+                status = "llm_error"
+                status_message = str(e)
+                raw_sections.append(("error", f"(exception calling LLM: {e})"))
 
         # Stitch the per-step raw replies into one panel-friendly blob so the
         # existing UI's raw_reply pane stays useful for debugging all four steps.
@@ -1244,7 +1291,11 @@ class LLMWildcardManager:
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
-        # seed=0 → fresh roll every queue; seed!=0 → reproducible.
+        # lock_template=True OR seed!=0 → reproducible (downstream Resolver
+        # still re-rolls each queue when its fix_seed is off).
+        # lock_template=False AND seed=0 → fresh roll every queue.
+        if bool(kwargs.get("lock_template")):
+            return _seeded_is_changed(True, kwargs)
         locked = int(kwargs.get("seed", 0) or 0) != 0
         return _seeded_is_changed(locked, kwargs)
 
