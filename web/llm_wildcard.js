@@ -72,41 +72,60 @@ function pinWidgetHeight(domWidget, height) {
 
 // Make a DOM widget grow with the node frame: the widget claims whatever
 // vertical space is left after the title bar and any sibling widgets, with a
-// floor of `minHeight` so the contents stay usable on a tiny node. Hooks
-// `onResize` so dragging the node corner reflows the inner flex children
-// (slots list, raw textarea) instead of being clipped.
+// floor of `minHeight` so the contents stay usable on a tiny node.
 //
-// Sizing must converge — if our `computeSize` reports a height + the chrome
-// LiteGraph/ComfyUI insert exceeds `node.size[1]`, ComfyUI grows the node,
-// `onResize` fires, we read the larger size, our height grows by the gap, and
-// the node inflates a few pixels every frame forever. Estimating the chrome
-// with a constant (TITLE + VPADDING + sum of siblings) doesn't match what
-// `node.computeSize()` actually returns, which is what reopened the loop.
+// Two earlier fixes (caching computedHeight; probing real chrome) still let
+// the node creep up by ~1px per mouse-driven redraw because they trusted
+// `node.size[1]` as input. Anything that nudged node.size — DOM widget
+// re-layout, scrollbar appearance, ComfyUI's own min-size enforcement —
+// flowed straight into the next computed height and grew us forever.
 //
-// Instead, probe `node.computeSize()` with our widget pinned to `minHeight` to
-// learn the real overhead the node adds around us, then pick our height so
-// `our_height + overhead === node.size[1]`. ComfyUI sees no reason to grow,
-// onResize doesn't re-fire, and the loop stays broken.
+// Flip the relationship: this widget is the source of truth for height. The
+// chrome is probed once at startup. node.size[1] is locked to
+// `widgetHeight + chrome` on every onResize call, so any drift from outside
+// is immediately undone. The widget only grows when the user is actively
+// dragging the resize corner (detected via `app.canvas.resizing_node`).
 function fillWidgetToNode(node, domWidget, minHeight = 280) {
     domWidget.computedHeight = minHeight;
     domWidget.computeSize = function (width) {
         return [width, domWidget.computedHeight ?? minHeight];
     };
-    function recompute() {
-        const saved = domWidget.computedHeight;
-        domWidget.computedHeight = minHeight;
-        const probed = (typeof node.computeSize === "function"
-            ? node.computeSize()[1] : minHeight);
-        const overhead = Math.max(0, probed - minHeight);
-        const target = Math.max(minHeight, node.size[1] - overhead);
-        domWidget.computedHeight = target;
-        return target !== saved;
+    // Probe overhead once. Pin our widget to minHeight, ask the node for its
+    // computed size, and the difference is everything else (title, slots,
+    // gaps). It does not depend on node.size, so it is stable.
+    const probed = (typeof node.computeSize === "function"
+        ? node.computeSize()[1] : minHeight);
+    const chrome = Math.max(0, probed - minHeight);
+
+    let intendedHeight = node.size[1];
+    function setWidgetHeight(h) {
+        domWidget.computedHeight = Math.max(minHeight, h);
+        intendedHeight = domWidget.computedHeight + chrome;
+        node.size[1] = intendedHeight;
     }
-    recompute();
+    setWidgetHeight(node.size[1] - chrome);
+
     const onResize = node.onResize;
     node.onResize = function (size) {
         onResize?.apply(this, arguments);
-        if (recompute()) node.setDirtyCanvas(true, true);
+        const userResizing =
+            app?.canvas?.resizing_node === node ||
+            window.LGraphCanvas?.active_canvas?.resizing_node === node;
+        // A real user drag moves the corner by several pixels per frame; the
+        // bug-causing drift was 1px at a time. Treat a >= 4px delta as
+        // user-initiated even if the canvas-state probe missed it (different
+        // ComfyUI/LiteGraph versions expose the resize flag differently).
+        const delta = Math.abs(node.size[1] - intendedHeight);
+        if (userResizing || delta >= 4) {
+            setWidgetHeight(node.size[1] - chrome);
+            node.setDirtyCanvas(true, true);
+        } else if (node.size[1] !== intendedHeight) {
+            // Drift from somewhere else (re-layout, min-size enforcement,
+            // etc.). Pin the node back so it cannot escalate into a per-frame
+            // feedback loop.
+            node.size[1] = intendedHeight;
+            node.setDirtyCanvas(true, true);
+        }
     };
 }
 
@@ -959,11 +978,14 @@ app.registerExtension({
                 const REPORT_DEFAULT_HEIGHT = 520;
                 const reportWidget = node.addDOMWidget(
                     "report_view", "div", root, { serialize: false });
-                fillWidgetToNode(node, reportWidget, REPORT_MIN_DOM_HEIGHT);
+                // Size the node frame BEFORE handing it to fillWidgetToNode so
+                // the widget's initial computedHeight fills the default frame
+                // instead of the smaller one ComfyUI starts with.
                 node.size = [
                     Math.max(node.size[0], 560),
                     Math.max(node.size[1], REPORT_DEFAULT_HEIGHT),
                 ];
+                fillWidgetToNode(node, reportWidget, REPORT_MIN_DOM_HEIGHT);
 
                 node._renderReport = (payload) => {
                     renderTallies(payload?.tallies, payload?.raw);
