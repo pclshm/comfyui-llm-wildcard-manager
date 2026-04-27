@@ -271,163 +271,66 @@ def resolve_direction(direction: str) -> str:
 
 
 # -----------------------------------------------------------------------------
-# System prompts
+# System prompts — one per small, focused step. No "WRONG OUTPUTS" lists, no
+# rule recitations: just say what to produce.
 # -----------------------------------------------------------------------------
-RESOLVER_SYSTEM_PROMPT = (
-    "You generate a single concise wildcard value for a stable-diffusion prompt category.\n"
-    "Strict rules:\n"
-    "1. Output ONLY the value itself. No preamble, no quotes, no markdown, no explanation, no trailing period.\n"
-    "2. The value MUST NOT match or paraphrase any item in the forbidden list.\n"
-    "3. Stay strictly within the category meaning provided.\n"
-    "4. Keep it short — a phrase, not a sentence.\n"
-    "5. You are isolated from any larger prompt context. Do not invent unrelated content. "
-    "Do not assume what the larger prompt is about beyond what the category meaning says.\n"
-    "6. Anatomy and proportions, when relevant, must be plausible and natural."
+DRAFT_SYSTEM_PROMPT = (
+    "Write one image prompt sentence based on the user's idea and direction. "
+    "Keep it concrete and visual. Output the sentence only, no preamble or quotes."
+)
+
+WILDCARDIFY_SYSTEM_PROMPT = (
+    "Rewrite the image prompt by replacing each variable element — subjects, "
+    "actions, settings, attributes, styling — with a __snake_case__ "
+    "placeholder. Use double underscores on each side of every placeholder. "
+    "Also list each placeholder name. "
+    'Output JSON: {"prompt": "...with __placeholders__ inserted...", '
+    '"categories": ["name1", "name2", ...]}'
+)
+
+DESCRIBE_SYSTEM_PROMPT = (
+    "For each wildcard name, write one short phrase describing what kind of "
+    "value belongs there. No examples, no full sentences. "
+    'Output JSON: {"<name>": "<short description>", ...}'
+)
+
+ALIGN_SYSTEM_PROMPT = (
+    "Smooth the grammar of the image prompt so it reads naturally — fix "
+    "articles (a/an), pluralization, and joining words. Do NOT change, "
+    "rephrase, or remove any of the descriptive phrases themselves. "
+    "Output the corrected sentence only."
+)
+
+LIST_SYSTEM_PROMPT = (
+    "Generate a short list of distinct values for an image-prompt wildcard "
+    "category. Each value is a phrase, not a sentence. "
+    'Output JSON: {"values": ["...", "...", ...]}'
 )
 
 
-MANAGER_SYSTEM_PROMPT = (
-    "TASK\n"
-    "Rewrite the user's prompt idea by REPLACING noun phrases with\n"
-    "__wildcard__ placeholders. Output a single JSON object — no markdown\n"
-    "fences, no prose before or after, no commentary.\n\n"
-    "CRITICAL CONSTRAINT (failure to follow = invalid output):\n"
-    "  The `prompt` string MUST literally contain at least 3 placeholders\n"
-    "  shaped like __snake_case_name__ (double underscore + name + double\n"
-    "  underscore). If your output contains zero `__` substrings, you have\n"
-    "  failed the task.\n\n"
-    "EXACT OUTPUT SHAPE (only these two top-level keys are allowed):\n"
-    "{\n"
-    "  \"prompt\": \"<the user's idea, but with __wildcards__ inserted>\",\n"
-    "  \"categories\": {\n"
-    "    \"<wildcard_name>\": \"<short shape-of-value description>\"\n"
-    "  }\n"
-    "}\n\n"
-    "EXAMPLE 1\n"
-    "INPUT: A portrait of a woman doing an outdoor activity, photorealistic, masterpiece.\n"
-    "OUTPUT:\n"
-    "{\n"
-    "  \"prompt\": \"A portrait of a __age__ __ethnicity__ woman with __hair__, "
-    "__activity__ at a __location__, __time__, wearing __outfit__, __pose__, "
-    "__style__, photorealistic, masterpiece\",\n"
-    "  \"categories\": {\n"
-    "    \"age\": \"An age descriptor.\",\n"
-    "    \"ethnicity\": \"A heritage descriptor.\",\n"
-    "    \"hair\": \"Hair style, length, and color.\",\n"
-    "    \"activity\": \"A single active activity.\",\n"
-    "    \"location\": \"An indoor or outdoor location.\",\n"
-    "    \"time\": \"A time-of-day or lighting condition.\",\n"
-    "    \"outfit\": \"An outfit description.\",\n"
-    "    \"pose\": \"A pose or body-language description.\",\n"
-    "    \"style\": \"Photographic or illustration style modifiers.\"\n"
-    "  }\n"
-    "}\n\n"
-    "EXAMPLE 2\n"
-    "INPUT: A cyberpunk samurai walking through neon-lit streets at night.\n"
-    "OUTPUT:\n"
-    "{\n"
-    "  \"prompt\": \"A __era__ __character_class__ __action__ through __setting__ at __time__\",\n"
-    "  \"categories\": {\n"
-    "    \"era\": \"An era or genre descriptor.\",\n"
-    "    \"character_class\": \"A character archetype.\",\n"
-    "    \"action\": \"What the character is doing.\",\n"
-    "    \"setting\": \"The environment or streetscape.\",\n"
-    "    \"time\": \"Time-of-day or atmospheric phase.\"\n"
-    "  }\n"
-    "}\n\n"
-    "WRONG OUTPUTS — do NOT do any of these:\n"
-    "  WRONG: {\"prompt\": \"A polished version of the user's idea.\"}\n"
-    "         (no __wildcards__ — failed the critical constraint)\n"
-    "  WRONG: {\"subject\": \"woman\", \"style\": \"photorealistic\"}\n"
-    "         (flat keys instead of {prompt, categories})\n"
-    "  WRONG: {\"prompt\": \"...\", \"style\": \"...\", \"lighting\": \"...\"}\n"
-    "         (extra top-level keys forbidden — those belong inside prompt or categories)\n"
-    "  WRONG: {\"prompt\": \"...\", \"negative_prompt\": \"...\",\n"
-    "          \"parameters\": {...}, \"wildcard_slots_used\": [\"subject_action\", ...]}\n"
-    "         (this is an image-gen API payload, NOT a wildcard template. The\n"
-    "          wildcards must be inserted INTO the prompt string as literal\n"
-    "          __snake_case_name__ tokens — never listed in a separate array,\n"
-    "          and never accompanied by negative_prompt / parameters / steps /\n"
-    "          guidance_scale / aspect_ratio / seed / etc.)\n\n"
-    "STRICT RULES\n"
-    "1. The `prompt` string MUST contain `__name__` placeholders. At least 3.\n"
-    "2. Do NOT just polish or rewrite the user's idea — you MUST insert\n"
-    "   __wildcards__ where the variable parts are.\n"
-    "3. Wildcards look like __snake_case_name__ (double underscore each side).\n"
-    "4. Every wildcard in `prompt` MUST have a matching key in `categories`.\n"
-    "5. Every key in `categories` MUST appear in `prompt` at least once.\n"
-    "6. The ONLY top-level keys allowed are `prompt` and `categories`.\n"
-    "7. Keep category descriptions short and shape-focused, not specifics.\n"
-    "8. Reuse common category names (hair, age, outfit, location, time,\n"
-    "   activity, style, pose, ...) to build up reusable wildcard libraries."
-)
-
-
-# Strict JSON schema for the Manager's reply. Sent to the backend so the
-# server grammar-constrains output and the model can't invent extra top-level
-# keys (negative_prompt, parameters, wildcard_slots_used, seed, ...) the way
-# json_object mode allows.
-#
-# The `pattern` on `prompt` forces the grammar to require at least one
-# __snake_case__ substring. Without this, weaker models exhibit "schema
-# collapse" — they satisfy the {prompt, categories} shape but emit a plain
-# polished sentence with zero placeholders, treating categories as filled-in
-# values instead of placeholder descriptions.
-MANAGER_JSON_SCHEMA: dict = {
+# Light per-step JSON schemas. No `pattern` constraints, no GBNF — failures
+# surface as parse errors rather than getting masked by salvage paths.
+WILDCARDIFY_JSON_SCHEMA: dict = {
     "type": "object",
     "properties": {
-        "prompt": {
-            "type": "string",
-            # llama.cpp's schema-to-grammar converter requires the pattern to
-            # be anchored with ^ and $. The `[\s\S]*` (instead of `.*`) lets
-            # the prompt span newlines, since `.` excludes \n in its regex.
-            "pattern": "^[\\s\\S]*__[A-Za-z][A-Za-z0-9_-]*__[\\s\\S]*$",
-        },
-        "categories": {
-            "type": "object",
-            "additionalProperties": {"type": "string"},
-        },
+        "prompt": {"type": "string"},
+        "categories": {"type": "array", "items": {"type": "string"}},
     },
     "required": ["prompt", "categories"],
-    "additionalProperties": False,
 }
 
+DESCRIBE_JSON_SCHEMA: dict = {
+    "type": "object",
+    "additionalProperties": {"type": "string"},
+}
 
-# Raw GBNF grammar mirroring MANAGER_JSON_SCHEMA. Sent via llama.cpp's native
-# `grammar` field — the only enforcement path that has worked reliably across
-# llama.cpp builds for the user. The schema-to-grammar converter has historically
-# produced permissive grammars (extra top-level keys leak through, the prompt's
-# pattern requirement is dropped, ...). Hand-written GBNF bypasses that and
-# guarantees:
-#   1. exactly two top-level keys, in order: "prompt" and "categories"
-#   2. the prompt string contains at least one __snake_case_name__ substring
-#      (the prefix rule rejects any sequence containing a stray "__" before the
-#      wildcard, forcing the model to emit a real placeholder)
-#   3. categories is an object mapping snake_case keys to strings
-MANAGER_GBNF = r'''
-root ::= "{" ws "\"prompt\"" ws ":" ws prompt-string ws "," ws "\"categories\"" ws ":" ws cat-obj ws "}"
-
-prompt-string ::= "\"" pre-segs "__" wname "__" post-segs "\""
-
-pre-segs ::= ( pre-char | "_" non-und )*
-pre-char ::= [^"\\_\x7F\x00-\x1F]
-non-und ::= [^_"\\\x7F\x00-\x1F]
-
-wname ::= [a-zA-Z] [a-zA-Z0-9_-]*
-
-post-segs ::= post-char*
-post-char ::= [^"\\\x7F\x00-\x1F] | escape
-
-escape ::= "\\" ( ["\\bfnrt] | "u" [0-9a-fA-F]{4} )
-
-cat-obj ::= "{" ws "}" | "{" ws cat-entry (ws "," ws cat-entry)* ws "}"
-cat-entry ::= cat-key ws ":" ws cat-value
-cat-key ::= "\"" [a-z] [a-z0-9_]* "\""
-cat-value ::= "\"" val-char* "\""
-val-char ::= [^"\\\x7F\x00-\x1F] | escape
-
-ws ::= [ \t\n\r]*
-'''.strip()
+LIST_JSON_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "values": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["values"],
+}
 
 
 # -----------------------------------------------------------------------------
@@ -553,301 +456,207 @@ def extract_wildcard_names(template: str) -> list[str]:
 _KEY_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 
-def _salvage_flat_template(base_text: str, flat: dict
-                           ) -> tuple[str, dict[str, str]] | None:
-    """Reconstruct a template from a flat {key: value, ...} LLM reply.
-
-    Many models ignore the {prompt, categories} schema and instead respond with
-    a flat object that *correctly* names the variables — `subject: "woman"`,
-    `activity: "outdoor activity"`, `style: "photorealistic"`. If those values
-    appear in the user's idea, we can splice each one back in as `__key__` and
-    end up with a perfectly usable template.
-
-    Returns (template, categories) on success, None if nothing matched.
-    """
-    if not base_text or not isinstance(flat, dict):
-        return None
-    base_text = base_text.strip()
-    if not base_text:
-        return None
-
-    candidates: list[tuple[str, str]] = []
-    for raw_k, raw_v in flat.items():
-        if not isinstance(raw_v, str):
-            continue
-        v = raw_v.strip()
-        if len(v) < 2:
-            continue
-        k = re.sub(r"[^a-z0-9_]+", "_", str(raw_k).lower()).strip("_")
-        if not k or not _KEY_RE.match(k):
-            continue
-        if k == "prompt":
-            continue  # the literal sentence, not a wildcard slot
-        candidates.append((k, v))
-    if not candidates:
-        return None
-    # Longest value first so "outdoor activity" beats "activity" etc.
-    candidates.sort(key=lambda kv: -len(kv[1]))
-
-    # Segment-walk the base text. Each segment is either ("text", str) or
-    # ("wild", key). We only search inside text segments, so once a span has
-    # been wildcarded we won't re-match a substring of it.
-    segments: list[tuple[str, str]] = [("text", base_text)]
-    for key, value in candidates:
-        new_segments: list[tuple[str, str]] = []
-        replaced = False
-        for kind, content in segments:
-            if replaced or kind != "text":
-                new_segments.append((kind, content))
-                continue
-            idx = content.lower().find(value.lower())
-            if idx < 0:
-                new_segments.append((kind, content))
-                continue
-            before = content[:idx]
-            after = content[idx + len(value):]
-            if before:
-                new_segments.append(("text", before))
-            new_segments.append(("wild", key))
-            if after:
-                new_segments.append(("text", after))
-            replaced = True
-        segments = new_segments
-
-    used: list[str] = []
-    parts: list[str] = []
-    for kind, content in segments:
-        if kind == "text":
-            parts.append(content)
-        else:
-            parts.append(f"__{content}__")
-            if content not in used:
-                used.append(content)
-    if not used:
-        return None
-    template = "".join(parts)
-    cats = {k: f"A value for the '{k}' wildcard category." for k in used}
-    return template, cats
-
-
-# Heuristic patterns for the next salvage tier — when the LLM gives us a
-# polished sentence with no flat keys, pattern-match common nouns and inject
-# the matching default-category wildcard. Order matters: longer / more
-# specific phrases first, broad subject words last.
-_HEURISTIC_PATTERNS: list[tuple[re.Pattern, str]] = [
-    (re.compile(r"\boutdoor activity\b", re.I), "activity"),
-    (re.compile(r"\bindoor activity\b", re.I), "activity"),
-    (re.compile(
-        r"\b(?:jogging|running|swimming|climbing|hiking|cycling|dancing|"
-        r"skiing|surfing|reading|painting|gardening|practicing\s+yoga)\b",
-        re.I), "activity"),
-    (re.compile(
-        r"\b(?:photorealistic|hyperrealistic|cinematic|anime|cartoon|"
-        r"illustration|watercolour|watercolor|oil\s+painting|sketch|noir|"
-        r"dreamlike|vintage)\b", re.I), "style"),
-    (re.compile(
-        r"\b(?:sunrise|sunset|midnight|twilight|dawn|dusk|noon|morning|"
-        r"afternoon|evening|night)\b", re.I), "time"),
-    (re.compile(
-        r"\b(?:beach|forest|mountain|park|garden|rooftop|cafe|library|"
-        r"studio|street|alley|meadow|lake|river|desert|coast|harbour|harbor)\b",
-        re.I), "location"),
-    (re.compile(
-        r"\b(?:rainy|sunny|cloudy|stormy|foggy|misty|snowy|windy)\b",
-        re.I), "weather"),
-    # subject is broad — keep it last so more specific matches win first.
-    (re.compile(r"\b(?:woman|man|girl|boy|person|lady|guy|model)\b",
-                re.I), "subject"),
-]
-
-_HEURISTIC_DESCRIPTIONS = {
-    "subject": (
-        "The portrait subject (e.g. 'woman', 'man', 'older gentleman'). "
-        "One concise phrase."
-    ),
-}
-
-
-def _heuristic_salvage(base_text: str
-                       ) -> tuple[str, dict[str, str]] | None:
-    """Pattern-match common nouns in `base_text` and replace each with the
-    matching default-category wildcard. Returns (template, categories) on
-    success, None if no patterns matched."""
-    if not base_text or not base_text.strip():
-        return None
-    out = base_text
-    used: list[str] = []
-    for pattern, name in _HEURISTIC_PATTERNS:
-        if name in used:
-            continue
-        m = pattern.search(out)
-        if not m:
-            continue
-        # Don't overwrite an already-inserted wildcard.
-        span = out[m.start():m.end()]
-        if "__" in span:
-            continue
-        out = out[:m.start()] + f"__{name}__" + out[m.end():]
-        used.append(name)
-    if not used:
-        return None
-    cats = {}
-    for n in used:
-        cats[n] = (
-            DEFAULT_CATEGORIES.get(n)
-            or _HEURISTIC_DESCRIPTIONS.get(n)
-            or f"A value for the '{n}' wildcard category."
-        )
-    return out, cats
-
-
-_DEFAULT_FALLBACK_TEMPLATE = (
-    "A portrait of a __age__ __ethnicity__ __subject__ with __hair__, "
-    "__activity__ at a __location__, __time__, __weather__, wearing "
-    "__outfit__, __pose__, __style__"
-)
-
-
-def _default_template_fallback() -> tuple[str, dict[str, str]]:
-    """Last resort — return a generic template using DEFAULT_CATEGORIES so
-    the downstream Resolver always has wildcards to fill, even when the LLM
-    completely failed to produce a usable structure."""
-    cats: dict[str, str] = {}
-    for name in extract_wildcard_names(_DEFAULT_FALLBACK_TEMPLATE):
-        cats[name] = (
-            DEFAULT_CATEGORIES.get(name)
-            or _HEURISTIC_DESCRIPTIONS.get(name)
-            or f"A value for the '{name}' wildcard category."
-        )
-    return _DEFAULT_FALLBACK_TEMPLATE, cats
+def _to_snake_case(name: str) -> str:
+    """Normalize an LLM-supplied wildcard name to lower snake_case."""
+    s = re.sub(r"[^A-Za-z0-9_]+", "_", str(name or "").strip().lower())
+    s = s.strip("_")
+    return s
 
 
 # -----------------------------------------------------------------------------
-# LLM operations
+# Wildcard-format repair
 # -----------------------------------------------------------------------------
-def llm_generate_value(category: str, description: str, existing: list[str],
-                       server: dict, system_prompt: str | None = None,
-                       temperature_override: float | None = None) -> str:
-    sys_p = system_prompt if (system_prompt and system_prompt.strip()) else RESOLVER_SYSTEM_PROMPT
-    forbidden = "\n".join(f"- {e}" for e in existing) if existing else "(none yet)"
-    user = (
-        f"Category: {category}\n"
-        f"Category meaning: {description}\n\n"
-        f"Forbidden values (do NOT repeat or paraphrase any of these):\n{forbidden}\n\n"
-        f"Output exactly one new value for the '{category}' category."
-    )
-    raw = _server_call(server, sys_p, user, temperature_override=temperature_override)
-    return _clean_llm_value(raw)
+def ensure_wildcard_format(template: str, known_names) -> str:
+    """For each name in `known_names`, rewrite bare `name`, `_name_`, `_name`,
+    or `name_` occurrences in `template` to `__name__`. Tokens already wrapped
+    in `__...__` are left alone. Tokens not in `known_names` are left alone."""
+    if not template or not known_names:
+        return template or ""
+    names = sorted({_to_snake_case(n) for n in known_names if str(n).strip()},
+                   key=len, reverse=True)
+    out = template
+    for name in names:
+        if not name:
+            continue
+        # (?<![A-Za-z0-9])  — left boundary excluding alnum (underscores allowed
+        #                     so we can match `_name_`, `_name`, etc.).
+        # _{0,2}            — optional 0/1/2 leading underscores.
+        # name              — the literal category name.
+        # _{0,2}            — optional 0/1/2 trailing underscores.
+        # (?![A-Za-z0-9_])  — right boundary excluding alnum and underscore so
+        #                     we don't chop into the middle of `___name___`.
+        pattern = re.compile(
+            rf"(?<![A-Za-z0-9])_{{0,2}}{re.escape(name)}_{{0,2}}(?![A-Za-z0-9_])"
+        )
+        out = pattern.sub(f"__{name}__", out)
+    return out
 
 
-def llm_design_template(example_prompt: str, direction_text: str, extra_flair: str,
-                        server: dict, system_prompt_override: str | None = None,
-                        seed: int = 0
-                        ) -> tuple[str, dict[str, str], str, str]:
-    """Ask the LLM to produce a prompt template + a description per wildcard.
+# -----------------------------------------------------------------------------
+# LLM operations — small, sequential steps. Failures raise; nothing is
+# silently substituted with canned content.
+# -----------------------------------------------------------------------------
+class ManagerStepError(Exception):
+    """Raised when one of the manager's small LLM steps returns unparseable
+    output. Carries the step name and raw reply so the UI can show both."""
+    def __init__(self, step: str, raw: str, message: str = ""):
+        super().__init__(message or f"step '{step}' did not return parseable output")
+        self.step = step
+        self.raw = raw or ""
 
-    Returns (template, categories, raw_reply, status). status is one of:
-      "ok"           — JSON parsed and `prompt` non-empty.
-      "parse_failed" — could not extract a JSON object from the reply.
-      "no_prompt"    — JSON parsed but `prompt` was missing/empty.
-    No silent fallback to example_prompt — the Manager surfaces the failure
-    so the user can see the raw reply and fix the LLM/system prompt.
-    """
-    base = (system_prompt_override or "").strip() or MANAGER_SYSTEM_PROMPT
-    flair_lines = [s for s in (direction_text or "", extra_flair or "") if s.strip()]
-    if flair_lines:
-        base = base + "\n\nAdditional direction from the user:\n" + "\n".join(flair_lines)
 
+def llm_draft_prompt(idea: str, direction_text: str, server: dict,
+                     seed: int = 0) -> tuple[str, str]:
+    """Step 1 — turn the user idea + direction into a single image-prompt
+    sentence. Returns (sentence, raw_reply)."""
     user_parts = [
-        "User idea / example prompt:",
-        (example_prompt or "").strip() or "(no example provided)",
+        "User idea:",
+        (idea or "").strip() or "(no example provided)",
     ]
+    if direction_text and direction_text.strip():
+        user_parts.append("\nDirection:")
+        user_parts.append(direction_text.strip())
     if seed:
-        # Belt-and-suspenders: also nudge the model textually, since some local
-        # backends ignore the sampling seed in their /chat options.
-        # Avoid the literal word "seed" in the user-visible text — it cues some
-        # models to emit an image-gen-style payload with a top-level "seed" key.
-        user_parts.append(
-            f"\nVariation token: {seed}. Treat this token as inspiration for "
-            "fresh phrasing and a different mix of wildcard slots — produce a "
-            "meaningfully different template than you would for any other token."
-        )
-    user_parts.append("\nNow produce the JSON object.")
+        user_parts.append(f"\nVariation token: {seed}.")
+    user_parts.append("\nWrite the image prompt sentence now.")
     user = "\n".join(user_parts)
+    raw = _server_call(server, DRAFT_SYSTEM_PROMPT, user, seed=seed)
+    sentence = (raw or "").strip()
+    # Trim a single set of wrapping quotes if the model added them.
+    if len(sentence) >= 2 and sentence[0] in "\"'`" and sentence[-1] == sentence[0]:
+        sentence = sentence[1:-1].strip()
+    if not sentence:
+        raise ManagerStepError("draft", raw, "empty draft prompt")
+    return sentence, raw
 
-    raw = _server_call(server, base, user, request_json=True, seed=seed,
-                       json_schema=MANAGER_JSON_SCHEMA, grammar=MANAGER_GBNF)
+
+def llm_wildcardify_prompt(draft_prompt: str, server: dict,
+                           seed: int = 0) -> tuple[str, list[str], str]:
+    """Step 2 — ask the LLM to rewrite the draft with __placeholders__ already
+    inserted, plus the list of placeholder names. Returns (template, names,
+    raw_reply). The LLM does its own placement so we don't lose wildcards to
+    span-substring mismatches; ensure_wildcard_format runs afterward as a
+    safety net for any names it forgot to wrap."""
+    user = (
+        f"Image prompt:\n{draft_prompt}\n\n"
+        "Rewrite it with placeholders. Output the JSON object now."
+    )
+    raw = _server_call(server, WILDCARDIFY_SYSTEM_PROMPT, user,
+                       request_json=True, seed=seed,
+                       json_schema=WILDCARDIFY_JSON_SCHEMA)
     parsed = _extract_json_object(raw)
-    if not parsed:
-        return ("", {}, raw, "parse_failed")
+    if not isinstance(parsed, dict):
+        raise ManagerStepError("wildcardify", raw)
 
     template = str(parsed.get("prompt") or "").strip()
-    categories_raw = parsed.get("categories")
+    if not template:
+        raise ManagerStepError("wildcardify", raw, "missing 'prompt' field")
 
-    # Layered salvage. Order: (1) flat-key splice, (2) heuristic noun match,
-    # (3) generic default template. Each tier runs only if the previous one
-    # didn't produce a template with __wildcards__. This guarantees the
-    # downstream Resolver always has slots to fill, even with a dumb LLM.
-    salvage_kind = ""
+    raw_categories = parsed.get("categories")
+    declared: list[str] = []
+    if isinstance(raw_categories, list):
+        seen: set[str] = set()
+        for entry in raw_categories:
+            n = _to_snake_case(entry if isinstance(entry, str) else "")
+            if n and _KEY_RE.match(n) and n not in seen:
+                seen.add(n)
+                declared.append(n)
 
-    def _has_wildcards(t: str) -> bool:
-        return bool(extract_wildcard_names(t or ""))
+    # Repair any names the LLM listed but forgot to wrap in __ in the prompt.
+    template = ensure_wildcard_format(template, declared)
 
-    # Tier 1 — flat-key salvage from the LLM reply.
-    if not _has_wildcards(template) or not isinstance(categories_raw, dict):
-        candidates = []
-        for base_text in (template, (example_prompt or "").strip()):
-            base_text = (base_text or "").strip()
-            if not base_text:
-                continue
-            r = _salvage_flat_template(base_text, parsed)
-            if r is None:
-                continue
-            candidates.append((len(extract_wildcard_names(r[0])), r))
-        if candidates:
-            candidates.sort(key=lambda x: -x[0])
-            template, categories_raw = candidates[0][1]
-            salvage_kind = "flat"
+    # Final name set = union of declared + whatever ended up wrapped in the
+    # template after repair. This is what the next step describes.
+    in_template = extract_wildcard_names(template)
+    names: list[str] = []
+    for n in declared + in_template:
+        if n and n not in names:
+            names.append(n)
 
-    # Tier 2 — heuristic noun-pattern salvage on the LLM prompt or user idea.
-    if not _has_wildcards(template):
-        candidates = []
-        for base_text in (template, (example_prompt or "").strip()):
-            base_text = (base_text or "").strip()
-            if not base_text:
-                continue
-            r = _heuristic_salvage(base_text)
-            if r is None:
-                continue
-            candidates.append((len(extract_wildcard_names(r[0])), r))
-        if candidates:
-            candidates.sort(key=lambda x: -x[0])
-            template, categories_raw = candidates[0][1]
-            salvage_kind = "heuristic"
+    if not names:
+        raise ManagerStepError(
+            "wildcardify", raw,
+            "no placeholders inserted and no categories listed",
+        )
+    return template, names, raw
 
-    # Tier 3 — generic default template. Always succeeds.
-    if not _has_wildcards(template):
-        template, categories_raw = _default_template_fallback()
-        salvage_kind = "default"
 
-    categories: dict[str, str] = {}
-    if isinstance(categories_raw, dict):
-        for k, v in categories_raw.items():
-            ks = str(k).strip()
-            if ks:
-                categories[ks] = str(v).strip()
+def llm_describe_wildcards(names: list[str], server: dict,
+                           seed: int = 0) -> tuple[dict[str, str], str]:
+    """Step 3 — short shape-of-value description for each wildcard name.
+    Returns (descriptions, raw_reply)."""
+    if not names:
+        return {}, ""
+    listed = "\n".join(f"- {n}" for n in names)
+    user = (
+        f"Wildcard names:\n{listed}\n\n"
+        "Output the JSON object mapping each name to its description now."
+    )
+    raw = _server_call(server, DESCRIBE_SYSTEM_PROMPT, user,
+                       request_json=True, seed=seed,
+                       json_schema=DESCRIBE_JSON_SCHEMA)
+    parsed = _extract_json_object(raw)
+    if not isinstance(parsed, dict):
+        raise ManagerStepError("describe", raw)
+    descs: dict[str, str] = {}
+    for k, v in parsed.items():
+        key = _to_snake_case(k)
+        if key and isinstance(v, str) and v.strip():
+            descs[key] = v.strip()
+    return descs, raw
 
-    # final consistency pass — every wildcard in template must have a description.
-    for name in extract_wildcard_names(template):
-        categories.setdefault(name, f"A value for the '{name}' wildcard.")
 
-    if salvage_kind == "default":
-        status = "fallback_default"
-    elif salvage_kind:
-        status = "salvaged"
-    else:
-        status = "ok"
-    return (template, categories, raw, status)
+def llm_generate_value_list(category: str, description: str,
+                            existing: list[str], server: dict,
+                            count: int = 5, seed: int = 0) -> tuple[list[str], str]:
+    """Resolver step — ask the LLM for a short list of distinct values for one
+    wildcard category. Returns (values, raw_reply)."""
+    forbidden = ("\n".join(f"- {e}" for e in existing)
+                 if existing else "(none yet)")
+    user = (
+        f"Category: {category}\n"
+        f"What this wildcard means: {description}\n\n"
+        f"Already used (do not repeat):\n{forbidden}\n\n"
+        f"Produce {count} distinct new values. "
+        "Output the JSON object now."
+    )
+    raw = _server_call(server, LIST_SYSTEM_PROMPT, user,
+                       request_json=True, seed=seed,
+                       json_schema=LIST_JSON_SCHEMA)
+    parsed = _extract_json_object(raw)
+    if not isinstance(parsed, dict):
+        return [], raw
+    raw_values = parsed.get("values")
+    if not isinstance(raw_values, list):
+        return [], raw
+    out: list[str] = []
+    seen: set[str] = set()
+    for v in raw_values:
+        cleaned = _clean_llm_value(str(v) if v is not None else "")
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(cleaned)
+    return out, raw
+
+
+def llm_align_prompt(populated: str, server: dict, seed: int = 0
+                     ) -> tuple[str, str]:
+    """Resolver step — light grammar/article fix over the fully-populated
+    sentence. Returns (aligned, raw_reply). Aligned text is verified by the
+    caller to still contain every populated value verbatim before being used."""
+    user = (
+        f"Image prompt:\n{populated}\n\n"
+        "Output the corrected sentence only."
+    )
+    raw = _server_call(server, ALIGN_SYSTEM_PROMPT, user, seed=seed)
+    aligned = (raw or "").strip()
+    if len(aligned) >= 2 and aligned[0] in "\"'`" and aligned[-1] == aligned[0]:
+        aligned = aligned[1:-1].strip()
+    return aligned, raw
 
 
 # -----------------------------------------------------------------------------
@@ -1164,9 +973,13 @@ class LLMWildcardManager:
         direction = (direction or "").strip() or "none"
         direction_text = resolve_direction(direction)
         extra = (extra_flair or "").strip()
-        flair = "\n".join(s for s in (direction_text, extra) if s)
+        combined_direction = "\n".join(s for s in (direction_text, extra) if s)
 
-        override = (system_prompt_override or "").strip()
+        # `system_prompt_override` is kept on the input for backward compat,
+        # but the manager now drives four small calls — a single override
+        # can't apply to all of them, so it's ignored here. The Resolver still
+        # honours overrides via the bundle below.
+        _ = system_prompt_override
 
         # User explicit overrides from the JSON widget (edited in the table UI)
         user_overrides: dict[str, str] = {}
@@ -1182,10 +995,7 @@ class LLMWildcardManager:
             except Exception as e:
                 print(f"[LLMWildcardManager] Bad categories JSON: {e}")
 
-        # Effective sampling seed for the LLM. seed=0 means "fresh roll every
-        # queue", so pick a non-deterministic one — otherwise the model would
-        # see the same input each queue and likely emit the same template.
-        # seed!=0 is passed through verbatim so reproducibility is preserved.
+        # Effective sampling seed: 0 = fresh roll, non-zero = reproducible.
         try:
             seed_int = int(seed)
         except Exception:
@@ -1195,45 +1005,60 @@ class LLMWildcardManager:
         else:
             effective_seed = seed_int
 
-        # Call the LLM to design the template + suggest descriptions.
+        template = ""
+        suggested_cats: dict[str, str] = {}
+        used_names: list[str] = []
         status = "ok"
         status_message = ""
+        raw_sections: list[tuple[str, str]] = []
+
         try:
-            template, suggested_cats, raw_reply, status = llm_design_template(
-                example_prompt=example_prompt or "",
-                direction_text=direction_text,
-                extra_flair=extra,
-                server=server,
-                system_prompt_override=override or None,
+            # Step 1 — draft the prompt sentence from idea + direction.
+            draft, raw_draft = llm_draft_prompt(
+                example_prompt or "", combined_direction, server,
                 seed=effective_seed,
             )
+            raw_sections.append(("draft", raw_draft))
+
+            # Step 2 — LLM rewrites the draft with __placeholders__ already
+            # inserted + lists the category names. Doing the wildcard insertion
+            # in the LLM (rather than substring-matching spans afterwards)
+            # avoids losing wildcards to phrasing mismatches; the helper also
+            # runs ensure_wildcard_format to repair any forgotten __ wraps.
+            template, used_names, raw_wildcardify = llm_wildcardify_prompt(
+                draft, server, seed=effective_seed,
+            )
+            raw_sections.append(("wildcardify", raw_wildcardify))
+
+            # Step 3 — describe each wildcard.
+            descs, raw_describe = llm_describe_wildcards(
+                used_names, server, seed=effective_seed,
+            )
+            raw_sections.append(("describe", raw_describe))
+            suggested_cats = descs
+        except ManagerStepError as e:
+            template = ""
+            used_names = []
+            status = f"failed_{e.step}"
+            status_message = (
+                f"Step '{e.step}' did not return parseable output. "
+                "See the raw reply panel below."
+            )
+            raw_sections.append((e.step + " (failed)", e.raw))
         except Exception as e:
             print(f"[LLMWildcardManager] LLM call failed: {e}")
             template = ""
-            suggested_cats = {}
-            raw_reply = f"(exception calling LLM: {e})"
+            used_names = []
             status = "llm_error"
             status_message = str(e)
+            raw_sections.append(("error", f"(exception calling LLM: {e})"))
 
-        if status == "parse_failed":
-            status_message = (
-                "LLM did not return a parseable JSON object. "
-                "See the raw reply panel below."
-            )
-        elif status == "salvaged":
-            status_message = (
-                "LLM didn't follow the schema, but I rebuilt a template by "
-                "matching its output back into your idea. Edit the prompt "
-                "above if the wildcards landed in the wrong place."
-            )
-        elif status == "fallback_default":
-            status_message = (
-                "LLM never produced a usable template (even after pattern "
-                "salvage). Falling back to a generic default template using "
-                "the built-in categories. For better results, switch to a "
-                "stronger model (e.g. qwen2.5:7b, llama3.1:8b-instruct, "
-                "gemma2:9b) in your LLM Server Config."
-            )
+        # Stitch the per-step raw replies into one panel-friendly blob so the
+        # existing UI's raw_reply pane stays useful for debugging all four steps.
+        raw_reply = "\n\n".join(
+            f"--- step: {step} ---\n{(body or '').strip()}"
+            for step, body in raw_sections
+        ) or "(no LLM output captured)"
 
         # Effective category descriptions: defaults < disk < LLM-suggested < user.
         merged_disk = load_category_config()
@@ -1242,15 +1067,16 @@ class LLMWildcardManager:
         effective.update(suggested_cats)
         effective.update(user_overrides)
 
-        # Persist any newly-suggested or user-overridden category to disk so the
-        # Resolver-only path also picks them up. This file accumulates over time.
-        merged_disk.update(suggested_cats)
-        merged_disk.update(user_overrides)
-        save_category_config(merged_disk)
+        # Persist suggested + user-override categories so the Resolver-only
+        # path picks them up too. Only on success — failed runs shouldn't poison
+        # the disk config.
+        if status == "ok":
+            merged_disk.update(suggested_cats)
+            merged_disk.update(user_overrides)
+            save_category_config(merged_disk)
 
-        # Persist the last successful template only on real success — never
-        # mask a failure by stashing example_prompt or a malformed reply.
-        if template and status in ("ok", "salvaged", "fallback_default"):
+        # Persist the last successful template only on real success.
+        if template and status == "ok":
             try:
                 LAST_TEMPLATE_PATH.write_text(template, encoding="utf-8")
             except Exception as e:
@@ -1267,21 +1093,20 @@ class LLMWildcardManager:
         except Exception as e:
             print(f"[LLMWildcardManager] Could not persist last reply: {e}")
 
-        # Build the bundle handed to the Resolver. Effective categories include
-        # everything we know — that's what the Resolver should use as descriptions.
+        # Build the bundle handed to the Resolver.
         bundle = {
-            "system_prompt": (
-                (override or RESOLVER_SYSTEM_PROMPT)
-                + (f"\n\nAdditional direction from the user:\n{flair}" if flair else "")
-            ),
-            "flair": flair,
+            # Resolver no longer has a strict-rules system prompt; the small
+            # LIST_SYSTEM_PROMPT inside the resolver handles each per-slot call.
+            # We still expose any combined direction text under "flair" so the
+            # report and (future) custom prompts can pick it up.
+            "system_prompt": "",
+            "flair": combined_direction,
             "category_overrides": dict(effective),
+            "intended_names": list(used_names),
         }
 
-        # Snapshot the categories the UI should display: only the ones used by
-        # the current template + any user override + any disk file. Everything
-        # else is noise.
-        used = set(extract_wildcard_names(template))
+        # Snapshot the categories the UI should display.
+        used = set(used_names)
         display_cats = {n: effective.get(n, "") for n in
                         sorted(used | set(user_overrides))}
 
@@ -1355,94 +1180,150 @@ class LLMWildcardResolver:
         rng = random.Random(seed if (fix_seed or seed != 0) else None)
 
         categories = load_category_config()
-        custom_system_prompt: str | None = None
         flair_text = ""
+        intended_names: list[str] = []
         if isinstance(prompts, dict):
-            custom_system_prompt = prompts.get("system_prompt") or None
             flair_text = prompts.get("flair") or ""
             cfg_overrides = prompts.get("category_overrides") or {}
             if isinstance(cfg_overrides, dict):
                 categories.update(cfg_overrides)
+            raw_intended = prompts.get("intended_names") or []
+            if isinstance(raw_intended, list):
+                intended_names = [str(n) for n in raw_intended if str(n).strip()]
 
+        # If the manager bundled a list of intended wildcard names, repair any
+        # template tokens that lost their double underscores (e.g. `_subject_`
+        # or bare `subject` left by a manual edit).
+        if intended_names:
+            template = ensure_wildcard_format(template, intended_names)
+
+        # Effective sampling seed for any LLM calls. seed=0 + fix_seed=False
+        # means fresh roll every queue.
+        try:
+            seed_int = int(seed)
+        except Exception:
+            seed_int = 0
+        if seed_int == 0:
+            llm_seed = random.SystemRandom().randrange(1, 2**31)
+        else:
+            llm_seed = seed_int
+
+        # Phase 1 — for each unique wildcard name, decide on a value. Either
+        # reuse from disk, or call the LLM for a small list of candidates
+        # (filling up the pool faster than one-at-a-time).
         records: list[dict] = []
-
-        def resolve_slot(match: "re.Match") -> str:
-            force_flag = match.group(1)
-            name = match.group(2)
-            force_new = (force_flag == "!") or (mode == "force_new")
+        picks: dict[str, str] = {}
+        unique_names = extract_wildcard_names(template)
+        for name in unique_names:
             existing = read_wildcard_file(name)
             description = categories.get(
                 name, f"A value for the '{name}' wildcard category.")
-
             rec: dict = {"name": name, "pool_size": len(existing)}
 
+            force_new = mode == "force_new"
             should_reuse = (not force_new) and existing and (mode != "force_new")
+
             if should_reuse:
                 value = rng.choice(existing)
                 rec.update({"status": "reused", "value": value})
                 records.append(rec)
-                return value
+                picks[name] = value
+                continue
 
             if len(existing) >= max_per_category:
-                value = rng.choice(existing) if existing else f"[{name}]"
+                value = rng.choice(existing) if existing else ""
                 rec.update({"status": "cap_reached", "value": value})
                 records.append(rec)
-                return value
+                picks[name] = value
+                continue
 
             sent = (
                 f'category="{name}" | desc={description!r} | '
-                f'forbidden={len(existing)} items | '
+                f'pool={len(existing)} items | '
                 f'model={server.get("model", "")!r} | '
                 f'temp={server.get("temperature", 0.9)}'
             )
             rec["sent"] = sent
             try:
-                value = llm_generate_value(
+                values, raw = llm_generate_value_list(
                     name, description, existing, server,
-                    system_prompt=custom_system_prompt,
+                    count=5, seed=llm_seed,
                 )
-                rec["raw"] = value
-                if not value:
-                    raise RuntimeError("empty LLM response")
+                rec["raw"] = raw
+                # Only keep values that aren't already in the pool.
+                lower_existing = {e.lower() for e in existing}
+                fresh = [v for v in values if v.lower() not in lower_existing]
+                appended: list[str] = []
+                for v in fresh:
+                    if append_wildcard(name, v):
+                        appended.append(v)
+                rec["new_count"] = len(appended)
 
-                # one retry if the model ignored the forbidden list
-                if existing and any(e.lower() == value.lower() for e in existing):
-                    bumped = min(2.0, float(server.get("temperature", 0.9)) + 0.3)
-                    rec["retry_sent"] = f"temp={bumped} (after duplicate)"
-                    retry = llm_generate_value(
-                        name, description, existing + [value], server,
-                        system_prompt=custom_system_prompt,
-                        temperature_override=bumped,
-                    )
-                    rec["retry_raw"] = retry
-                    if retry and not any(e.lower() == retry.lower() for e in existing):
-                        value = retry
+                if force_new:
+                    pool = appended or fresh
+                else:
+                    pool = existing + appended
+                if not pool:
+                    rec.update({"status": "error", "err": "no values produced",
+                                "value": ""})
+                    records.append(rec)
+                    picks[name] = ""
+                    continue
 
-                appended = append_wildcard(name, value)
+                value = rng.choice(pool)
                 rec.update({
-                    "status": "generated_new" if appended else "generated_duplicate",
+                    "status": "generated_new" if value in appended else "reused",
                     "value": value,
                 })
                 records.append(rec)
-                return value
-
+                picks[name] = value
             except Exception as e:
-                fallback = rng.choice(existing) if existing else f"__{name}__"
-                rec.update({"status": "error", "err": str(e), "value": fallback})
+                rec.update({"status": "error", "err": str(e), "value": ""})
                 records.append(rec)
-                return fallback
+                picks[name] = ""
 
-        resolved = WILDCARD_RE.sub(resolve_slot, template)
+        def _substitute(match: "re.Match") -> str:
+            return picks.get(match.group(2), match.group(0))
+
+        substituted = WILDCARD_RE.sub(_substitute, template or "")
+
+        # Phase 2 — light grammar/article alignment pass. Skip if substitution
+        # produced nothing useful or every value is empty.
+        resolved = substituted
+        align_raw = ""
+        align_status = "skipped"
+        non_empty_values = [v for v in picks.values() if v]
+        if substituted and non_empty_values:
+            try:
+                aligned, align_raw = llm_align_prompt(
+                    substituted, server, seed=llm_seed,
+                )
+                lower_aligned = aligned.lower()
+                # Only accept the alignment if every populated value is still
+                # present verbatim (case-insensitive). Otherwise keep the
+                # literal substitution — losing a value is worse than a small
+                # grammar slip.
+                if aligned and all(v.lower() in lower_aligned
+                                   for v in non_empty_values):
+                    resolved = aligned
+                    align_status = "applied"
+                else:
+                    align_status = "rejected"
+            except Exception as e:
+                align_status = f"error: {e}"
+
         report = format_report(records, flair=flair_text,
-                               using_custom_prompt=bool(custom_system_prompt))
+                               using_custom_prompt=False)
         write_last_report(report, records, flair=flair_text,
-                          using_custom_prompt=bool(custom_system_prompt))
+                          using_custom_prompt=False)
 
         snapshot = {
             "template": template or "",
             "resolved": resolved or "",
             "records": records,
             "tallies": _tally(records),
+            "align_status": align_status,
+            "align_raw": align_raw,
         }
         try:
             LAST_RESOLVER_PATH.write_text(
