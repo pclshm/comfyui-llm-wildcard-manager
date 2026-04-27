@@ -293,7 +293,13 @@ WILDCARDIFY_SYSTEM_PROMPT = (
 
 DESCRIBE_SYSTEM_PROMPT = (
     "For each wildcard name, write one short phrase describing what kind of "
-    "value belongs there. No examples, no full sentences. "
+    "value belongs in that slot of THIS specific image prompt. Anchor the "
+    "description to the prompt's idea, direction, and any extra steering: "
+    "narrow enough that random or off-topic values would feel wrong, but "
+    "broad enough to allow variety. Reference the relevant tone, era, "
+    "setting, or aesthetic when those constraints apply. Avoid bland "
+    "category-only definitions like 'an outfit' or 'a location'. "
+    "No examples, no full sentences. "
     'Output JSON: {"<name>": "<short description>", ...}'
 )
 
@@ -652,16 +658,36 @@ def llm_wildcardify_prompt(draft_prompt: str, server: dict,
 
 
 def llm_describe_wildcards(names: list[str], server: dict,
-                           seed: int = 0) -> tuple[dict[str, str], str]:
+                           seed: int = 0,
+                           idea: str = "",
+                           direction_text: str = "",
+                           template: str = "") -> tuple[dict[str, str], str]:
     """Step 3 — short shape-of-value description for each wildcard name.
-    Returns (descriptions, raw_reply)."""
+    Returns (descriptions, raw_reply).
+
+    `idea`, `direction_text`, and `template` give the LLM enough context to
+    write descriptions that fit this specific prompt rather than generic
+    category-only definitions. Without them, descriptions drift to "an
+    outfit" / "a location" and the resolver's value generator returns random
+    content that doesn't match the prompt's direction."""
     if not names:
         return {}, ""
     listed = "\n".join(f"- {n}" for n in names)
-    user = (
-        f"Wildcard names:\n{listed}\n\n"
-        "Output the JSON object mapping each name to its description now."
+    parts: list[str] = []
+    if idea and idea.strip():
+        parts.append(f"User idea:\n{idea.strip()}")
+    if direction_text and direction_text.strip():
+        parts.append(f"Direction / steering:\n{direction_text.strip()}")
+    if template and template.strip():
+        parts.append(f"Prompt template (with placeholders):\n{template.strip()}")
+    parts.append(f"Wildcard names:\n{listed}")
+    parts.append(
+        "For each name, write a short phrase describing what kind of value "
+        "belongs there in this specific prompt — tied to the idea and "
+        "direction above so the resolver generates fitting values, not "
+        "generic ones. Output the JSON object now."
     )
+    user = "\n\n".join(parts)
     raw = _server_call(server, DESCRIBE_SYSTEM_PROMPT, user,
                        request_json=True, seed=seed,
                        json_schema=DESCRIBE_JSON_SCHEMA)
@@ -1191,9 +1217,16 @@ class LLMWildcardManager:
                 )
                 raw_sections.append(("wildcardify", raw_wildcardify))
 
-                # Step 3 — describe each wildcard.
+                # Step 3 — describe each wildcard. Pass the user's idea,
+                # combined direction, and the wildcardified template so the
+                # descriptions are tailored to this specific prompt rather
+                # than generic category definitions — that specificity is
+                # what keeps the resolver's value generator on-topic.
                 descs, raw_describe = llm_describe_wildcards(
                     used_names, server, seed=effective_seed,
+                    idea=example_prompt or "",
+                    direction_text=combined_direction,
+                    template=template,
                 )
                 raw_sections.append(("describe", raw_describe))
                 suggested_cats = descs
