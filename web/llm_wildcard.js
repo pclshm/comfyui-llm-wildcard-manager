@@ -75,29 +75,37 @@ function pinWidgetHeight(domWidget, height) {
 // floor of `minHeight` so the contents stay usable on a tiny node. Hooks
 // `onResize` so dragging the node corner reflows the inner flex children
 // (slots list, raw textarea) instead of being clipped.
+//
+// `computeSize` MUST return a cached value rather than re-deriving the height
+// from `node.size[1]` on every call: LiteGraph's draw loop sums widget heights
+// plus inter-widget spacing to decide if the node needs to grow, and a height
+// that tracks `node.size[1] - small_constant` causes an infinite feedback loop
+// where each frame inflates the node by however much chrome LiteGraph adds
+// between widgets. The cached height only changes via `onResize`, so the loop
+// is broken.
 function fillWidgetToNode(node, domWidget, minHeight = 280) {
     const TITLE_H = (window.LiteGraph?.NODE_TITLE_HEIGHT) || 30;
     const VPADDING = 12;
-    const siblingHeight = (width) => {
-        let used = 0;
+    function recompute() {
+        let siblings = 0;
         for (const w of node.widgets || []) {
             if (w === domWidget) continue;
             const h = w.computedHeight
-                ?? (typeof w.computeSize === "function" ? w.computeSize(width)[1] : 0);
-            used += Math.max(0, h || 0);
+                ?? (typeof w.computeSize === "function"
+                    ? w.computeSize(node.size[0])[1] : 0);
+            siblings += Math.max(0, h || 0);
         }
-        return used;
-    };
+        const avail = node.size[1] - TITLE_H - siblings - VPADDING;
+        domWidget.computedHeight = Math.max(minHeight, avail);
+    }
     domWidget.computeSize = function (width) {
-        const avail = node.size[1] - TITLE_H - siblingHeight(width) - VPADDING;
-        const h = Math.max(minHeight, avail);
-        domWidget.computedHeight = h;
-        return [width, h];
+        return [width, domWidget.computedHeight ?? minHeight];
     };
+    recompute();
     const onResize = node.onResize;
     node.onResize = function (size) {
         onResize?.apply(this, arguments);
-        domWidget.computeSize(size?.[0] ?? node.size[0]);
+        recompute();
         node.setDirtyCanvas(true, true);
     };
 }
