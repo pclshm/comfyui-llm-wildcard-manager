@@ -184,6 +184,11 @@ Inputs:
 - **`fix_seed`** — when **off** (default), every queue run re-rolls the
   fills (regardless of seed). When **on**, the resolver is fully
   deterministic: same template + same seed = same final values.
+- **`trigger_words`** — optional text spliced onto the final prompt (after
+  the grammar-alignment pass, so LoRA trigger tokens stay verbatim). Empty
+  means no triggers are added. Joined to the resolved prompt with `, `.
+- **`trigger_position`** — `prefix` (default) puts the trigger words at the
+  start of the prompt; `suffix` appends them at the end.
 - **`prompts`** *(optional input)* — wire from the Manager. Carries the
   system prompt + flair + category descriptions used per-slot.
 
