@@ -1163,6 +1163,11 @@ class LLMWildcardResolver:
                 "seed": ("INT", {"default": 0, "min": 0,
                                  "max": 0xFFFFFFFFFFFFFFFF}),
                 "fix_seed": ("BOOLEAN", {"default": False}),
+                "trigger_words": ("STRING", {
+                    "multiline": True,
+                    "default": "",
+                }),
+                "trigger_position": (["prefix", "suffix"], {"default": "prefix"}),
             },
             "optional": {
                 "prompts": ("WILDCARD_PROMPTS",),
@@ -1176,7 +1181,7 @@ class LLMWildcardResolver:
     OUTPUT_NODE = True
 
     def resolve(self, server, template, mode, max_per_category, seed, fix_seed,
-                prompts=None):
+                trigger_words="", trigger_position="prefix", prompts=None):
         rng = random.Random(seed if (fix_seed or seed != 0) else None)
 
         categories = load_category_config()
@@ -1312,6 +1317,16 @@ class LLMWildcardResolver:
             except Exception as e:
                 align_status = f"error: {e}"
 
+        # Phase 3 — splice trigger words onto the (already aligned) prompt.
+        # Done after alignment so LoRA trigger tokens stay verbatim — the
+        # alignment LLM might otherwise paraphrase or drop them.
+        triggers = (trigger_words or "").strip().strip(",").strip()
+        if triggers:
+            if trigger_position == "suffix":
+                resolved = f"{resolved}, {triggers}" if resolved else triggers
+            else:
+                resolved = f"{triggers}, {resolved}" if resolved else triggers
+
         report = format_report(records, flair=flair_text,
                                using_custom_prompt=False)
         write_last_report(report, records, flair=flair_text,
@@ -1324,6 +1339,8 @@ class LLMWildcardResolver:
             "tallies": _tally(records),
             "align_status": align_status,
             "align_raw": align_raw,
+            "trigger_words": triggers,
+            "trigger_position": trigger_position if triggers else "",
         }
         try:
             LAST_RESOLVER_PATH.write_text(
