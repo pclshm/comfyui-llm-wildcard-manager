@@ -70,6 +70,38 @@ function pinWidgetHeight(domWidget, height) {
     domWidget.computedHeight = height;
 }
 
+// Make a DOM widget grow with the node frame: the widget claims whatever
+// vertical space is left after the title bar and any sibling widgets, with a
+// floor of `minHeight` so the contents stay usable on a tiny node. Hooks
+// `onResize` so dragging the node corner reflows the inner flex children
+// (slots list, raw textarea) instead of being clipped.
+function fillWidgetToNode(node, domWidget, minHeight = 280) {
+    const TITLE_H = (window.LiteGraph?.NODE_TITLE_HEIGHT) || 30;
+    const VPADDING = 12;
+    const siblingHeight = (width) => {
+        let used = 0;
+        for (const w of node.widgets || []) {
+            if (w === domWidget) continue;
+            const h = w.computedHeight
+                ?? (typeof w.computeSize === "function" ? w.computeSize(width)[1] : 0);
+            used += Math.max(0, h || 0);
+        }
+        return used;
+    };
+    domWidget.computeSize = function (width) {
+        const avail = node.size[1] - TITLE_H - siblingHeight(width) - VPADDING;
+        const h = Math.max(minHeight, avail);
+        domWidget.computedHeight = h;
+        return [width, h];
+    };
+    const onResize = node.onResize;
+    node.onResize = function (size) {
+        onResize?.apply(this, arguments);
+        domWidget.computeSize(size?.[0] ?? node.size[0]);
+        node.setDirtyCanvas(true, true);
+    };
+}
+
 // Build a single-line editable div that mimics an <input type="text"> but
 // isn't a form field — password managers (Dashlane, 1Password, LastPass,
 // Bitwarden) don't autofill into contenteditable divs. The data-* attributes
@@ -136,6 +168,9 @@ function injectStyles() {
             overflow-y:auto; overflow-x:hidden; padding-right:2px; }
         .lwm-scroll.lwm-cap-cats   { max-height:260px; }
         .lwm-scroll.lwm-cap-slots  { max-height:240px; }
+        /* Report uses a flexible split: slots and raw textarea share the
+           leftover vertical space and grow with the node frame. */
+        .lwm-scroll.lwm-grow       { flex:1 1 0; min-height:120px; }
         .lwm-scroll::-webkit-scrollbar { width:8px; }
         .lwm-scroll::-webkit-scrollbar-thumb {
             background:#2c3138; border-radius:4px; }
@@ -771,10 +806,12 @@ app.registerExtension({
                 slotsLabel.textContent = "Per-slot details";
                 root.appendChild(slotsLabel);
 
-                // slots list lives in its own scroll container so the node
-                // body never overflows past the visible footer.
+                // slots list lives in its own scroll container; it flex-grows
+                // with the node frame so resizing the node taller hands more
+                // vertical room to per-slot details instead of clipping them.
                 const slotsScroll = document.createElement("div");
-                slotsScroll.className = "lwm-scroll lwm-cap-slots";
+                slotsScroll.className = "lwm-scroll lwm-grow";
+                slotsScroll.style.flex = "2 1 0";
                 const slots = document.createElement("div");
                 slots.className = "lwm-list";
                 slotsScroll.appendChild(slots);
@@ -785,9 +822,13 @@ app.registerExtension({
                 rawLabel.textContent = "Raw report";
                 root.appendChild(rawLabel);
 
+                // Raw report wrap shares the remaining height with the slots
+                // list; both have a min-height floor so neither collapses on a
+                // small node, and both grow when the user enlarges the frame.
                 const rawWrap = document.createElement("div");
                 rawWrap.className = "lwm-flex-fill";
-                rawWrap.style.flex = "0 0 160px";
+                rawWrap.style.flex = "1 1 0";
+                rawWrap.style.minHeight = "120px";
                 const rawTA = document.createElement("textarea");
                 rawTA.readOnly = true;
                 rawTA.spellcheck = false;
@@ -894,13 +935,19 @@ app.registerExtension({
                     for (const r of records) slots.appendChild(buildSlot(r));
                 }
 
-                // Header (~36) + label (~16) + slots scroll cap (240) +
-                // label (~16) + raw textarea (160) + gaps ≈ 480.
-                const REPORT_DOM_HEIGHT = 480;
+                // The widget grows with the node frame instead of being
+                // pinned: the slots list and raw textarea split the leftover
+                // space as flex:2 / flex:1, so dragging the node corner makes
+                // both bigger. Keep a comfortable default size on first paint.
+                const REPORT_MIN_DOM_HEIGHT = 320;
+                const REPORT_DEFAULT_HEIGHT = 520;
                 const reportWidget = node.addDOMWidget(
                     "report_view", "div", root, { serialize: false });
-                pinWidgetHeight(reportWidget, REPORT_DOM_HEIGHT);
-                node.size = [Math.max(node.size[0], 560), node.size[1]];
+                fillWidgetToNode(node, reportWidget, REPORT_MIN_DOM_HEIGHT);
+                node.size = [
+                    Math.max(node.size[0], 560),
+                    Math.max(node.size[1], REPORT_DEFAULT_HEIGHT),
+                ];
 
                 node._renderReport = (payload) => {
                     renderTallies(payload?.tallies, payload?.raw);
