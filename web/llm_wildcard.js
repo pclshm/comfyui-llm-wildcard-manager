@@ -76,37 +76,37 @@ function pinWidgetHeight(domWidget, height) {
 // `onResize` so dragging the node corner reflows the inner flex children
 // (slots list, raw textarea) instead of being clipped.
 //
-// `computeSize` MUST return a cached value rather than re-deriving the height
-// from `node.size[1]` on every call: LiteGraph's draw loop sums widget heights
-// plus inter-widget spacing to decide if the node needs to grow, and a height
-// that tracks `node.size[1] - small_constant` causes an infinite feedback loop
-// where each frame inflates the node by however much chrome LiteGraph adds
-// between widgets. The cached height only changes via `onResize`, so the loop
-// is broken.
+// Sizing must converge — if our `computeSize` reports a height + the chrome
+// LiteGraph/ComfyUI insert exceeds `node.size[1]`, ComfyUI grows the node,
+// `onResize` fires, we read the larger size, our height grows by the gap, and
+// the node inflates a few pixels every frame forever. Estimating the chrome
+// with a constant (TITLE + VPADDING + sum of siblings) doesn't match what
+// `node.computeSize()` actually returns, which is what reopened the loop.
+//
+// Instead, probe `node.computeSize()` with our widget pinned to `minHeight` to
+// learn the real overhead the node adds around us, then pick our height so
+// `our_height + overhead === node.size[1]`. ComfyUI sees no reason to grow,
+// onResize doesn't re-fire, and the loop stays broken.
 function fillWidgetToNode(node, domWidget, minHeight = 280) {
-    const TITLE_H = (window.LiteGraph?.NODE_TITLE_HEIGHT) || 30;
-    const VPADDING = 12;
-    function recompute() {
-        let siblings = 0;
-        for (const w of node.widgets || []) {
-            if (w === domWidget) continue;
-            const h = w.computedHeight
-                ?? (typeof w.computeSize === "function"
-                    ? w.computeSize(node.size[0])[1] : 0);
-            siblings += Math.max(0, h || 0);
-        }
-        const avail = node.size[1] - TITLE_H - siblings - VPADDING;
-        domWidget.computedHeight = Math.max(minHeight, avail);
-    }
+    domWidget.computedHeight = minHeight;
     domWidget.computeSize = function (width) {
         return [width, domWidget.computedHeight ?? minHeight];
     };
+    function recompute() {
+        const saved = domWidget.computedHeight;
+        domWidget.computedHeight = minHeight;
+        const probed = (typeof node.computeSize === "function"
+            ? node.computeSize()[1] : minHeight);
+        const overhead = Math.max(0, probed - minHeight);
+        const target = Math.max(minHeight, node.size[1] - overhead);
+        domWidget.computedHeight = target;
+        return target !== saved;
+    }
     recompute();
     const onResize = node.onResize;
     node.onResize = function (size) {
         onResize?.apply(this, arguments);
-        recompute();
-        node.setDirtyCanvas(true, true);
+        if (recompute()) node.setDirtyCanvas(true, true);
     };
 }
 
