@@ -72,60 +72,68 @@ function pinWidgetHeight(domWidget, height) {
 
 // Make a DOM widget grow with the node frame: the widget claims whatever
 // vertical space is left after the title bar and any sibling widgets, with a
-// floor of `minHeight` so the contents stay usable on a tiny node.
+// floor of `minHeight` so the contents stay usable on a tiny node. Hooks
+// `onResize` so dragging the node corner reflows the inner flex children
+// (slots list, raw textarea) instead of being clipped.
 //
-// Two earlier fixes (caching computedHeight; probing real chrome) still let
-// the node creep up by ~1px per mouse-driven redraw because they trusted
-// `node.size[1]` as input. Anything that nudged node.size — DOM widget
-// re-layout, scrollbar appearance, ComfyUI's own min-size enforcement —
-// flowed straight into the next computed height and grew us forever.
+// Sizing must converge — if our `computeSize` reports a height + the chrome
+// LiteGraph/ComfyUI insert exceeds `node.size[1]`, ComfyUI grows the node,
+// `onResize` fires, we read the larger size, our height grows by the gap, and
+// the node inflates a few pixels every frame forever. Estimating the chrome
+// with a constant (TITLE + VPADDING + sum of siblings) doesn't match what
+// `node.computeSize()` actually returns, which is what reopened the loop.
 //
-// Flip the relationship: this widget is the source of truth for height. The
-// chrome is probed once at startup. node.size[1] is locked to
-// `widgetHeight + chrome` on every onResize call, so any drift from outside
-// is immediately undone. The widget only grows when the user is actively
-// dragging the resize corner (detected via `app.canvas.resizing_node`).
+// Instead, probe `node.computeSize()` with our widget pinned to `minHeight` to
+// learn the real overhead the node adds around us, then pick our height so
+// `our_height + overhead === node.size[1]`. ComfyUI sees no reason to grow,
+// onResize doesn't re-fire, and the loop stays broken.
 function fillWidgetToNode(node, domWidget, minHeight = 280) {
     domWidget.computedHeight = minHeight;
     domWidget.computeSize = function (width) {
         return [width, domWidget.computedHeight ?? minHeight];
     };
-    // Probe overhead once. Pin our widget to minHeight, ask the node for its
-    // computed size, and the difference is everything else (title, slots,
-    // gaps). It does not depend on node.size, so it is stable.
-    const probed = (typeof node.computeSize === "function"
-        ? node.computeSize()[1] : minHeight);
-    const chrome = Math.max(0, probed - minHeight);
-
-    let intendedHeight = node.size[1];
-    function setWidgetHeight(h) {
-        domWidget.computedHeight = Math.max(minHeight, h);
-        intendedHeight = domWidget.computedHeight + chrome;
-        node.size[1] = intendedHeight;
+    function recompute() {
+        const saved = domWidget.computedHeight;
+        domWidget.computedHeight = minHeight;
+        const probed = (typeof node.computeSize === "function"
+            ? node.computeSize()[1] : minHeight);
+        const overhead = Math.max(0, probed - minHeight);
+        const target = Math.max(minHeight, node.size[1] - overhead);
+        domWidget.computedHeight = target;
+        return target !== saved;
     }
-    setWidgetHeight(node.size[1] - chrome);
-
+    recompute();
     const onResize = node.onResize;
     node.onResize = function (size) {
         onResize?.apply(this, arguments);
-        const userResizing =
-            app?.canvas?.resizing_node === node ||
-            window.LGraphCanvas?.active_canvas?.resizing_node === node;
-        // A real user drag moves the corner by several pixels per frame; the
-        // bug-causing drift was 1px at a time. Treat a >= 4px delta as
-        // user-initiated even if the canvas-state probe missed it (different
-        // ComfyUI/LiteGraph versions expose the resize flag differently).
-        const delta = Math.abs(node.size[1] - intendedHeight);
-        if (userResizing || delta >= 4) {
-            setWidgetHeight(node.size[1] - chrome);
+        if (recompute()) node.setDirtyCanvas(true, true);
+    };
+}
+
+// Size a DOM widget + its node to wrap the rendered content. RAF coalesces
+// bursts of edits into a single layout pass; the widget reports exactly
+// `scrollHeight` (plus a small fudge for borders), so the node grows or
+// shrinks to fit and never runs away. Inner panels are responsible for their
+// own scrolling — this helper assumes the root has `height:auto` and that
+// any list/textarea inside has its own max-height. Returns a function the
+// caller invokes after any change that affects rendered height.
+function fitWidgetToContent(node, domWidget, root, minWidth = 0) {
+    let pending = false;
+    return function update() {
+        if (pending) return;
+        pending = true;
+        requestAnimationFrame(() => {
+            pending = false;
+            const h = Math.ceil(root.scrollHeight) + 8;
+            const prev = domWidget.computedHeight || 0;
+            if (Math.abs(prev - h) < 2) return;
+            domWidget.computeSize = (width) => [width, h];
+            domWidget.computedHeight = h;
+            const min = node.computeSize();
+            const w = Math.max(node.size[0], min[0], minWidth);
+            node.setSize([w, min[1]]);
             node.setDirtyCanvas(true, true);
-        } else if (node.size[1] !== intendedHeight) {
-            // Drift from somewhere else (re-layout, min-size enforcement,
-            // etc.). Pin the node back so it cannot escalate into a per-frame
-            // feedback loop.
-            node.size[1] = intendedHeight;
-            node.setDirtyCanvas(true, true);
-        }
+        });
     };
 }
 
@@ -231,6 +239,13 @@ function injectStyles() {
         .lwm-textarea { width:100%; resize:none;
             font-family: ui-monospace, Menlo, Consolas, monospace;
             font-size:11px; line-height:1.4; white-space:pre; }
+        /* Report's raw view wraps long lines and keeps a fixed height so the
+           node body wraps the content instead of stretching with it. */
+        .lwm-textarea.lwm-raw-textarea {
+            height:200px; min-height:120px;
+            white-space:pre-wrap; word-break:break-word;
+            overflow:auto;
+        }
         .lwm-btn { padding:6px 10px; font-size:12px;
             background:#2c5b86; color:#fff; border:none; border-radius:4px;
             cursor:pointer; transition:background .12s, transform .04s; }
@@ -829,7 +844,11 @@ app.registerExtension({
                 const node = this;
 
                 const root = document.createElement("div");
-                root.className = "lwm-root";
+                // `lwm-root-fit` lets the node wrap its content instead of
+                // stretching to fill the frame. Inner panels (slots scroll +
+                // raw textarea) own their own scroll, so the node settles at
+                // header + slots cap + textarea + padding.
+                root.className = "lwm-root lwm-root-fit";
 
                 const header = document.createElement("div");
                 header.className = "lwm-report-header lwm-fixed";
@@ -841,12 +860,10 @@ app.registerExtension({
                 slotsLabel.textContent = "Per-slot details";
                 root.appendChild(slotsLabel);
 
-                // slots list lives in its own scroll container; it flex-grows
-                // with the node frame so resizing the node taller hands more
-                // vertical room to per-slot details instead of clipping them.
+                // slots list scrolls inside its own container, capped at
+                // 240px so a long run doesn't push the node off-screen.
                 const slotsScroll = document.createElement("div");
-                slotsScroll.className = "lwm-scroll lwm-grow";
-                slotsScroll.style.flex = "2 1 0";
+                slotsScroll.className = "lwm-scroll lwm-cap-slots";
                 const slots = document.createElement("div");
                 slots.className = "lwm-list";
                 slotsScroll.appendChild(slots);
@@ -857,19 +874,13 @@ app.registerExtension({
                 rawLabel.textContent = "Raw report";
                 root.appendChild(rawLabel);
 
-                // Raw report wrap shares the remaining height with the slots
-                // list; both have a min-height floor so neither collapses on a
-                // small node, and both grow when the user enlarges the frame.
-                const rawWrap = document.createElement("div");
-                rawWrap.className = "lwm-flex-fill";
-                rawWrap.style.flex = "1 1 0";
-                rawWrap.style.minHeight = "120px";
+                // Raw textarea wraps long lines and has a fixed height; it
+                // owns its own scrollbar instead of growing the node body.
                 const rawTA = document.createElement("textarea");
                 rawTA.readOnly = true;
                 rawTA.spellcheck = false;
-                rawTA.className = "lwm-textarea";
-                rawWrap.appendChild(rawTA);
-                root.appendChild(rawWrap);
+                rawTA.className = "lwm-textarea lwm-raw-textarea";
+                root.appendChild(rawTA);
 
                 node._rawTA = rawTA;
                 node._reportRoot = root;
@@ -970,27 +981,23 @@ app.registerExtension({
                     for (const r of records) slots.appendChild(buildSlot(r));
                 }
 
-                // The widget grows with the node frame instead of being
-                // pinned: the slots list and raw textarea split the leftover
-                // space as flex:2 / flex:1, so dragging the node corner makes
-                // both bigger. Keep a comfortable default size on first paint.
-                const REPORT_MIN_DOM_HEIGHT = 320;
-                const REPORT_DEFAULT_HEIGHT = 520;
+                // The node wraps its rendered content: each panel inside
+                // owns its own scrollbar (slots cap at 240px, textarea is a
+                // fixed 200px), and the node body sizes itself to whatever
+                // the root currently measures. No feedback loop with
+                // LiteGraph's per-frame size check.
                 const reportWidget = node.addDOMWidget(
                     "report_view", "div", root, { serialize: false });
-                // Size the node frame BEFORE handing it to fillWidgetToNode so
-                // the widget's initial computedHeight fills the default frame
-                // instead of the smaller one ComfyUI starts with.
-                node.size = [
-                    Math.max(node.size[0], 560),
-                    Math.max(node.size[1], REPORT_DEFAULT_HEIGHT),
-                ];
-                fillWidgetToNode(node, reportWidget, REPORT_MIN_DOM_HEIGHT);
+                node.size = [Math.max(node.size[0], 560), node.size[1]];
+                const updateReportSize =
+                    fitWidgetToContent(node, reportWidget, root, 560);
+                updateReportSize();
 
                 node._renderReport = (payload) => {
                     renderTallies(payload?.tallies, payload?.raw);
                     renderRecords(payload?.records);
                     rawTA.value = payload?.raw || "";
+                    updateReportSize();
                 };
             };
 
