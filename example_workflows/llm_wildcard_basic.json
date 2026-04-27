@@ -35,9 +35,12 @@
       "properties": { "Node name for S&R": "LLMWildcardManager" },
       "widgets_values": [
         "A portrait of a woman doing an outdoor activity, photorealistic, masterpiece.",
+        false,
         0,
         "cinematic",
         "",
+        3,
+        8,
         "",
         "{}"
       ]
@@ -65,7 +68,9 @@
         "hybrid",
         200,
         0,
-        false
+        false,
+        "",
+        "prefix"
       ]
     },
     {
