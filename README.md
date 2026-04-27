@@ -142,6 +142,11 @@ Inputs:
   `fantasy`, `anime`, `dreamlike`, `minimal`, `sfw_strict`) or type your own
   steering text directly.
 - **`extra_flair`** — optional extra steering, appended after the direction.
+- **`max_categories`** — hard cap on how many `__wildcard__` placeholders the
+  template may contain. The LLM is asked to pick the most impactful variables
+  and leave the rest as concrete words; if it exceeds the cap, the surplus
+  placeholders are demoted to plain words deterministically. Lower values =
+  more focused prompts. Default `5`.
 - **`system_prompt_override`** — leave empty for the built-in template-design
   system prompt; fill to fully replace it (advanced).
 - **`categories`** — JSON object of `{name: description}`. **User overrides

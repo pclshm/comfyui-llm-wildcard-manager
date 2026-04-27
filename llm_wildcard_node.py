@@ -280,9 +280,12 @@ DRAFT_SYSTEM_PROMPT = (
 )
 
 WILDCARDIFY_SYSTEM_PROMPT = (
-    "Rewrite the image prompt by replacing each variable element — subjects, "
-    "actions, settings, attributes, styling — with a __snake_case__ "
-    "placeholder. Use double underscores on each side of every placeholder. "
+    "Rewrite the image prompt by replacing variable elements — subjects, "
+    "actions, settings, attributes, styling — with __snake_case__ "
+    "placeholders. Use double underscores on each side of every placeholder. "
+    "If the user gives a maximum number of placeholders, do not exceed it: "
+    "pick the most impactful variables to wildcardify and leave the rest as "
+    "concrete words. "
     "Also list each placeholder name. "
     'Output JSON: {"prompt": "...with __placeholders__ inserted...", '
     '"categories": ["name1", "name2", ...]}'
@@ -466,6 +469,22 @@ def _to_snake_case(name: str) -> str:
 # -----------------------------------------------------------------------------
 # Wildcard-format repair
 # -----------------------------------------------------------------------------
+def _trim_template_wildcards(template: str, keep_names) -> str:
+    """Drop any `__name__` token in `template` whose name isn't in `keep_names`
+    by replacing it with a humanized form (snake_case → spaced words). Used as
+    a fallback when the LLM exceeds the user's max-categories cap; the
+    grammar-align step at resolve time tidies the surrounding sentence."""
+    keep = {_to_snake_case(n) for n in (keep_names or []) if str(n).strip()}
+
+    def repl(m: "re.Match") -> str:
+        name = m.group(2)
+        if name in keep:
+            return m.group(0)
+        return name.replace("_", " ")
+
+    return WILDCARD_RE.sub(repl, template or "")
+
+
 def ensure_wildcard_format(template: str, known_names) -> str:
     """For each name in `known_names`, rewrite bare `name`, `_name_`, `_name`,
     or `name_` occurrences in `template` to `__name__`. Tokens already wrapped
@@ -531,15 +550,29 @@ def llm_draft_prompt(idea: str, direction_text: str, server: dict,
 
 
 def llm_wildcardify_prompt(draft_prompt: str, server: dict,
-                           seed: int = 0) -> tuple[str, list[str], str]:
+                           seed: int = 0,
+                           max_categories: int = 0) -> tuple[str, list[str], str]:
     """Step 2 — ask the LLM to rewrite the draft with __placeholders__ already
     inserted, plus the list of placeholder names. Returns (template, names,
     raw_reply). The LLM does its own placement so we don't lose wildcards to
     span-substring mismatches; ensure_wildcard_format runs afterward as a
-    safety net for any names it forgot to wrap."""
+    safety net for any names it forgot to wrap.
+
+    `max_categories` (>0) caps how many `__wildcard__` placeholders may end up
+    in the template. The cap is communicated to the LLM in the user message;
+    if the model still exceeds it, _trim_template_wildcards demotes the
+    surplus tokens to plain words deterministically."""
+    cap_line = ""
+    if max_categories and max_categories > 0:
+        plural = "" if max_categories == 1 else "s"
+        cap_line = (
+            f" Use at most {max_categories} placeholder{plural} in total — "
+            "pick the most impactful variables and leave the rest as concrete "
+            "words."
+        )
     user = (
         f"Image prompt:\n{draft_prompt}\n\n"
-        "Rewrite it with placeholders. Output the JSON object now."
+        f"Rewrite it with placeholders.{cap_line} Output the JSON object now."
     )
     raw = _server_call(server, WILDCARDIFY_SYSTEM_PROMPT, user,
                        request_json=True, seed=seed,
@@ -578,6 +611,20 @@ def llm_wildcardify_prompt(draft_prompt: str, server: dict,
             "wildcardify", raw,
             "no placeholders inserted and no categories listed",
         )
+
+    # Hard enforcement of the cap when the LLM ignored the instruction. Keep
+    # the first `max_categories` placeholders by appearance in the template
+    # (then by declared order) and demote the rest to plain words so the
+    # sentence still reads.
+    if max_categories and max_categories > 0 and len(names) > max_categories:
+        ordered: list[str] = []
+        for n in in_template + declared:
+            if n and n not in ordered:
+                ordered.append(n)
+        kept = ordered[:max_categories]
+        template = _trim_template_wildcards(template, kept)
+        names = [n for n in names if n in kept]
+
     return template, names, raw
 
 
@@ -946,6 +993,19 @@ class LLMWildcardManager:
                         "Leave empty to use only the direction value."
                     ),
                 }),
+                # Hard cap on how many `__wildcard__` placeholders the LLM may
+                # introduce in the generated template. Keeps the prompt focused
+                # — the model is told to pick the most impactful variables and
+                # leave the rest as concrete words. If the model still exceeds
+                # the cap, the surplus placeholders are demoted to plain words
+                # deterministically.
+                "max_categories": ("INT", {
+                    "default": 5, "min": 1, "max": 30,
+                    "tooltip": (
+                        "Maximum number of __wildcard__ placeholders in the "
+                        "generated template. Lower = more focused prompts."
+                    ),
+                }),
                 "system_prompt_override": ("STRING", {
                     "multiline": True,
                     "default": "",
@@ -969,7 +1029,7 @@ class LLMWildcardManager:
     OUTPUT_NODE = True
 
     def manage(self, server, example_prompt, seed, direction, extra_flair,
-               system_prompt_override, categories):
+               max_categories, system_prompt_override, categories):
         direction = (direction or "").strip() or "none"
         direction_text = resolve_direction(direction)
         extra = (extra_flair or "").strip()
@@ -1005,6 +1065,13 @@ class LLMWildcardManager:
         else:
             effective_seed = seed_int
 
+        try:
+            max_cats = int(max_categories)
+        except Exception:
+            max_cats = 0
+        if max_cats < 0:
+            max_cats = 0
+
         template = ""
         suggested_cats: dict[str, str] = {}
         used_names: list[str] = []
@@ -1027,6 +1094,7 @@ class LLMWildcardManager:
             # runs ensure_wildcard_format to repair any forgotten __ wraps.
             template, used_names, raw_wildcardify = llm_wildcardify_prompt(
                 draft, server, seed=effective_seed,
+                max_categories=max_cats,
             )
             raw_sections.append(("wildcardify", raw_wildcardify))
 
