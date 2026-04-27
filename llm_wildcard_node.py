@@ -279,11 +279,13 @@ DRAFT_SYSTEM_PROMPT = (
     "Keep it concrete and visual. Output the sentence only, no preamble or quotes."
 )
 
-DETECT_SYSTEM_PROMPT = (
-    "List the variable parts of an image prompt — subjects, actions, settings, "
-    "attributes, styling. For each, give a short snake_case name and the exact "
-    "substring from the prompt that names it. "
-    'Output JSON: {"items": [{"name": "...", "span": "..."}, ...]}'
+WILDCARDIFY_SYSTEM_PROMPT = (
+    "Rewrite the image prompt by replacing each variable element — subjects, "
+    "actions, settings, attributes, styling — with a __snake_case__ "
+    "placeholder. Use double underscores on each side of every placeholder. "
+    "Also list each placeholder name. "
+    'Output JSON: {"prompt": "...with __placeholders__ inserted...", '
+    '"categories": ["name1", "name2", ...]}'
 )
 
 DESCRIBE_SYSTEM_PROMPT = (
@@ -308,22 +310,13 @@ LIST_SYSTEM_PROMPT = (
 
 # Light per-step JSON schemas. No `pattern` constraints, no GBNF — failures
 # surface as parse errors rather than getting masked by salvage paths.
-DETECT_JSON_SCHEMA: dict = {
+WILDCARDIFY_JSON_SCHEMA: dict = {
     "type": "object",
     "properties": {
-        "items": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"},
-                    "span": {"type": "string"},
-                },
-                "required": ["name", "span"],
-            },
-        },
+        "prompt": {"type": "string"},
+        "categories": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["items"],
+    "required": ["prompt", "categories"],
 }
 
 DESCRIBE_JSON_SCHEMA: dict = {
@@ -537,39 +530,55 @@ def llm_draft_prompt(idea: str, direction_text: str, server: dict,
     return sentence, raw
 
 
-def llm_detect_wildcards(draft_prompt: str, server: dict,
-                         seed: int = 0) -> tuple[list[dict], str]:
-    """Step 2 — ask the LLM which substrings of the draft are variable.
-    Returns (items, raw_reply) where items is a list of {"name", "span"}."""
+def llm_wildcardify_prompt(draft_prompt: str, server: dict,
+                           seed: int = 0) -> tuple[str, list[str], str]:
+    """Step 2 — ask the LLM to rewrite the draft with __placeholders__ already
+    inserted, plus the list of placeholder names. Returns (template, names,
+    raw_reply). The LLM does its own placement so we don't lose wildcards to
+    span-substring mismatches; ensure_wildcard_format runs afterward as a
+    safety net for any names it forgot to wrap."""
     user = (
         f"Image prompt:\n{draft_prompt}\n\n"
-        "List the variable parts. Output the JSON object now."
+        "Rewrite it with placeholders. Output the JSON object now."
     )
-    raw = _server_call(server, DETECT_SYSTEM_PROMPT, user,
+    raw = _server_call(server, WILDCARDIFY_SYSTEM_PROMPT, user,
                        request_json=True, seed=seed,
-                       json_schema=DETECT_JSON_SCHEMA)
+                       json_schema=WILDCARDIFY_JSON_SCHEMA)
     parsed = _extract_json_object(raw)
     if not isinstance(parsed, dict):
-        raise ManagerStepError("detect", raw)
-    raw_items = parsed.get("items")
-    if not isinstance(raw_items, list):
-        raise ManagerStepError("detect", raw, "missing 'items' array")
-    items: list[dict] = []
-    seen: set[str] = set()
-    for entry in raw_items:
-        if not isinstance(entry, dict):
-            continue
-        name = _to_snake_case(entry.get("name", ""))
-        span = str(entry.get("span", "") or "").strip()
-        if not name or not span or not _KEY_RE.match(name):
-            continue
-        if name in seen:
-            continue
-        seen.add(name)
-        items.append({"name": name, "span": span})
-    if not items:
-        raise ManagerStepError("detect", raw, "no usable items returned")
-    return items, raw
+        raise ManagerStepError("wildcardify", raw)
+
+    template = str(parsed.get("prompt") or "").strip()
+    if not template:
+        raise ManagerStepError("wildcardify", raw, "missing 'prompt' field")
+
+    raw_categories = parsed.get("categories")
+    declared: list[str] = []
+    if isinstance(raw_categories, list):
+        seen: set[str] = set()
+        for entry in raw_categories:
+            n = _to_snake_case(entry if isinstance(entry, str) else "")
+            if n and _KEY_RE.match(n) and n not in seen:
+                seen.add(n)
+                declared.append(n)
+
+    # Repair any names the LLM listed but forgot to wrap in __ in the prompt.
+    template = ensure_wildcard_format(template, declared)
+
+    # Final name set = union of declared + whatever ended up wrapped in the
+    # template after repair. This is what the next step describes.
+    in_template = extract_wildcard_names(template)
+    names: list[str] = []
+    for n in declared + in_template:
+        if n and n not in names:
+            names.append(n)
+
+    if not names:
+        raise ManagerStepError(
+            "wildcardify", raw,
+            "no placeholders inserted and no categories listed",
+        )
+    return template, names, raw
 
 
 def llm_describe_wildcards(names: list[str], server: dict,
@@ -595,38 +604,6 @@ def llm_describe_wildcards(names: list[str], server: dict,
         if key and isinstance(v, str) and v.strip():
             descs[key] = v.strip()
     return descs, raw
-
-
-def assemble_template(draft: str, items: list[dict]
-                      ) -> tuple[str, list[str], list[dict]]:
-    """Replace each item's `span` in `draft` with `__name__`. Pure Python — no
-    LLM. Returns (template, used_names, skipped_items). Items whose span isn't
-    found are skipped (and reported)."""
-    if not draft:
-        return "", [], list(items or [])
-    # Longest span first so "outdoor activity" beats "activity" in the same
-    # slot and so a longer phrase isn't fragmented by an earlier shorter one.
-    ordered = sorted(items, key=lambda it: -len(it.get("span", "")))
-    out = draft
-    used: list[str] = []
-    skipped: list[dict] = []
-    for it in ordered:
-        name = _to_snake_case(it.get("name", ""))
-        span = str(it.get("span", "") or "").strip()
-        if not name or not span:
-            skipped.append(it)
-            continue
-        # Case-insensitive first-occurrence match on the *current* `out` so we
-        # never touch a span that's already inside an inserted `__name__`.
-        idx = out.lower().find(span.lower())
-        if idx < 0:
-            skipped.append({"name": name, "span": span, "reason": "span not found"})
-            continue
-        out = out[:idx] + f"__{name}__" + out[idx + len(span):]
-        if name not in used:
-            used.append(name)
-    out = ensure_wildcard_format(out, used)
-    return out, used, skipped
 
 
 def llm_generate_value_list(category: str, description: str,
@@ -1031,7 +1008,6 @@ class LLMWildcardManager:
         template = ""
         suggested_cats: dict[str, str] = {}
         used_names: list[str] = []
-        skipped_items: list[dict] = []
         status = "ok"
         status_message = ""
         raw_sections: list[tuple[str, str]] = []
@@ -1044,27 +1020,22 @@ class LLMWildcardManager:
             )
             raw_sections.append(("draft", raw_draft))
 
-            # Step 2 — detect wildcardable spans in the draft.
-            items, raw_detect = llm_detect_wildcards(
+            # Step 2 — LLM rewrites the draft with __placeholders__ already
+            # inserted + lists the category names. Doing the wildcard insertion
+            # in the LLM (rather than substring-matching spans afterwards)
+            # avoids losing wildcards to phrasing mismatches; the helper also
+            # runs ensure_wildcard_format to repair any forgotten __ wraps.
+            template, used_names, raw_wildcardify = llm_wildcardify_prompt(
                 draft, server, seed=effective_seed,
             )
-            raw_sections.append(("detect", raw_detect))
+            raw_sections.append(("wildcardify", raw_wildcardify))
 
             # Step 3 — describe each wildcard.
-            names = [it["name"] for it in items]
             descs, raw_describe = llm_describe_wildcards(
-                names, server, seed=effective_seed,
+                used_names, server, seed=effective_seed,
             )
             raw_sections.append(("describe", raw_describe))
             suggested_cats = descs
-
-            # Step 4 — assemble the template (deterministic, no LLM).
-            template, used_names, skipped_items = assemble_template(draft, items)
-            if not used_names:
-                raise ManagerStepError(
-                    "assemble", draft,
-                    "no detected spans matched the draft prompt",
-                )
         except ManagerStepError as e:
             template = ""
             used_names = []
@@ -1088,9 +1059,6 @@ class LLMWildcardManager:
             f"--- step: {step} ---\n{(body or '').strip()}"
             for step, body in raw_sections
         ) or "(no LLM output captured)"
-        if skipped_items:
-            raw_reply += "\n\n--- skipped (span not found in draft) ---\n" + \
-                "\n".join(json.dumps(it) for it in skipped_items)
 
         # Effective category descriptions: defaults < disk < LLM-suggested < user.
         merged_disk = load_category_config()
