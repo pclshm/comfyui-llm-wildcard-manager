@@ -478,7 +478,7 @@ app.registerExtension({
                 // Shrink the oversized multiline STRING widgets so the node
                 // header doesn't eat all the space before the DOM table.
                 shrinkMultilineWidget(node, "example_prompt", 64);
-                shrinkMultilineWidget(node, "extra_flair", 48);
+                shrinkMultilineWidget(node, "negative_prompt", 64);
                 shrinkMultilineWidget(node, "system_prompt_override", 48);
 
                 const root = document.createElement("div");

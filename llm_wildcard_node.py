@@ -276,16 +276,27 @@ def resolve_direction(direction: str) -> str:
 # -----------------------------------------------------------------------------
 DRAFT_SYSTEM_PROMPT = (
     "Write one image prompt sentence based on the user's idea and direction. "
-    "Keep it concrete and visual. Output the sentence only, no preamble or quotes."
+    "Keep it concrete and visual. If the user provides a negative prompt, "
+    "the sentence MUST NOT contain or imply any of the listed traits — "
+    "treat each item as forbidden. Output the sentence only, no preamble or quotes."
 )
 
 WILDCARDIFY_SYSTEM_PROMPT = (
     "Rewrite the image prompt by replacing variable elements — subjects, "
     "actions, settings, attributes, styling — with __snake_case__ "
     "placeholders. Use double underscores on each side of every placeholder. "
-    "If the user gives a placeholder count range, stay within it: do not "
-    "exceed the maximum, and try to reach the minimum by wildcardifying "
-    "additional impactful variables when needed. "
+    "Placeholder count: if the user gives a range you MUST stay within it. "
+    "Never produce fewer placeholders than the minimum and never exceed the "
+    "maximum. To reach the minimum, wildcardify additional impactful "
+    "variables (subject attributes, environment details, lighting, mood, "
+    "composition, styling, props, materials, era markers, color palette, "
+    "etc.) — keep going until the count is in range. "
+    "Negative prompt: if the user supplies one, do NOT introduce a "
+    "placeholder for any aspect it constrains (an aspect the user has "
+    "already pinned). Keep that aspect as concrete words baked into the "
+    "sentence so its value can never drift. Example: idea 'young woman' "
+    "with negative 'no old or middle-aged people' means do NOT create an "
+    "__age__ placeholder — write 'young' as a concrete word. "
     "Also list each placeholder name. "
     'Output JSON: {"prompt": "...with __placeholders__ inserted...", '
     '"categories": ["name1", "name2", ...]}'
@@ -294,12 +305,15 @@ WILDCARDIFY_SYSTEM_PROMPT = (
 DESCRIBE_SYSTEM_PROMPT = (
     "For each wildcard name, write one short phrase describing what kind of "
     "value belongs in that slot of THIS specific image prompt. Anchor the "
-    "description to the prompt's idea, direction, and any extra steering: "
+    "description to the prompt's idea, direction, and any negative prompt: "
     "narrow enough that random or off-topic values would feel wrong, but "
     "broad enough to allow variety. Reference the relevant tone, era, "
-    "setting, or aesthetic when those constraints apply. Avoid bland "
-    "category-only definitions like 'an outfit' or 'a location'. "
-    "No examples, no full sentences. "
+    "setting, or aesthetic when those constraints apply. If a negative "
+    "prompt is given, the description MUST explicitly exclude those traits "
+    "(e.g. 'must be young — never middle-aged or older') so the per-slot "
+    "value generator cannot produce them. Avoid bland category-only "
+    "definitions like 'an outfit' or 'a location'. No examples, no full "
+    "sentences. "
     'Output JSON: {"<name>": "<short description>", ...}'
 )
 
@@ -531,9 +545,10 @@ class ManagerStepError(Exception):
 
 
 def llm_draft_prompt(idea: str, direction_text: str, server: dict,
-                     seed: int = 0) -> tuple[str, str]:
+                     seed: int = 0, negative_prompt: str = "") -> tuple[str, str]:
     """Step 1 — turn the user idea + direction into a single image-prompt
-    sentence. Returns (sentence, raw_reply)."""
+    sentence. `negative_prompt` lists traits the sentence must avoid.
+    Returns (sentence, raw_reply)."""
     user_parts = [
         "User idea:",
         (idea or "").strip() or "(no example provided)",
@@ -541,6 +556,9 @@ def llm_draft_prompt(idea: str, direction_text: str, server: dict,
     if direction_text and direction_text.strip():
         user_parts.append("\nDirection:")
         user_parts.append(direction_text.strip())
+    if negative_prompt and negative_prompt.strip():
+        user_parts.append("\nNegative prompt (DO NOT include or imply any of these):")
+        user_parts.append(negative_prompt.strip())
     if seed:
         user_parts.append(f"\nVariation token: {seed}.")
     user_parts.append("\nWrite the image prompt sentence now.")
@@ -555,57 +573,45 @@ def llm_draft_prompt(idea: str, direction_text: str, server: dict,
     return sentence, raw
 
 
-def llm_wildcardify_prompt(draft_prompt: str, server: dict,
-                           seed: int = 0,
-                           min_categories: int = 0,
-                           max_categories: int = 0) -> tuple[str, list[str], str]:
-    """Step 2 — ask the LLM to rewrite the draft with __placeholders__ already
-    inserted, plus the list of placeholder names. Returns (template, names,
-    raw_reply). The LLM does its own placement so we don't lose wildcards to
-    span-substring mismatches; ensure_wildcard_format runs afterward as a
-    safety net for any names it forgot to wrap.
-
-    `min_categories` (>0) is a soft floor — the LLM is asked to wildcardify
-    at least that many variables. `max_categories` (>0) is a hard cap; if
-    the model exceeds it, _trim_template_wildcards demotes the surplus
-    tokens to plain words deterministically. The range is communicated to
-    the LLM in the user message."""
-    lo = max(0, int(min_categories or 0))
-    hi = max(0, int(max_categories or 0))
-    if lo and hi and lo > hi:
-        lo = hi
-    cap_line = ""
+def _build_wildcardify_cap_line(lo: int, hi: int) -> str:
     if lo and hi and lo == hi:
         plural = "" if hi == 1 else "s"
-        cap_line = (
-            f" Use exactly {hi} placeholder{plural} in total — pick the "
-            "most impactful variables and leave the rest as concrete words."
+        return (
+            f" You MUST use exactly {hi} placeholder{plural} in total — pick "
+            "the most impactful variables and leave the rest as concrete words."
         )
-    elif lo and hi:
-        cap_line = (
-            f" Use between {lo} and {hi} placeholders in total — pick the "
-            "most impactful variables and leave the rest as concrete words."
+    if lo and hi:
+        return (
+            f" You MUST use between {lo} and {hi} placeholders in total. "
+            "Fewer than the minimum is not acceptable; producing only a "
+            "handful when the minimum is much higher is a failure. Find "
+            "additional impactful variables (subject attributes, "
+            "environment, lighting, mood, composition, styling, props, "
+            "materials, era markers, color palette, etc.) until the count "
+            "is in range."
         )
-    elif hi:
+    if hi:
         plural = "" if hi == 1 else "s"
-        cap_line = (
+        return (
             f" Use at most {hi} placeholder{plural} in total — "
             "pick the most impactful variables and leave the rest as concrete "
             "words."
         )
-    elif lo:
+    if lo:
         plural = "" if lo == 1 else "s"
-        cap_line = (
-            f" Use at least {lo} placeholder{plural} — wildcardify the most "
-            "impactful variables."
+        return (
+            f" You MUST use at least {lo} placeholder{plural} — wildcardify "
+            "the most impactful variables, then keep adding more "
+            "(subject attributes, environment, lighting, mood, composition, "
+            "styling, props, materials, era markers, color palette, etc.) "
+            "until the count is reached."
         )
-    user = (
-        f"Image prompt:\n{draft_prompt}\n\n"
-        f"Rewrite it with placeholders.{cap_line} Output the JSON object now."
-    )
-    raw = _server_call(server, WILDCARDIFY_SYSTEM_PROMPT, user,
-                       request_json=True, seed=seed,
-                       json_schema=WILDCARDIFY_JSON_SCHEMA)
+    return ""
+
+
+def _parse_wildcardify_reply(raw: str) -> tuple[str, list[str], list[str]]:
+    """Parse one wildcardify LLM reply. Returns (template, names, in_template).
+    Raises ManagerStepError if the reply is unparseable."""
     parsed = _extract_json_object(raw)
     if not isinstance(parsed, dict):
         raise ManagerStepError("wildcardify", raw)
@@ -624,11 +630,7 @@ def llm_wildcardify_prompt(draft_prompt: str, server: dict,
                 seen.add(n)
                 declared.append(n)
 
-    # Repair any names the LLM listed but forgot to wrap in __ in the prompt.
     template = ensure_wildcard_format(template, declared)
-
-    # Final name set = union of declared + whatever ended up wrapped in the
-    # template after repair. This is what the next step describes.
     in_template = extract_wildcard_names(template)
     names: list[str] = []
     for n in declared + in_template:
@@ -640,28 +642,114 @@ def llm_wildcardify_prompt(draft_prompt: str, server: dict,
             "wildcardify", raw,
             "no placeholders inserted and no categories listed",
         )
+    return template, names, in_template
+
+
+def llm_wildcardify_prompt(draft_prompt: str, server: dict,
+                           seed: int = 0,
+                           min_categories: int = 0,
+                           max_categories: int = 0,
+                           negative_prompt: str = "") -> tuple[str, list[str], str]:
+    """Step 2 — ask the LLM to rewrite the draft with __placeholders__ already
+    inserted, plus the list of placeholder names. Returns (template, names,
+    raw_reply). The LLM does its own placement so we don't lose wildcards to
+    span-substring mismatches; ensure_wildcard_format runs afterward as a
+    safety net for any names it forgot to wrap.
+
+    `min_categories` (>0) is a hard floor enforced via retry: if the model
+    returns fewer placeholders, we re-call it with the previous result and
+    an explicit "you produced X, need at least N — add more" instruction
+    until it complies (up to a small retry budget). `max_categories` (>0)
+    is a hard ceiling; if exceeded, surplus placeholders are demoted to
+    plain words deterministically.
+
+    `negative_prompt` lists traits that the user has explicitly pinned.
+    The LLM is told NOT to wildcardify aspects the negative constrains —
+    those stay as concrete words so the resolver can't drift them later."""
+    lo = max(0, int(min_categories or 0))
+    hi = max(0, int(max_categories or 0))
+    if lo and hi and lo > hi:
+        lo = hi
+
+    neg = (negative_prompt or "").strip()
+
+    def _call(attempt: int, prev_template: str = "", prev_count: int = -1,
+              prev_names: list[str] | None = None) -> tuple[str, list[str], list[str], str]:
+        cap_line = _build_wildcardify_cap_line(lo, hi)
+        parts = [f"Image prompt:\n{draft_prompt}"]
+        if neg:
+            parts.append(
+                "Negative prompt — the user has already pinned these aspects. "
+                "Do NOT introduce a placeholder for any aspect listed here; "
+                "keep that aspect as concrete words in the sentence:\n"
+                f"{neg}"
+            )
+        if attempt > 0 and prev_count >= 0 and lo and prev_count < lo:
+            shown_names = ", ".join(f"__{n}__" for n in (prev_names or [])) or "(none)"
+            parts.append(
+                f"Your previous attempt produced only {prev_count} "
+                f"placeholder(s): {shown_names}. That is below the minimum "
+                f"of {lo}. Try again — keep the existing placeholders and "
+                "wildcardify ADDITIONAL impactful variables until the count "
+                f"is at least {lo}."
+            )
+            if prev_template:
+                parts.append(f"Previous template:\n{prev_template}")
+        parts.append(f"Rewrite it with placeholders.{cap_line} Output the JSON object now.")
+        user = "\n\n".join(parts)
+        # Vary seed across retries so we don't get the same sample back.
+        attempt_seed = seed + attempt * 9973 if seed else 0
+        raw = _server_call(server, WILDCARDIFY_SYSTEM_PROMPT, user,
+                           request_json=True, seed=attempt_seed,
+                           json_schema=WILDCARDIFY_JSON_SCHEMA)
+        template, names, in_template = _parse_wildcardify_reply(raw)
+        return template, names, in_template, raw
+
+    template, names, in_template, raw = _call(0)
+
+    # Retry up to 2 times if the LLM falls short of the minimum. Beyond that,
+    # accept what we have rather than spinning forever.
+    retries = 0
+    raw_log = [raw]
+    while lo and len(names) < lo and retries < 2:
+        retries += 1
+        try:
+            template, names, in_template, raw = _call(
+                retries, prev_template=template, prev_count=len(names),
+                prev_names=names,
+            )
+            raw_log.append(raw)
+        except ManagerStepError as e:
+            # Keep the last good result; surface the failed retry's raw.
+            raw_log.append(e.raw or "")
+            break
 
     # Hard enforcement of the cap when the LLM ignored the instruction. Keep
     # the first `max_categories` placeholders by appearance in the template
     # (then by declared order) and demote the rest to plain words so the
     # sentence still reads.
-    if max_categories and max_categories > 0 and len(names) > max_categories:
+    if hi and len(names) > hi:
         ordered: list[str] = []
-        for n in in_template + declared:
+        for n in in_template + names:
             if n and n not in ordered:
                 ordered.append(n)
-        kept = ordered[:max_categories]
+        kept = ordered[:hi]
         template = _trim_template_wildcards(template, kept)
         names = [n for n in names if n in kept]
 
-    return template, names, raw
+    combined_raw = raw_log[0] if len(raw_log) == 1 else "\n\n".join(
+        f"--- attempt {i} ---\n{(r or '').strip()}"
+        for i, r in enumerate(raw_log)
+    )
+    return template, names, combined_raw
 
 
 def llm_describe_wildcards(names: list[str], server: dict,
                            seed: int = 0,
                            idea: str = "",
                            direction_text: str = "",
-                           template: str = "") -> tuple[dict[str, str], str]:
+                           template: str = "",
+                           negative_prompt: str = "") -> tuple[dict[str, str], str]:
     """Step 3 — short shape-of-value description for each wildcard name.
     Returns (descriptions, raw_reply).
 
@@ -669,7 +757,11 @@ def llm_describe_wildcards(names: list[str], server: dict,
     write descriptions that fit this specific prompt rather than generic
     category-only definitions. Without them, descriptions drift to "an
     outfit" / "a location" and the resolver's value generator returns random
-    content that doesn't match the prompt's direction."""
+    content that doesn't match the prompt's direction.
+
+    `negative_prompt` is baked into every description as an explicit
+    exclusion clause — the per-slot value generator sees only the
+    description, so the avoid-list has to live inside it."""
     if not names:
         return {}, ""
     listed = "\n".join(f"- {n}" for n in names)
@@ -678,15 +770,32 @@ def llm_describe_wildcards(names: list[str], server: dict,
         parts.append(f"User idea:\n{idea.strip()}")
     if direction_text and direction_text.strip():
         parts.append(f"Direction / steering:\n{direction_text.strip()}")
+    neg = (negative_prompt or "").strip()
+    if neg:
+        parts.append(
+            "Negative prompt — values for any wildcard MUST NOT include or "
+            "imply these traits. Bake an explicit exclusion into each "
+            "description so the per-slot value generator (which sees ONLY "
+            "the description) cannot produce them:\n"
+            f"{neg}"
+        )
     if template and template.strip():
         parts.append(f"Prompt template (with placeholders):\n{template.strip()}")
     parts.append(f"Wildcard names:\n{listed}")
-    parts.append(
+    closing = (
         "For each name, write a short phrase describing what kind of value "
         "belongs there in this specific prompt — tied to the idea and "
         "direction above so the resolver generates fitting values, not "
-        "generic ones. Output the JSON object now."
+        "generic ones."
     )
+    if neg:
+        closing += (
+            " Each description MUST end with an explicit exclusion clause "
+            "covering the negative prompt above (e.g. '… — never "
+            "<forbidden trait>')."
+        )
+    closing += " Output the JSON object now."
+    parts.append(closing)
     user = "\n\n".join(parts)
     raw = _server_call(server, DESCRIBE_SYSTEM_PROMPT, user,
                        request_json=True, seed=seed,
@@ -851,7 +960,7 @@ def _tally(records: list[dict]) -> dict:
 # -----------------------------------------------------------------------------
 def build_manager_snapshot(effective_categories: dict, *,
                            direction: str = "none",
-                           extra_flair: str = "",
+                           negative_prompt: str = "",
                            generated_prompt: str = "",
                            user_overrides: dict | None = None) -> dict:
     # The category list shown by the UI tracks the *current* template plus any
@@ -876,7 +985,7 @@ def build_manager_snapshot(effective_categories: dict, *,
         "direction": direction,
         "direction_text": resolve_direction(direction),
         "direction_presets": DIRECTION_PRESETS,
-        "extra_flair": extra_flair,
+        "negative_prompt": negative_prompt,
         "generated_prompt": generated_prompt,
         "rows": rows,
     }
@@ -1046,12 +1155,26 @@ class LLMWildcardManager:
                     "default": "none",
                     "placeholder": "preset key (e.g. 'cinematic') or any custom steering text",
                 }),
-                "extra_flair": ("STRING", {
+                "negative_prompt": ("STRING", {
                     "multiline": True,
                     "default": "",
                     "placeholder": (
-                        "Optional extra steering, appended after the direction.\n"
-                        "Leave empty to use only the direction value."
+                        "Traits to AVOID — applied at every step.\n"
+                        "1) The drafted sentence won't include them.\n"
+                        "2) Aspects you pin here won't become wildcards "
+                        "(e.g. 'no old or middle-aged people' stops "
+                        "__age__ from being generated).\n"
+                        "3) Each wildcard description gets an explicit "
+                        "exclusion clause so the resolver can't drift into "
+                        "them either.\n"
+                        "One item per line or comma-separated."
+                    ),
+                    "tooltip": (
+                        "What the LLM must avoid. Pinning an aspect here "
+                        "(e.g. 'no old/middle-aged people' when the idea "
+                        "is 'young woman') prevents the Manager from "
+                        "creating a wildcard for that aspect AND keeps the "
+                        "resolver's per-slot values from contradicting it."
                     ),
                 }),
                 # Soft floor on how many `__wildcard__` placeholders the LLM
@@ -1062,8 +1185,10 @@ class LLMWildcardManager:
                     "default": 3, "min": 1, "max": 30,
                     "display": "slider",
                     "tooltip": (
-                        "Minimum number of __wildcard__ placeholders the LLM "
-                        "is asked to insert. Higher = more variation."
+                        "Minimum number of __wildcard__ placeholders the "
+                        "Manager will accept. Enforced by retrying the "
+                        "wildcardify step if the LLM falls short. Higher = "
+                        "more variation."
                     ),
                 }),
                 # Hard cap on how many `__wildcard__` placeholders the LLM may
@@ -1103,12 +1228,11 @@ class LLMWildcardManager:
     OUTPUT_NODE = True
 
     def manage(self, server, example_prompt, lock_template, seed, direction,
-               extra_flair, min_categories, max_categories,
+               negative_prompt, min_categories, max_categories,
                system_prompt_override, categories):
         direction = (direction or "").strip() or "none"
         direction_text = resolve_direction(direction)
-        extra = (extra_flair or "").strip()
-        combined_direction = "\n".join(s for s in (direction_text, extra) if s)
+        negative = (negative_prompt or "").strip()
 
         # `system_prompt_override` is kept on the input for backward compat,
         # but the manager now drives four small calls — a single override
@@ -1199,34 +1323,34 @@ class LLMWildcardManager:
             try:
                 # Step 1 — draft the prompt sentence from idea + direction.
                 draft, raw_draft = llm_draft_prompt(
-                    example_prompt or "", combined_direction, server,
+                    example_prompt or "", direction_text, server,
                     seed=effective_seed,
+                    negative_prompt=negative,
                 )
                 raw_sections.append(("draft", raw_draft))
 
                 # Step 2 — LLM rewrites the draft with __placeholders__ already
-                # inserted + lists the category names. Doing the wildcard
-                # insertion in the LLM (rather than substring-matching spans
-                # afterwards) avoids losing wildcards to phrasing mismatches;
-                # the helper also runs ensure_wildcard_format to repair any
-                # forgotten __ wraps.
+                # inserted + lists the category names. The negative prompt
+                # tells it which aspects MUST stay as concrete words (so
+                # already-pinned attributes don't become drift-prone wildcards).
                 template, used_names, raw_wildcardify = llm_wildcardify_prompt(
                     draft, server, seed=effective_seed,
                     min_categories=min_cats,
                     max_categories=max_cats,
+                    negative_prompt=negative,
                 )
                 raw_sections.append(("wildcardify", raw_wildcardify))
 
                 # Step 3 — describe each wildcard. Pass the user's idea,
-                # combined direction, and the wildcardified template so the
-                # descriptions are tailored to this specific prompt rather
-                # than generic category definitions — that specificity is
-                # what keeps the resolver's value generator on-topic.
+                # direction, negative prompt, and the wildcardified template
+                # so descriptions are tailored to this specific prompt and
+                # carry an explicit exclusion clause from the negative.
                 descs, raw_describe = llm_describe_wildcards(
                     used_names, server, seed=effective_seed,
                     idea=example_prompt or "",
-                    direction_text=combined_direction,
+                    direction_text=direction_text,
                     template=template,
+                    negative_prompt=negative,
                 )
                 raw_sections.append(("describe", raw_describe))
                 suggested_cats = descs
@@ -1291,10 +1415,12 @@ class LLMWildcardManager:
         bundle = {
             # Resolver no longer has a strict-rules system prompt; the small
             # LIST_SYSTEM_PROMPT inside the resolver handles each per-slot call.
-            # We still expose any combined direction text under "flair" so the
-            # report and (future) custom prompts can pick it up.
+            # `flair` exposes the direction text for the report; `negative`
+            # is included for visibility — the actual avoid clauses are
+            # already baked into each category description.
             "system_prompt": "",
-            "flair": combined_direction,
+            "flair": direction_text,
+            "negative": negative,
             "category_overrides": dict(effective),
             "intended_names": list(used_names),
         }
@@ -1307,7 +1433,7 @@ class LLMWildcardManager:
         snapshot = build_manager_snapshot(
             display_cats,
             direction=direction,
-            extra_flair=extra,
+            negative_prompt=negative,
             generated_prompt=template,
             user_overrides=user_overrides,
         )
