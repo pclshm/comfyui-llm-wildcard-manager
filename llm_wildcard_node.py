@@ -325,8 +325,19 @@ ALIGN_SYSTEM_PROMPT = (
 )
 
 LIST_SYSTEM_PROMPT = (
-    "Generate a short list of distinct values for an image-prompt wildcard "
-    "category. Each value is a phrase, not a sentence. "
+    "Generate distinct values for an image-prompt wildcard category. Each "
+    "value is a phrase, not a sentence — concise but specific. "
+    "From the description, identify the implicit dimensions of the value "
+    "(e.g. for hair: color × length × texture × style; for outfit: garment × "
+    "material × era × fit; for location: place × time-of-day × mood). Each "
+    "entry should COMBINE choices across multiple dimensions, and entries "
+    "should SPREAD across different dimensional combinations — do NOT return "
+    "synonyms or near-paraphrases varying along a single axis. "
+    "If existing values are listed: treat them as forbidden AND as a hint "
+    "about which combinations are already covered. Your new values must "
+    "explore combinations the existing pool has not — different colors with "
+    "different textures, different eras with different materials, etc. Aim "
+    "for breadth, not refinement of one cluster. "
     'Output JSON: {"values": ["...", "...", ...]}'
 )
 
@@ -813,7 +824,7 @@ def llm_describe_wildcards(names: list[str], server: dict,
 
 def llm_generate_value_list(category: str, description: str,
                             existing: list[str], server: dict,
-                            count: int = 5, seed: int = 0) -> tuple[list[str], str]:
+                            count: int = 10, seed: int = 0) -> tuple[list[str], str]:
     """Resolver step — ask the LLM for a short list of distinct values for one
     wildcard category. Returns (values, raw_reply)."""
     forbidden = ("\n".join(f"- {e}" for e in existing)
@@ -1484,6 +1495,8 @@ class LLMWildcardResolver:
                 "mode": (["reuse_existing", "force_new", "hybrid"],
                          {"default": "hybrid"}),
                 "max_per_category": ("INT", {"default": 200, "min": 1, "max": 10000}),
+                "min_pool_size": ("INT", {"default": 5, "min": 1, "max": 1000}),
+                "values_per_call": ("INT", {"default": 10, "min": 1, "max": 50}),
                 "seed": ("INT", {"default": 0, "min": 0,
                                  "max": 0xFFFFFFFFFFFFFFFF}),
                 "fix_seed": ("BOOLEAN", {"default": False}),
@@ -1504,9 +1517,14 @@ class LLMWildcardResolver:
     CATEGORY = "prompt/wildcards"
     OUTPUT_NODE = True
 
-    def resolve(self, server, template, mode, max_per_category, seed, fix_seed,
+    def resolve(self, server, template, mode, max_per_category,
+                min_pool_size, values_per_call, seed, fix_seed,
                 trigger_words="", trigger_position="prefix", prompts=None):
         rng = random.Random(seed if (fix_seed or seed != 0) else None)
+
+        # Pool floor cannot exceed the hard cap.
+        effective_min = max(1, min(int(min_pool_size), int(max_per_category)))
+        per_call = max(1, int(values_per_call))
 
         categories = load_category_config()
         flair_text = ""
@@ -1537,9 +1555,12 @@ class LLMWildcardResolver:
         else:
             llm_seed = seed_int
 
-        # Phase 1 — for each unique wildcard name, decide on a value. Either
-        # reuse from disk, or call the LLM for a small list of candidates
-        # (filling up the pool faster than one-at-a-time).
+        # Phase 1 — for each unique wildcard name, decide on a value.
+        # Generation triggers when:
+        #   * mode is force_new (always), OR
+        #   * pool is empty (need at least one value), OR
+        #   * pool is below `effective_min` (top-up to grow combinatoric breadth).
+        # Otherwise we pick from disk without an LLM call.
         records: list[dict] = []
         picks: dict[str, str] = {}
         unique_names = extract_wildcard_names(template)
@@ -1550,25 +1571,38 @@ class LLMWildcardResolver:
             rec: dict = {"name": name, "pool_size": len(existing)}
 
             force_new = mode == "force_new"
-            should_reuse = (not force_new) and existing and (mode != "force_new")
 
-            if should_reuse:
-                value = rng.choice(existing)
-                rec.update({"status": "reused", "value": value})
-                records.append(rec)
-                picks[name] = value
-                continue
-
-            if len(existing) >= max_per_category:
+            # Hard cap: no more generation possible — pick what's there.
+            if not force_new and len(existing) >= max_per_category:
                 value = rng.choice(existing) if existing else ""
                 rec.update({"status": "cap_reached", "value": value})
                 records.append(rec)
                 picks[name] = value
                 continue
 
+            below_floor = (mode != "force_new") and existing and \
+                len(existing) < effective_min
+            needs_generation = force_new or not existing or below_floor
+
+            if not needs_generation:
+                value = rng.choice(existing)
+                rec.update({"status": "reused", "value": value})
+                records.append(rec)
+                picks[name] = value
+                continue
+
+            # How many to ask for: enough to reach the floor in one shot when
+            # possible, but never less than `per_call` (avoid wasting a call on
+            # one or two items) and never more than the cap allows.
+            target_new = max(per_call, effective_min - len(existing))
+            if not force_new:
+                cap_remaining = max(1, max_per_category - len(existing))
+                target_new = min(target_new, cap_remaining)
+            target_new = max(1, target_new)
+
             sent = (
                 f'category="{name}" | desc={description!r} | '
-                f'pool={len(existing)} items | '
+                f'pool={len(existing)} items | request={target_new} | '
                 f'model={server.get("model", "")!r} | '
                 f'temp={server.get("temperature", 0.9)}'
             )
@@ -1576,7 +1610,7 @@ class LLMWildcardResolver:
             try:
                 values, raw = llm_generate_value_list(
                     name, description, existing, server,
-                    count=5, seed=llm_seed,
+                    count=target_new, seed=llm_seed,
                 )
                 rec["raw"] = raw
                 # Only keep values that aren't already in the pool.

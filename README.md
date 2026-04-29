@@ -200,6 +200,14 @@ Inputs:
 - **`mode`** — `hybrid` (recommended), `reuse_existing`, or `force_new`.
 - **`max_per_category`** — soft cap. Once a category file hits this many
   entries, the resolver stops appending and starts reusing.
+- **`min_pool_size`** — pool floor. If a category's on-disk pool is below
+  this number when the resolver runs, it tops up the pool with fresh values
+  before picking. Default `5`. Bump higher (e.g. `20`–`50`) when outputs feel
+  same-y across runs — wider pool = more combinatoric variety. Tops up
+  silently once each pool is seeded.
+- **`values_per_call`** — how many values to request per LLM call when the
+  resolver does generate or top up. Default `10`. Higher = fewer calls to
+  reach the floor but each call is bigger.
 - **`seed`** — random seed for the choice between existing values.
 - **`fix_seed`** — when **off** (default), every queue run re-rolls the
   fills (regardless of seed). When **on**, the resolver is fully
@@ -253,6 +261,12 @@ Each per-slot LLM call receives:
 1. Only the category name and category description.
 2. The full list of existing values flagged as **forbidden / do not paraphrase**.
 3. No other context from the surrounding prompt.
+
+The system prompt also asks the LLM to identify the implicit dimensions of
+the description (e.g. for hair: color × length × texture × style) and produce
+values that combine choices across dimensions instead of varying along a
+single axis. Anti-duplication and combinatoric breadth are different
+problems; the Resolver enforces both.
 
 If the model returns a duplicate anyway, the Resolver retries once with a
 higher temperature.
