@@ -328,6 +328,12 @@ ALIGN_SYSTEM_PROMPT = (
 LIST_SYSTEM_PROMPT = (
     "Generate distinct values for an image-prompt wildcard category. Each "
     "value is a phrase, not a sentence — concise but specific. "
+    "Anchor every value to the provided image-prompt context — the prompt "
+    "template, the user's direction/steering, and any negative prompt. "
+    "Values MUST fit that context: respect the direction's tone/era/setting, "
+    "and never contradict the negative prompt or any constraint baked into "
+    "the description (e.g. if the description says 'must be young — never "
+    "middle-aged', do not produce older values). "
     "From the description, identify the implicit dimensions of the value "
     "(e.g. for hair: color length texture style; for outfit: garment "
     "material era fit; for location: place time-of-day mood). Each "
@@ -825,18 +831,35 @@ def llm_describe_wildcards(names: list[str], server: dict,
 
 def llm_generate_value_list(category: str, description: str,
                             existing: list[str], server: dict,
-                            count: int = 10, seed: int = 0) -> tuple[list[str], str]:
+                            count: int = 10, seed: int = 0,
+                            template: str = "",
+                            direction_text: str = "",
+                            negative_prompt: str = "",
+                            ) -> tuple[list[str], str]:
     """Resolver step — ask the LLM for a short list of distinct values for one
-    wildcard category. Returns (values, raw_reply)."""
+    wildcard category. The prompt's template, direction, and negative prompt
+    are passed through so the LLM can keep each value consistent with the
+    overall image (e.g. age values stay adult/young when the direction calls
+    for a young woman). Returns (values, raw_reply)."""
     forbidden = ("\n".join(f"- {e}" for e in existing)
                  if existing else "(none yet)")
-    user = (
-        f"Category: {category}\n"
-        f"What this wildcard means: {description}\n\n"
-        f"Already used (do not repeat):\n{forbidden}\n\n"
-        f"Produce {count} distinct new values. "
-        "Output the JSON object now."
+    parts = [f"Category: {category}",
+             f"What this wildcard means: {description}"]
+    if template and template.strip():
+        parts.append(f"\nImage prompt template (full context):\n{template.strip()}")
+    if direction_text and direction_text.strip():
+        parts.append(f"\nDirection / steering for the whole image:\n{direction_text.strip()}")
+    if negative_prompt and negative_prompt.strip():
+        parts.append(
+            "\nNegative prompt (values MUST NOT contain or imply any of "
+            f"these traits):\n{negative_prompt.strip()}"
+        )
+    parts.append(f"\nAlready used (do not repeat):\n{forbidden}")
+    parts.append(
+        f"\nProduce {count} distinct new values that fit the image prompt's "
+        "context above. Output the JSON object now."
     )
+    user = "\n".join(parts)
     raw = _server_call(server, LIST_SYSTEM_PROMPT, user,
                        request_json=True, seed=seed,
                        json_schema=LIST_JSON_SCHEMA)
@@ -1529,9 +1552,11 @@ class LLMWildcardResolver:
 
         categories = load_category_config()
         flair_text = ""
+        negative_text = ""
         intended_names: list[str] = []
         if isinstance(prompts, dict):
             flair_text = prompts.get("flair") or ""
+            negative_text = prompts.get("negative") or ""
             cfg_overrides = prompts.get("category_overrides") or {}
             if isinstance(cfg_overrides, dict):
                 categories.update(cfg_overrides)
@@ -1612,6 +1637,9 @@ class LLMWildcardResolver:
                 values, raw = llm_generate_value_list(
                     name, description, existing, server,
                     count=target_new, seed=llm_seed,
+                    template=template or "",
+                    direction_text=flair_text,
+                    negative_prompt=negative_text,
                 )
                 rec["raw"] = raw
                 # Only keep values that aren't already in the pool.
