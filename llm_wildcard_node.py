@@ -278,7 +278,8 @@ DRAFT_SYSTEM_PROMPT = (
     "Write one image prompt sentence based on the user's idea and direction. "
     "Keep it concrete and visual. If the user provides a negative prompt, "
     "the sentence MUST NOT contain or imply any of the listed traits — "
-    "treat each item as forbidden. Output the sentence only, no preamble or quotes."
+    "leave out the complete opposites if not specified clearly do not find a loophole to include them in a different way. "
+    "Treat each item as forbidden. Output the sentence only, no preamble or quotes."
 )
 
 WILDCARDIFY_SYSTEM_PROMPT = (
@@ -328,8 +329,8 @@ LIST_SYSTEM_PROMPT = (
     "Generate distinct values for an image-prompt wildcard category. Each "
     "value is a phrase, not a sentence — concise but specific. "
     "From the description, identify the implicit dimensions of the value "
-    "(e.g. for hair: color × length × texture × style; for outfit: garment × "
-    "material × era × fit; for location: place × time-of-day × mood). Each "
+    "(e.g. for hair: color length texture style; for outfit: garment "
+    "material era fit; for location: place time-of-day mood). Each "
     "entry should COMBINE choices across multiple dimensions, and entries "
     "should SPREAD across different dimensional combinations — do NOT return "
     "synonyms or near-paraphrases varying along a single axis. "
