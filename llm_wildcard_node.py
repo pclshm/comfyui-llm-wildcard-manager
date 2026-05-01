@@ -50,7 +50,7 @@ LAST_RESOLVER_PATH = WILDCARDS_DIR / ".last_resolver.json"
 DEFAULT_CATEGORIES = {
     "hair": "A short visual description of a person's hair: style, length, and color. One concise phrase, no leading article.",
     "ethnicity": "A single ethnicity or heritage descriptor for a portrait subject. One or two words.",
-    "age": "An age descriptor for an ADULT portrait subject (18+). Examples: 'young woman in her 20s', 'woman in her 30s', 'middle-aged woman'. Never produce values implying a minor (under 18), child, teen, schoolgirl, or anything age-ambiguous.",
+    "age": "An age descriptor for a portrait subject, e.g. 'young woman in her 20s' or 'middle-aged woman'.",
     "activity": "A single sport or active activity, e.g. 'jogging', 'practicing yoga', 'rock climbing'.",
     "location": "A single outdoor or indoor location suitable for a photoshoot.",
     "time": "A time-of-day or natural lighting condition.",
@@ -344,15 +344,6 @@ LIST_SYSTEM_PROMPT = (
     "explore combinations the existing pool has not — different colors with "
     "different textures, different eras with different materials, etc. Aim "
     "for breadth, not refinement of one cluster. "
-    "SAFETY (non-negotiable): any human subject is an ADULT, 18 or older. "
-    "Never produce a value that describes, implies, or is age-ambiguous "
-    "about a minor — no children, no teens, no 'schoolgirl/schoolboy', no "
-    "'middle/high schooler', no 'teenager', no specific ages under 18, no "
-    "'underage', no '-chan' or other diminutives that read as juvenile. "
-    "When the prompt's direction is suggestive, intimate, sexy, romantic, "
-    "or otherwise mature, this rule is absolute: human descriptors must be "
-    "unambiguously adult (e.g. 'woman in her 20s', not just 'young'). If a "
-    "category could imply a person, default to clearly adult phrasing. "
     'Output JSON: {"values": ["...", "...", ...]}'
 )
 
