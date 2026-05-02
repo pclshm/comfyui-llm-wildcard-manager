@@ -274,91 +274,91 @@ def resolve_direction(direction: str) -> str:
 # System prompts — one per small, focused step. No "WRONG OUTPUTS" lists, no
 # rule recitations: just say what to produce.
 # -----------------------------------------------------------------------------
+PARSE_NEGATIVE_SYSTEM_PROMPT = (
+    "Classify each item in a user's negative-prompt list as one of two kinds.\n"
+    " - axis_ban: the item names a variable attribute axis that must NOT "
+    "become a wildcard placeholder. The downstream wildcardifier will refuse "
+    "to create that placeholder. Examples: 'no age', 'no gender', "
+    "'no ethnicity', 'no body type'. Output the snake_case axis name only "
+    "(e.g. 'age', 'gender', 'body_type').\n"
+    " - scene_ban: the item names a thing or quality that must NOT appear in "
+    "the image (objects, props, atmosphere, composition, text). Output the "
+    "item as a short phrase suitable for 'do not depict ___'. Examples: "
+    "'no phone', 'no text', 'multiple images in one'.\n"
+    "If unsure, prefer scene_ban — only mark as axis_ban when the item is "
+    "clearly an attribute axis name (one or two words naming a dimension).\n"
+    'Output JSON: {"axis_bans": ["age", "gender"], '
+    '"scene_bans": ["phone", "text in the image", ...]}'
+)
+
 DRAFT_SYSTEM_PROMPT = (
-    "Write one image prompt sentence based on the user's idea and direction. "
-    "Keep it concrete and visual. If the user provides a negative prompt, "
-    "the sentence MUST NOT contain or imply any of the listed traits — "
-    "leave out the complete opposites if not specified clearly do not find a loophole to include them in a different way. "
-    "Treat each item as forbidden. "
-    "Whenever the negative restricts a dimension (age, ethnicity, body type, "
-    "era, gender, etc.), the sentence MUST include a concrete word covering "
-    "the allowed value for that dimension — do not leave it implicit. "
-    "Example: negative 'no minors, no teens' → write 'an adult woman' (not "
-    "just 'a woman'); negative 'no period costumes' → write 'in modern "
-    "clothing'. The downstream wildcardifier relies on these concrete words "
-    "to know which aspects are pinned, so omitting them defeats the negative. "
-    "Output the sentence only, no preamble or quotes."
+    "Write one image-prompt sentence from the user's idea and direction. "
+    "Concrete, visual, present tense. No preamble, no quotes — sentence only.\n"
+    "If a list of forbidden scene elements is provided, the sentence MUST "
+    "NOT depict or imply any of them (no clever rephrasings)."
 )
 
 WILDCARDIFY_SYSTEM_PROMPT = (
-    "Rewrite the image prompt by replacing variable elements — subjects, "
-    "actions, settings, attributes, styling — with __snake_case__ "
-    "placeholders. Use double underscores on each side of every placeholder. "
-    "Placeholder count: if the user gives a range you MUST stay within it. "
-    "Never produce fewer placeholders than the minimum and never exceed the "
-    "maximum. To reach the minimum, wildcardify additional impactful "
-    "variables (subject attributes, environment details, lighting, mood, "
-    "composition, styling, props, materials, era markers, color palette, "
-    "etc.) — keep going until the count is in range. "
-    "Negative prompt: if the user supplies one, do NOT introduce a "
-    "placeholder for any aspect it constrains (an aspect the user has "
-    "already pinned). Keep that aspect as concrete words baked into the "
-    "sentence so its value can never drift. Example: idea 'young woman' "
-    "with negative 'no old or middle-aged people' means do NOT create an "
-    "__age__ placeholder — write 'young' as a concrete word. "
-    "Also list each placeholder name. "
-    'Output JSON: {"prompt": "...with __placeholders__ inserted...", '
+    "Rewrite the image-prompt sentence by replacing variable elements with "
+    "__snake_case__ placeholders (double underscores on each side).\n"
+    "Pick the most impactful variables: subject action, pose, lighting, "
+    "mood, composition, props, materials, color palette, era markers — "
+    "whatever fits the sentence.\n"
+    "Stay within the placeholder count range you are given. To reach the "
+    "minimum, wildcardify additional variables; to stay under the maximum, "
+    "leave the rest as concrete words.\n"
+    "If a list of forbidden placeholder names is provided, you MUST NOT "
+    "create any of those placeholders. Keep that aspect as concrete words.\n"
+    'Output JSON: {"prompt": "...with __placeholders__...", '
     '"categories": ["name1", "name2", ...]}'
 )
 
 DESCRIBE_SYSTEM_PROMPT = (
-    "For each wildcard name, write one short phrase describing what kind of "
-    "value belongs in that slot of THIS specific image prompt. Anchor the "
-    "description to the prompt's idea, direction, and any negative prompt: "
-    "narrow enough that random or off-topic values would feel wrong, but "
-    "broad enough to allow variety. Reference the relevant tone, era, "
-    "setting, or aesthetic when those constraints apply. If a negative "
-    "prompt is given, the description MUST explicitly exclude those traits "
-    "(e.g. 'must be young — never middle-aged or older') so the per-slot "
-    "value generator cannot produce them. Avoid bland category-only "
-    "definitions like 'an outfit' or 'a location'. No examples, no full "
-    "sentences. "
+    "For each wildcard name, write one short phrase (no full sentence) "
+    "describing what kind of value belongs in that slot, tied to the "
+    "specific image prompt. Specific enough that off-topic values feel "
+    "wrong, broad enough to allow variety.\n"
+    "Avoid bland category-only definitions like 'an outfit'. Reference the "
+    "tone, era, setting, or aesthetic when relevant.\n"
+    "If a list of forbidden scene elements is provided, no description may "
+    "invite values that introduce those elements.\n"
     'Output JSON: {"<name>": "<short description>", ...}'
 )
 
 ALIGN_SYSTEM_PROMPT = (
-    "Smooth the grammar of the image prompt so it reads naturally — fix "
-    "articles (a/an), pluralization, and joining words. Do NOT change, "
-    "rephrase, or remove any of the descriptive phrases themselves. "
-    "Output the corrected sentence only."
+    "Smooth the grammar of the image prompt — articles, pluralization, "
+    "joining words. Do NOT change, rephrase, or remove any descriptive "
+    "phrase. Output the corrected sentence only."
 )
 
 LIST_SYSTEM_PROMPT = (
-    "Generate distinct values for an image-prompt wildcard category. Each "
-    "value is a phrase, not a sentence — concise but specific. "
-    "Anchor every value to the provided image-prompt context — the prompt "
-    "template, the user's direction/steering, and any negative prompt. "
-    "Values MUST fit that context: respect the direction's tone/era/setting, "
-    "and never contradict the negative prompt or any constraint baked into "
-    "the description (e.g. if the description says 'must be young — never "
-    "middle-aged', do not produce older values). "
-    "From the description, identify the implicit dimensions of the value "
-    "(e.g. for hair: color length texture style; for outfit: garment "
-    "material era fit; for location: place time-of-day mood). Each "
-    "entry should COMBINE choices across multiple dimensions, and entries "
-    "should SPREAD across different dimensional combinations — do NOT return "
-    "synonyms or near-paraphrases varying along a single axis. "
-    "If existing values are listed: treat them as forbidden AND as a hint "
-    "about which combinations are already covered. Your new values must "
-    "explore combinations the existing pool has not — different colors with "
-    "different textures, different eras with different materials, etc. Aim "
-    "for breadth, not refinement of one cluster. "
+    "Generate distinct values for one image-prompt wildcard slot. Each "
+    "value is a concise, specific phrase — not a sentence.\n"
+    "Every value must fit the surrounding image prompt and respect its "
+    "direction. Use the description to identify the dimensions of the "
+    "value (e.g. hair = color + length + texture + style); spread entries "
+    "across different dimensional combinations, do not return synonyms or "
+    "near-paraphrases.\n"
+    "Existing values are forbidden and signal which combinations are "
+    "already covered — your new values must explore combinations the pool "
+    "has not.\n"
+    "If a list of forbidden scene elements is provided, no value may "
+    "contain or imply any of them.\n"
     'Output JSON: {"values": ["...", "...", ...]}'
 )
 
 
 # Light per-step JSON schemas. No `pattern` constraints, no GBNF — failures
 # surface as parse errors rather than getting masked by salvage paths.
+PARSE_NEGATIVE_JSON_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "axis_bans": {"type": "array", "items": {"type": "string"}},
+        "scene_bans": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["axis_bans", "scene_bans"],
+}
+
 WILDCARDIFY_JSON_SCHEMA: dict = {
     "type": "object",
     "properties": {
@@ -650,28 +650,78 @@ class ManagerStepError(Exception):
         self.raw = raw or ""
 
 
+def llm_parse_negative(negative_prompt: str, server: dict, seed: int = 0,
+                       ) -> tuple[list[str], list[str], str]:
+    """Step 0 — split the raw negative-prompt text into structured bans.
+
+    Returns (axis_bans, scene_bans, raw_reply). `axis_bans` is a list of
+    snake_case attribute names that must NOT become wildcard placeholders
+    (e.g. 'no age' → 'age'); `scene_bans` is a list of short phrases that
+    must NOT appear in the image (e.g. 'no phone' → 'phone'). Empty input
+    short-circuits to ([], [], "")."""
+    text = (negative_prompt or "").strip()
+    if not text:
+        return [], [], ""
+    user = (
+        f"Negative prompt items:\n{text}\n\n"
+        "Classify each item. Output the JSON object now."
+    )
+    raw = _server_call(server, PARSE_NEGATIVE_SYSTEM_PROMPT, user,
+                       request_json=True, seed=seed,
+                       json_schema=PARSE_NEGATIVE_JSON_SCHEMA)
+    parsed = _extract_json_object(raw)
+    if not isinstance(parsed, dict):
+        # Fall back to treating everything as scene bans rather than failing
+        # the whole pipeline — user can still correct via forbidden_placeholders.
+        return [], [t for t in _negative_terms(text)], raw
+    axis_raw = parsed.get("axis_bans") if isinstance(parsed, dict) else None
+    scene_raw = parsed.get("scene_bans") if isinstance(parsed, dict) else None
+    axis_bans: list[str] = []
+    seen_axis: set[str] = set()
+    if isinstance(axis_raw, list):
+        for entry in axis_raw:
+            n = _to_snake_case(entry if isinstance(entry, str) else "")
+            if n and _KEY_RE.match(n) and n not in seen_axis:
+                seen_axis.add(n)
+                axis_bans.append(n)
+    scene_bans: list[str] = []
+    seen_scene: set[str] = set()
+    if isinstance(scene_raw, list):
+        for entry in scene_raw:
+            s = str(entry or "").strip().strip('"').strip("'")
+            if s and s.lower() not in seen_scene:
+                seen_scene.add(s.lower())
+                scene_bans.append(s)
+    return axis_bans, scene_bans, raw
+
+
+def _format_scene_bans(scene_bans: list[str]) -> str:
+    """Render scene_bans as a bullet list for injection into user messages.
+    Returns "" when the list is empty so callers can skip the section."""
+    if not scene_bans:
+        return ""
+    return "\n".join(f"- {s}" for s in scene_bans)
+
+
 def llm_draft_prompt(idea: str, direction_text: str, server: dict,
-                     seed: int = 0, negative_prompt: str = "") -> tuple[str, str]:
+                     seed: int = 0, scene_bans: list[str] | None = None,
+                     ) -> tuple[str, str]:
     """Step 1 — turn the user idea + direction into a single image-prompt
-    sentence. `negative_prompt` lists traits the sentence must avoid.
+    sentence. `scene_bans` lists scene elements the sentence must avoid
+    (already extracted from the raw negative prompt by llm_parse_negative).
     Returns (sentence, raw_reply)."""
-    user_parts = [
-        "User idea:",
-        (idea or "").strip() or "(no example provided)",
-    ]
+    parts = [f"User idea:\n{(idea or '').strip() or '(no example provided)'}"]
     if direction_text and direction_text.strip():
-        user_parts.append("\nDirection:")
-        user_parts.append(direction_text.strip())
-    if negative_prompt and negative_prompt.strip():
-        user_parts.append("\nNegative prompt (DO NOT include or imply any of these):")
-        user_parts.append(negative_prompt.strip())
+        parts.append(f"Direction:\n{direction_text.strip()}")
+    bans = _format_scene_bans(scene_bans or [])
+    if bans:
+        parts.append(f"Forbidden scene elements (must not appear):\n{bans}")
     if seed:
-        user_parts.append(f"\nVariation token: {seed}.")
-    user_parts.append("\nWrite the image prompt sentence now.")
-    user = "\n".join(user_parts)
+        parts.append(f"Variation token: {seed}")
+    parts.append("Write the image-prompt sentence now.")
+    user = "\n\n".join(parts)
     raw = _server_call(server, DRAFT_SYSTEM_PROMPT, user, seed=seed)
     sentence = (raw or "").strip()
-    # Trim a single set of wrapping quotes if the model added them.
     if len(sentence) >= 2 and sentence[0] in "\"'`" and sentence[-1] == sentence[0]:
         sentence = sentence[1:-1].strip()
     if not sentence:
@@ -681,37 +731,13 @@ def llm_draft_prompt(idea: str, direction_text: str, server: dict,
 
 def _build_wildcardify_cap_line(lo: int, hi: int) -> str:
     if lo and hi and lo == hi:
-        plural = "" if hi == 1 else "s"
-        return (
-            f" You MUST use exactly {hi} placeholder{plural} in total — pick "
-            "the most impactful variables and leave the rest as concrete words."
-        )
+        return f"Use exactly {hi} placeholder{'' if hi == 1 else 's'}."
     if lo and hi:
-        return (
-            f" You MUST use between {lo} and {hi} placeholders in total. "
-            "Fewer than the minimum is not acceptable; producing only a "
-            "handful when the minimum is much higher is a failure. Find "
-            "additional impactful variables (subject attributes, "
-            "environment, lighting, mood, composition, styling, props, "
-            "materials, era markers, color palette, etc.) until the count "
-            "is in range."
-        )
+        return f"Use between {lo} and {hi} placeholders."
     if hi:
-        plural = "" if hi == 1 else "s"
-        return (
-            f" Use at most {hi} placeholder{plural} in total — "
-            "pick the most impactful variables and leave the rest as concrete "
-            "words."
-        )
+        return f"Use at most {hi} placeholder{'' if hi == 1 else 's'}."
     if lo:
-        plural = "" if lo == 1 else "s"
-        return (
-            f" You MUST use at least {lo} placeholder{plural} — wildcardify "
-            "the most impactful variables, then keep adding more "
-            "(subject attributes, environment, lighting, mood, composition, "
-            "styling, props, materials, era markers, color palette, etc.) "
-            "until the count is reached."
-        )
+        return f"Use at least {lo} placeholder{'' if lo == 1 else 's'}."
     return ""
 
 
@@ -755,84 +781,50 @@ def llm_wildcardify_prompt(draft_prompt: str, server: dict,
                            seed: int = 0,
                            min_categories: int = 0,
                            max_categories: int = 0,
-                           negative_prompt: str = "",
                            forbidden_names: list[str] | None = None,
                            ) -> tuple[str, list[str], str]:
-    """Step 2 — ask the LLM to rewrite the draft with __placeholders__ already
-    inserted, plus the list of placeholder names. Returns (template, names,
-    raw_reply). The LLM does its own placement so we don't lose wildcards to
-    span-substring mismatches; ensure_wildcard_format runs afterward as a
-    safety net for any names it forgot to wrap.
+    """Step 2 — rewrite the draft with __placeholders__ already inserted, plus
+    the list of placeholder names. Returns (template, names, raw_reply).
 
-    `min_categories` (>0) is a hard floor enforced via retry: if the model
-    returns fewer placeholders, we re-call it with the previous result and
-    an explicit "you produced X, need at least N — add more" instruction
-    until it complies (up to a small retry budget). `max_categories` (>0)
-    is a hard ceiling; if exceeded, surplus placeholders are demoted to
-    plain words deterministically.
+    `forbidden_names` is the FULL deny-list of placeholder names (axis bans
+    auto-derived from the negative prompt + any user-supplied bans). The LLM
+    is told to avoid them; any that slip through are demoted to plain words
+    deterministically after parsing — the LLM instruction alone is unreliable.
 
-    `negative_prompt` lists traits that the user has explicitly pinned.
-    The LLM is told NOT to wildcardify aspects the negative constrains —
-    those stay as concrete words so the resolver can't drift them later.
-
-    `forbidden_names` is a hard deny-list of placeholder names (bare
-    snake_case). The LLM is instructed to avoid them, and any that slip
-    through are deterministically demoted to plain words after parsing —
-    the negative-prompt instruction alone is unreliable, so this is the
-    backstop the user can lean on when a specific dimension MUST stay
-    concrete (e.g. forbidding `age` when the prompt is for adult content)."""
+    `min_categories` is enforced via retry; `max_categories` via post-hoc
+    demotion of surplus placeholders."""
     lo = max(0, int(min_categories or 0))
     hi = max(0, int(max_categories or 0))
     if lo and hi and lo > hi:
         lo = hi
 
-    neg = (negative_prompt or "").strip()
     forbidden_set: set[str] = {n for n in (forbidden_names or []) if n}
 
     def _call(attempt: int, prev_template: str = "", prev_count: int = -1,
               prev_names: list[str] | None = None) -> tuple[str, list[str], list[str], str]:
         cap_line = _build_wildcardify_cap_line(lo, hi)
         parts = [f"Image prompt:\n{draft_prompt}"]
-        if neg:
-            parts.append(
-                "Negative prompt — the user has already pinned these aspects. "
-                "Do NOT introduce a placeholder for any aspect listed here; "
-                "keep that aspect as concrete words in the sentence:\n"
-                f"{neg}"
-            )
         if forbidden_set:
             listed = ", ".join(f"__{n}__" for n in sorted(forbidden_set))
             parts.append(
-                "FORBIDDEN placeholder names — these MUST NOT appear in your "
-                f"output under any circumstances:\n{listed}\n"
-                "If a dimension covered by these names is variable in the "
-                "scene, keep it as concrete words in the sentence (do not "
-                "wildcardify it). Choose other impactful variables to reach "
-                "the placeholder count instead."
+                "Forbidden placeholder names (must not appear):\n"
+                f"{listed}"
             )
+        if cap_line:
+            parts.append(cap_line)
         if attempt > 0 and prev_count >= 0 and lo and prev_count < lo:
-            shown_names = ", ".join(f"__{n}__" for n in (prev_names or [])) or "(none)"
             parts.append(
-                f"Your previous attempt produced only {prev_count} "
-                f"placeholder(s): {shown_names}. That is below the minimum "
-                f"of {lo}. Try again — keep the existing placeholders and "
-                "wildcardify ADDITIONAL impactful variables until the count "
-                f"is at least {lo}."
+                f"Previous attempt produced {prev_count} placeholder(s); "
+                f"need at least {lo}. Keep them and add more.\n"
+                f"Previous template:\n{prev_template}"
             )
-            if prev_template:
-                parts.append(f"Previous template:\n{prev_template}")
-        parts.append(f"Rewrite it with placeholders.{cap_line} Output the JSON object now.")
+        parts.append("Output the JSON object now.")
         user = "\n\n".join(parts)
-        # Vary seed across retries so we don't get the same sample back.
         attempt_seed = seed + attempt * 9973 if seed else 0
         raw = _server_call(server, WILDCARDIFY_SYSTEM_PROMPT, user,
                            request_json=True, seed=attempt_seed,
                            json_schema=WILDCARDIFY_JSON_SCHEMA)
         template, names, in_template = _parse_wildcardify_reply(raw)
-        # Deterministic deny-list enforcement: demote any forbidden placeholder
-        # to plain words before counting toward the floor. The LLM is
-        # unreliable about respecting the instruction above, so this is the
-        # actual guarantee.
         if forbidden_set and any(n in forbidden_set for n in names):
             keep = [n for n in names if n not in forbidden_set]
             template = _trim_template_wildcards(template, keep)
@@ -884,53 +876,31 @@ def llm_describe_wildcards(names: list[str], server: dict,
                            idea: str = "",
                            direction_text: str = "",
                            template: str = "",
-                           negative_prompt: str = "") -> tuple[dict[str, str], str]:
+                           scene_bans: list[str] | None = None,
+                           ) -> tuple[dict[str, str], str]:
     """Step 3 — short shape-of-value description for each wildcard name.
     Returns (descriptions, raw_reply).
 
-    `idea`, `direction_text`, and `template` give the LLM enough context to
-    write descriptions that fit this specific prompt rather than generic
-    category-only definitions. Without them, descriptions drift to "an
-    outfit" / "a location" and the resolver's value generator returns random
-    content that doesn't match the prompt's direction.
+    `idea`, `direction_text`, and `template` anchor the descriptions to this
+    specific prompt instead of producing generic 'an outfit' filler.
 
-    `negative_prompt` is baked into every description as an explicit
-    exclusion clause — the per-slot value generator sees only the
-    description, so the avoid-list has to live inside it."""
+    `scene_bans` is the structured list of forbidden scene elements; passed
+    so the descriptions don't accidentally invite values that reintroduce
+    those elements."""
     if not names:
         return {}, ""
-    listed = "\n".join(f"- {n}" for n in names)
     parts: list[str] = []
     if idea and idea.strip():
         parts.append(f"User idea:\n{idea.strip()}")
     if direction_text and direction_text.strip():
-        parts.append(f"Direction / steering:\n{direction_text.strip()}")
-    neg = (negative_prompt or "").strip()
-    if neg:
-        parts.append(
-            "Negative prompt — values for any wildcard MUST NOT include or "
-            "imply these traits. Bake an explicit exclusion into each "
-            "description so the per-slot value generator (which sees ONLY "
-            "the description) cannot produce them:\n"
-            f"{neg}"
-        )
+        parts.append(f"Direction:\n{direction_text.strip()}")
     if template and template.strip():
-        parts.append(f"Prompt template (with placeholders):\n{template.strip()}")
-    parts.append(f"Wildcard names:\n{listed}")
-    closing = (
-        "For each name, write a short phrase describing what kind of value "
-        "belongs there in this specific prompt — tied to the idea and "
-        "direction above so the resolver generates fitting values, not "
-        "generic ones."
-    )
-    if neg:
-        closing += (
-            " Each description MUST end with an explicit exclusion clause "
-            "covering the negative prompt above (e.g. '… — never "
-            "<forbidden trait>')."
-        )
-    closing += " Output the JSON object now."
-    parts.append(closing)
+        parts.append(f"Prompt template:\n{template.strip()}")
+    bans = _format_scene_bans(scene_bans or [])
+    if bans:
+        parts.append(f"Forbidden scene elements (no description may invite them):\n{bans}")
+    parts.append("Wildcard names:\n" + "\n".join(f"- {n}" for n in names))
+    parts.append("Output the JSON object now.")
     user = "\n\n".join(parts)
     raw = _server_call(server, DESCRIBE_SYSTEM_PROMPT, user,
                        request_json=True, seed=seed,
@@ -951,32 +921,29 @@ def llm_generate_value_list(category: str, description: str,
                             count: int = 10, seed: int = 0,
                             template: str = "",
                             direction_text: str = "",
-                            negative_prompt: str = "",
+                            scene_bans: list[str] | None = None,
                             ) -> tuple[list[str], str]:
-    """Resolver step — ask the LLM for a short list of distinct values for one
-    wildcard category. The prompt's template, direction, and negative prompt
-    are passed through so the LLM can keep each value consistent with the
-    overall image (e.g. age values stay adult/young when the direction calls
-    for a young woman). Returns (values, raw_reply)."""
+    """Resolver step — generate distinct values for one wildcard slot.
+
+    `template`, `direction_text`, and `scene_bans` keep each value consistent
+    with the overall image and away from forbidden scene elements. Returns
+    (values, raw_reply)."""
+    parts = [
+        f"Category: {category}",
+        f"Description: {description}",
+    ]
+    if template and template.strip():
+        parts.append(f"Image prompt template:\n{template.strip()}")
+    if direction_text and direction_text.strip():
+        parts.append(f"Direction:\n{direction_text.strip()}")
+    bans = _format_scene_bans(scene_bans or [])
+    if bans:
+        parts.append(f"Forbidden scene elements (no value may contain or imply them):\n{bans}")
     forbidden = ("\n".join(f"- {e}" for e in existing)
                  if existing else "(none yet)")
-    parts = [f"Category: {category}",
-             f"What this wildcard means: {description}"]
-    if template and template.strip():
-        parts.append(f"\nImage prompt template (full context):\n{template.strip()}")
-    if direction_text and direction_text.strip():
-        parts.append(f"\nDirection / steering for the whole image:\n{direction_text.strip()}")
-    if negative_prompt and negative_prompt.strip():
-        parts.append(
-            "\nNegative prompt (values MUST NOT contain or imply any of "
-            f"these traits):\n{negative_prompt.strip()}"
-        )
-    parts.append(f"\nAlready used (do not repeat):\n{forbidden}")
-    parts.append(
-        f"\nProduce {count} distinct new values that fit the image prompt's "
-        "context above. Output the JSON object now."
-    )
-    user = "\n".join(parts)
+    parts.append(f"Already used (do not repeat):\n{forbidden}")
+    parts.append(f"Produce {count} distinct new values. Output the JSON object now.")
+    user = "\n\n".join(parts)
     raw = _server_call(server, LIST_SYSTEM_PROMPT, user,
                        request_json=True, seed=seed,
                        json_schema=LIST_JSON_SCHEMA)
@@ -1469,6 +1436,7 @@ class LLMWildcardManager:
         template = ""
         suggested_cats: dict[str, str] = {}
         used_names: list[str] = []
+        scene_bans: list[str] = []
         status = "ok"
         status_message = ""
         raw_sections: list[tuple[str, str]] = []
@@ -1507,38 +1475,53 @@ class LLMWildcardManager:
                     "(no cached template — toggle Lock off to generate)",
                 ))
         else:
+            axis_bans: list[str] = []
             try:
+                # Step 0 — split the raw negative prompt into structured bans.
+                # axis_bans names attribute axes that MUST NOT become
+                # placeholders (e.g. 'no age' → 'age'); scene_bans names
+                # things that must not appear in the image.
+                if negative:
+                    axis_bans, scene_bans, raw_parse_neg = llm_parse_negative(
+                        negative, server, seed=effective_seed,
+                    )
+                    raw_sections.append(("parse_negative", raw_parse_neg))
+
+                # Merge auto-derived axis bans into the user's explicit
+                # forbidden_placeholders list. This is the actual fix for
+                # 'no age, no gender' producing __age__/__gender__ anyway:
+                # the user no longer has to repeat themselves in two fields.
+                effective_forbidden_names: list[str] = []
+                seen_forbidden: set[str] = set()
+                for n in axis_bans + forbidden_names:
+                    if n and n not in seen_forbidden:
+                        seen_forbidden.add(n)
+                        effective_forbidden_names.append(n)
+
                 # Step 1 — draft the prompt sentence from idea + direction.
                 draft, raw_draft = llm_draft_prompt(
                     example_prompt or "", direction_text, server,
                     seed=effective_seed,
-                    negative_prompt=negative,
+                    scene_bans=scene_bans,
                 )
                 raw_sections.append(("draft", raw_draft))
 
-                # Step 2 — LLM rewrites the draft with __placeholders__ already
-                # inserted + lists the category names. The negative prompt
-                # tells it which aspects MUST stay as concrete words (so
-                # already-pinned attributes don't become drift-prone wildcards).
+                # Step 2 — wildcardify with the merged deny-list.
                 template, used_names, raw_wildcardify = llm_wildcardify_prompt(
                     draft, server, seed=effective_seed,
                     min_categories=min_cats,
                     max_categories=max_cats,
-                    negative_prompt=negative,
-                    forbidden_names=forbidden_names,
+                    forbidden_names=effective_forbidden_names,
                 )
                 raw_sections.append(("wildcardify", raw_wildcardify))
 
-                # Step 3 — describe each wildcard. Pass the user's idea,
-                # direction, negative prompt, and the wildcardified template
-                # so descriptions are tailored to this specific prompt and
-                # carry an explicit exclusion clause from the negative.
+                # Step 3 — describe each wildcard.
                 descs, raw_describe = llm_describe_wildcards(
                     used_names, server, seed=effective_seed,
                     idea=example_prompt or "",
                     direction_text=direction_text,
                     template=template,
-                    negative_prompt=negative,
+                    scene_bans=scene_bans,
                 )
                 raw_sections.append(("describe", raw_describe))
                 suggested_cats = descs
@@ -1599,16 +1582,17 @@ class LLMWildcardManager:
         except Exception as e:
             print(f"[LLMWildcardManager] Could not persist last reply: {e}")
 
-        # Build the bundle handed to the Resolver.
+        # Build the bundle handed to the Resolver. `scene_bans` is the
+        # structured list of forbidden scene elements derived from the raw
+        # negative prompt; the Resolver passes it to llm_generate_value_list
+        # so per-slot values can't reintroduce them. Falls back to the raw
+        # text via _negative_terms when the locked-template path skipped
+        # the parse_negative step.
         bundle = {
-            # Resolver no longer has a strict-rules system prompt; the small
-            # LIST_SYSTEM_PROMPT inside the resolver handles each per-slot call.
-            # `flair` exposes the direction text for the report; `negative`
-            # is included for visibility — the actual avoid clauses are
-            # already baked into each category description.
             "system_prompt": "",
             "flair": direction_text,
             "negative": negative,
+            "scene_bans": list(scene_bans),
             "category_overrides": dict(effective),
             "intended_names": list(used_names),
         }
@@ -1706,16 +1690,27 @@ class LLMWildcardResolver:
         categories = load_category_config()
         flair_text = ""
         negative_text = ""
+        scene_bans: list[str] = []
         intended_names: list[str] = []
         if isinstance(prompts, dict):
             flair_text = prompts.get("flair") or ""
             negative_text = prompts.get("negative") or ""
+            raw_scene = prompts.get("scene_bans") or []
+            if isinstance(raw_scene, list):
+                scene_bans = [str(s) for s in raw_scene if str(s).strip()]
             cfg_overrides = prompts.get("category_overrides") or {}
             if isinstance(cfg_overrides, dict):
                 categories.update(cfg_overrides)
             raw_intended = prompts.get("intended_names") or []
             if isinstance(raw_intended, list):
                 intended_names = [str(n) for n in raw_intended if str(n).strip()]
+
+        # Fall back to the heuristic split when the manager didn't supply
+        # structured scene_bans (locked-template path, or a stand-alone
+        # Resolver wired without a Manager). Keeps the negative prompt
+        # active in value generation either way.
+        if not scene_bans and negative_text:
+            scene_bans = list(_negative_terms(negative_text))
 
         # If the manager bundled a list of intended wildcard names, repair any
         # template tokens that lost their double underscores (e.g. `_subject_`
@@ -1809,7 +1804,7 @@ class LLMWildcardResolver:
                     count=target_new, seed=llm_seed,
                     template=template or "",
                     direction_text=flair_text,
-                    negative_prompt=negative_text,
+                    scene_bans=scene_bans,
                 )
                 rec["raw"] = raw
                 # Drop any LLM-returned values that violate the negative
@@ -1839,7 +1834,7 @@ class LLMWildcardResolver:
                             count=target_new, seed=llm_seed + 1,
                             template=template or "",
                             direction_text=flair_text,
-                            negative_prompt=negative_text,
+                            scene_bans=scene_bans,
                         )
                         rec["retry_raw"] = retry_raw
                         values = [v for v in retry_values
