@@ -479,6 +479,7 @@ app.registerExtension({
                 // header doesn't eat all the space before the DOM table.
                 shrinkMultilineWidget(node, "example_prompt", 64);
                 shrinkMultilineWidget(node, "negative_prompt", 64);
+                shrinkMultilineWidget(node, "forbidden_placeholders", 48);
                 shrinkMultilineWidget(node, "system_prompt_override", 48);
 
                 const root = document.createElement("div");

@@ -279,7 +279,15 @@ DRAFT_SYSTEM_PROMPT = (
     "Keep it concrete and visual. If the user provides a negative prompt, "
     "the sentence MUST NOT contain or imply any of the listed traits — "
     "leave out the complete opposites if not specified clearly do not find a loophole to include them in a different way. "
-    "Treat each item as forbidden. Output the sentence only, no preamble or quotes."
+    "Treat each item as forbidden. "
+    "Whenever the negative restricts a dimension (age, ethnicity, body type, "
+    "era, gender, etc.), the sentence MUST include a concrete word covering "
+    "the allowed value for that dimension — do not leave it implicit. "
+    "Example: negative 'no minors, no teens' → write 'an adult woman' (not "
+    "just 'a woman'); negative 'no period costumes' → write 'in modern "
+    "clothing'. The downstream wildcardifier relies on these concrete words "
+    "to know which aspects are pinned, so omitting them defeats the negative. "
+    "Output the sentence only, no preamble or quotes."
 )
 
 WILDCARDIFY_SYSTEM_PROMPT = (
@@ -564,6 +572,26 @@ def _to_snake_case(name: str) -> str:
     return s
 
 
+def _parse_forbidden_names(raw: str) -> list[str]:
+    """Split a user-supplied 'forbidden placeholders' string (comma- or
+    newline-separated, with or without surrounding underscores) into a deduped
+    list of bare snake_case names. e.g. '__age__, Ethnicity\\nbody type' →
+    ['age', 'ethnicity', 'body_type']."""
+    if not raw:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for chunk in re.split(r"[,\n;]+", str(raw)):
+        s = chunk.strip().strip("_").strip()
+        if not s:
+            continue
+        n = _to_snake_case(s)
+        if n and _KEY_RE.match(n) and n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
 # -----------------------------------------------------------------------------
 # Wildcard-format repair
 # -----------------------------------------------------------------------------
@@ -727,7 +755,9 @@ def llm_wildcardify_prompt(draft_prompt: str, server: dict,
                            seed: int = 0,
                            min_categories: int = 0,
                            max_categories: int = 0,
-                           negative_prompt: str = "") -> tuple[str, list[str], str]:
+                           negative_prompt: str = "",
+                           forbidden_names: list[str] | None = None,
+                           ) -> tuple[str, list[str], str]:
     """Step 2 — ask the LLM to rewrite the draft with __placeholders__ already
     inserted, plus the list of placeholder names. Returns (template, names,
     raw_reply). The LLM does its own placement so we don't lose wildcards to
@@ -743,13 +773,21 @@ def llm_wildcardify_prompt(draft_prompt: str, server: dict,
 
     `negative_prompt` lists traits that the user has explicitly pinned.
     The LLM is told NOT to wildcardify aspects the negative constrains —
-    those stay as concrete words so the resolver can't drift them later."""
+    those stay as concrete words so the resolver can't drift them later.
+
+    `forbidden_names` is a hard deny-list of placeholder names (bare
+    snake_case). The LLM is instructed to avoid them, and any that slip
+    through are deterministically demoted to plain words after parsing —
+    the negative-prompt instruction alone is unreliable, so this is the
+    backstop the user can lean on when a specific dimension MUST stay
+    concrete (e.g. forbidding `age` when the prompt is for adult content)."""
     lo = max(0, int(min_categories or 0))
     hi = max(0, int(max_categories or 0))
     if lo and hi and lo > hi:
         lo = hi
 
     neg = (negative_prompt or "").strip()
+    forbidden_set: set[str] = {n for n in (forbidden_names or []) if n}
 
     def _call(attempt: int, prev_template: str = "", prev_count: int = -1,
               prev_names: list[str] | None = None) -> tuple[str, list[str], list[str], str]:
@@ -761,6 +799,16 @@ def llm_wildcardify_prompt(draft_prompt: str, server: dict,
                 "Do NOT introduce a placeholder for any aspect listed here; "
                 "keep that aspect as concrete words in the sentence:\n"
                 f"{neg}"
+            )
+        if forbidden_set:
+            listed = ", ".join(f"__{n}__" for n in sorted(forbidden_set))
+            parts.append(
+                "FORBIDDEN placeholder names — these MUST NOT appear in your "
+                f"output under any circumstances:\n{listed}\n"
+                "If a dimension covered by these names is variable in the "
+                "scene, keep it as concrete words in the sentence (do not "
+                "wildcardify it). Choose other impactful variables to reach "
+                "the placeholder count instead."
             )
         if attempt > 0 and prev_count >= 0 and lo and prev_count < lo:
             shown_names = ", ".join(f"__{n}__" for n in (prev_names or [])) or "(none)"
@@ -781,6 +829,15 @@ def llm_wildcardify_prompt(draft_prompt: str, server: dict,
                            request_json=True, seed=attempt_seed,
                            json_schema=WILDCARDIFY_JSON_SCHEMA)
         template, names, in_template = _parse_wildcardify_reply(raw)
+        # Deterministic deny-list enforcement: demote any forbidden placeholder
+        # to plain words before counting toward the floor. The LLM is
+        # unreliable about respecting the instruction above, so this is the
+        # actual guarantee.
+        if forbidden_set and any(n in forbidden_set for n in names):
+            keep = [n for n in names if n not in forbidden_set]
+            template = _trim_template_wildcards(template, keep)
+            names = keep
+            in_template = [n for n in in_template if n not in forbidden_set]
         return template, names, in_template, raw
 
     template, names, in_template, raw = _call(0)
@@ -1282,6 +1339,29 @@ class LLMWildcardManager:
                         "resolver's per-slot values from contradicting it."
                     ),
                 }),
+                # Hard deny-list of placeholder names. The LLM is told to
+                # avoid them, and any that slip through are demoted to plain
+                # words deterministically. Use this when the negative prompt
+                # alone hasn't been enough to keep a specific dimension out
+                # of the template.
+                "forbidden_placeholders": ("STRING", {
+                    "multiline": True,
+                    "default": "",
+                    "placeholder": (
+                        "Placeholder names that must NEVER appear in the "
+                        "template. Comma- or newline-separated.\n"
+                        "Examples: age, ethnicity, body_type\n"
+                        "(with or without surrounding underscores — "
+                        "'__age__' and 'age' both work)."
+                    ),
+                    "tooltip": (
+                        "Hard deny-list. Any placeholder name listed here "
+                        "is stripped from the generated template and "
+                        "demoted to concrete words, even if the LLM "
+                        "ignored the instruction. Use this as a backstop "
+                        "when the negative prompt isn't enough."
+                    ),
+                }),
                 # Soft floor on how many `__wildcard__` placeholders the LLM
                 # should introduce. Communicated to the LLM in the user
                 # message; not enforced server-side because we can't promote
@@ -1333,11 +1413,13 @@ class LLMWildcardManager:
     OUTPUT_NODE = True
 
     def manage(self, server, example_prompt, lock_template, seed, direction,
-               negative_prompt, min_categories, max_categories,
+               negative_prompt, forbidden_placeholders,
+               min_categories, max_categories,
                system_prompt_override, categories):
         direction = (direction or "").strip() or "none"
         direction_text = resolve_direction(direction)
         negative = (negative_prompt or "").strip()
+        forbidden_names = _parse_forbidden_names(forbidden_placeholders or "")
 
         # `system_prompt_override` is kept on the input for backward compat,
         # but the manager now drives four small calls — a single override
@@ -1443,6 +1525,7 @@ class LLMWildcardManager:
                     min_categories=min_cats,
                     max_categories=max_cats,
                     negative_prompt=negative,
+                    forbidden_names=forbidden_names,
                 )
                 raw_sections.append(("wildcardify", raw_wildcardify))
 
