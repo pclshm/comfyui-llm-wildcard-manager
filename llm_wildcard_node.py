@@ -482,6 +482,66 @@ def _clean_llm_value(raw: str) -> str:
     return raw
 
 
+# Prefixes a user typically writes in front of a forbidden trait. Stripped so
+# the term itself is what we match against candidate values.
+_NEG_PREFIXES = (
+    "no ", "not ", "non ", "non-", "without ", "avoid ", "avoiding ",
+    "exclude ", "excluding ", "never ", "anti ", "anti-",
+)
+_NEG_ARTICLES = ("the ", "a ", "an ")
+
+
+def _negative_terms(text: str) -> list[str]:
+    """Break a free-form negative prompt into a list of forbidden phrases.
+
+    Each comma/semicolon/newline-delimited segment (also split on " and " /
+    " or ") is treated as one phrase. Common leading negation words and
+    articles are stripped so the user can write "no old people" or "old
+    people" interchangeably. Phrases shorter than three characters are dropped
+    to avoid stray-letter matches."""
+    if not text or not text.strip():
+        return []
+    parts = re.split(r"[,;\n\r/|]+| and | or ", text.lower())
+    terms: set[str] = set()
+    for raw in parts:
+        p = raw.strip().strip(".!?;:\"'`()[]{}")
+        # Strip leading negation words (possibly stacked, e.g. "no the").
+        changed = True
+        while changed:
+            changed = False
+            for prefix in _NEG_PREFIXES:
+                if p.startswith(prefix):
+                    p = p[len(prefix):].strip()
+                    changed = True
+            for art in _NEG_ARTICLES:
+                if p.startswith(art):
+                    p = p[len(art):].strip()
+                    changed = True
+        if len(p) >= 3:
+            terms.add(p)
+    # Longest first so report output and any overlap checks see specific
+    # phrases before their substrings.
+    return sorted(terms, key=len, reverse=True)
+
+
+def _value_violates_negative(value: str, terms: list[str]) -> bool:
+    """True if `value` contains any forbidden phrase as a whole-word match.
+
+    Uses an alnum-only word boundary so "old" doesn't match "gold" but does
+    match "old-fashioned" or "an old man"."""
+    if not value or not terms:
+        return False
+    v = value.lower()
+    for t in terms:
+        try:
+            if re.search(r"(?<![a-z0-9])" + re.escape(t) + r"(?![a-z0-9])", v):
+                return True
+        except re.error:
+            if t in v:
+                return True
+    return False
+
+
 WILDCARD_RE = re.compile(r"__(!)?([A-Za-z0-9_\-]+)__")
 
 
@@ -927,10 +987,20 @@ def format_report(records: list[dict], flair: str = "",
         lines.append(f"[{r['name']}]  status={r['status']}  value={r.get('value', '')!r}")
         if "pool_size" in r:
             lines.append(f"    pool       : {r['pool_size']} known values on disk")
+        if "blocked_by_negative" in r:
+            lines.append(
+                f"    neg-block  : {r['blocked_by_negative']} pool entries "
+                "filtered out by negative prompt"
+            )
         if "sent" in r:
             lines.append(f"    sent → LLM : {r['sent']}")
         if "raw" in r:
             lines.append(f"    LLM reply  : {r['raw']!r}")
+        if "filtered_by_negative" in r:
+            lines.append(
+                f"    neg-drop   : {r['filtered_by_negative']} fresh values "
+                "dropped for matching negative prompt"
+            )
         if "retry_sent" in r:
             lines.append(f"    retry sent : {r['retry_sent']}")
         if "retry_raw" in r:
@@ -1589,29 +1659,45 @@ class LLMWildcardResolver:
         # Otherwise we pick from disk without an LLM call.
         records: list[dict] = []
         picks: dict[str, str] = {}
+        neg_terms = _negative_terms(negative_text)
         unique_names = extract_wildcard_names(template)
         for name in unique_names:
             existing = read_wildcard_file(name)
+            # Filter the on-disk pool against the current negative prompt so
+            # that values generated before the negative was set (or values
+            # the LLM slipped through despite the instruction) cannot be
+            # reused. Without this, the resolver happily picks forbidden
+            # entries from the cached pool on every run.
+            safe_existing = [
+                e for e in existing
+                if not _value_violates_negative(e, neg_terms)
+            ]
+            blocked_existing = len(existing) - len(safe_existing)
             description = categories.get(
                 name, f"A value for the '{name}' wildcard category.")
             rec: dict = {"name": name, "pool_size": len(existing)}
+            if blocked_existing:
+                rec["blocked_by_negative"] = blocked_existing
 
             force_new = mode == "force_new"
 
-            # Hard cap: no more generation possible — pick what's there.
-            if not force_new and len(existing) >= max_per_category:
-                value = rng.choice(existing) if existing else ""
+            # Hard cap: only treat the pool as "full" when the *safe* subset
+            # already meets the cap. If everything safe is exhausted we fall
+            # through to generation so the user actually gets a compliant
+            # value instead of a recycled forbidden one.
+            if not force_new and len(safe_existing) >= max_per_category:
+                value = rng.choice(safe_existing)
                 rec.update({"status": "cap_reached", "value": value})
                 records.append(rec)
                 picks[name] = value
                 continue
 
-            below_floor = (mode != "force_new") and existing and \
-                len(existing) < effective_min
-            needs_generation = force_new or not existing or below_floor
+            below_floor = (mode != "force_new") and safe_existing and \
+                len(safe_existing) < effective_min
+            needs_generation = force_new or not safe_existing or below_floor
 
             if not needs_generation:
-                value = rng.choice(existing)
+                value = rng.choice(safe_existing)
                 rec.update({"status": "reused", "value": value})
                 records.append(rec)
                 picks[name] = value
@@ -1620,7 +1706,7 @@ class LLMWildcardResolver:
             # How many to ask for: enough to reach the floor in one shot when
             # possible, but never less than `per_call` (avoid wasting a call on
             # one or two items) and never more than the cap allows.
-            target_new = max(per_call, effective_min - len(existing))
+            target_new = max(per_call, effective_min - len(safe_existing))
             if not force_new:
                 cap_remaining = max(1, max_per_category - len(existing))
                 target_new = min(target_new, cap_remaining)
@@ -1628,7 +1714,8 @@ class LLMWildcardResolver:
 
             sent = (
                 f'category="{name}" | desc={description!r} | '
-                f'pool={len(existing)} items | request={target_new} | '
+                f'pool={len(existing)} (safe={len(safe_existing)}) items | '
+                f'request={target_new} | '
                 f'model={server.get("model", "")!r} | '
                 f'temp={server.get("temperature", 0.9)}'
             )
@@ -1642,6 +1729,38 @@ class LLMWildcardResolver:
                     negative_prompt=negative_text,
                 )
                 rec["raw"] = raw
+                # Drop any LLM-returned values that violate the negative
+                # prompt before they hit disk. If the model returned nothing
+                # safe, retry once with the forbidden traits glued onto the
+                # description so the per-slot generator can't miss them.
+                if neg_terms:
+                    kept = [v for v in values
+                            if not _value_violates_negative(v, neg_terms)]
+                    dropped = len(values) - len(kept)
+                    if dropped:
+                        rec["filtered_by_negative"] = dropped
+                    values = kept
+                    if not values:
+                        retry_desc = (
+                            f"{description} CRITICAL: the value MUST NOT "
+                            f"contain or imply any of: "
+                            f"{negative_text.strip()}"
+                        )
+                        retry_sent = (
+                            f'category="{name}" | retry after negative-'
+                            f'prompt filter dropped all values'
+                        )
+                        rec["retry_sent"] = retry_sent
+                        retry_values, retry_raw = llm_generate_value_list(
+                            name, retry_desc, existing, server,
+                            count=target_new, seed=llm_seed + 1,
+                            template=template or "",
+                            direction_text=flair_text,
+                            negative_prompt=negative_text,
+                        )
+                        rec["retry_raw"] = retry_raw
+                        values = [v for v in retry_values
+                                  if not _value_violates_negative(v, neg_terms)]
                 # Only keep values that aren't already in the pool.
                 lower_existing = {e.lower() for e in existing}
                 fresh = [v for v in values if v.lower() not in lower_existing]
@@ -1654,7 +1773,7 @@ class LLMWildcardResolver:
                 if force_new:
                     pool = appended or fresh
                 else:
-                    pool = existing + appended
+                    pool = safe_existing + appended
                 if not pool:
                     rec.update({"status": "error", "err": "no values produced",
                                 "value": ""})
