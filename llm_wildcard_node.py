@@ -1291,10 +1291,16 @@ class LLMServerConfig:
 # sampling controls (top_k, top_p, min_p, repeat_penalty, context_size) on top of
 # the base server. The output is still an LLM_SERVER so it slots in anywhere the
 # base server does.
+#
+# Also emits an OPTIONS bundle on a second output, shaped to match the contract
+# used by the "Prompt Generator" node from
+# https://github.com/abdozmantar/ComfyUI-Prompt-Manager — wire it into that
+# node's `options` input to drive sampling/model/system_prompt from one place.
 # =============================================================================
 class LLMSamplingOptions:
     """ComfyUI node: layer extra sampling controls onto an existing LLM_SERVER.
-    Output is an enhanced LLM_SERVER that the Manager and Resolver accept as-is."""
+    Outputs both an enhanced LLM_SERVER (for this package's Manager/Resolver)
+    and an OPTIONS dict compatible with the external Prompt Generator node."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -1349,6 +1355,12 @@ class LLMSamplingOptions:
                     "step": 512,
                     "tooltip": "Context window size in tokens (0 = use server default / not sent).",
                 }),
+                "system_prompt": ("STRING", {
+                    "multiline": True,
+                    "default": "",
+                    "placeholder": "Optional system prompt. Honored by the external Prompt Generator node; the wildcard Manager/Resolver use their own per-step prompts and ignore this field.",
+                    "tooltip": "Custom system prompt. Used only when wired into a node that reads it (e.g. Prompt Generator). Leave empty to use the consumer's defaults.",
+                }),
                 "show_everything_in_console": ("BOOLEAN", {
                     "default": False,
                     "tooltip": "Print system prompt, user prompt, sampling options, and raw replies to the ComfyUI console.",
@@ -1356,14 +1368,14 @@ class LLMSamplingOptions:
             },
         }
 
-    RETURN_TYPES = ("LLM_SERVER",)
-    RETURN_NAMES = ("server",)
+    RETURN_TYPES = ("LLM_SERVER", "OPTIONS")
+    RETURN_NAMES = ("server", "options")
     FUNCTION = "build"
     CATEGORY = "prompt/wildcards"
 
     def build(self, server, use_model_default_sampling=False, temperature=-1.0,
               top_k=0, top_p=0.0, min_p=0.0, repeat_penalty=1.0,
-              context_size=0, show_everything_in_console=False):
+              context_size=0, system_prompt="", show_everything_in_console=False):
         # Shallow copy so we don't mutate the upstream server dict in place.
         merged = dict(server)
         if temperature is not None and float(temperature) >= 0.0:
@@ -1381,7 +1393,40 @@ class LLMSamplingOptions:
             if context_size and int(context_size) > 0:
                 merged["context_size"] = int(context_size)
         merged["show_everything_in_console"] = bool(show_everything_in_console)
-        return (merged,)
+        if system_prompt and system_prompt.strip():
+            # Stored on the server dict but ignored by _server_call — kept here
+            # purely so a downstream node could pick it up if it wanted to.
+            merged["system_prompt"] = system_prompt
+
+        # OPTIONS bundle — shape matches the external Prompt Generator node's
+        # contract so users can wire `options` straight into it.
+        backend = server.get("backend", "ollama")
+        options: dict = {
+            "llm_backend": "ollama" if backend == "ollama" else "llama.cpp",
+            "use_model_default_sampling": bool(use_model_default_sampling),
+            "show_everything_in_console": bool(show_everything_in_console),
+        }
+        if server.get("model"):
+            options["model"] = server["model"]
+        if system_prompt and system_prompt.strip():
+            options["system_prompt"] = system_prompt
+        if temperature is not None and float(temperature) >= 0.0:
+            options["temperature"] = float(temperature)
+        elif "temperature" in server:
+            options["temperature"] = float(server["temperature"])
+        if not use_model_default_sampling:
+            if top_k and int(top_k) > 0:
+                options["top_k"] = int(top_k)
+            if top_p and float(top_p) > 0.0:
+                options["top_p"] = float(top_p)
+            if min_p and float(min_p) > 0.0:
+                options["min_p"] = float(min_p)
+            if repeat_penalty and float(repeat_penalty) > 1.0:
+                options["repeat_penalty"] = float(repeat_penalty)
+        if context_size and int(context_size) > 0:
+            options["context_size"] = int(context_size)
+
+        return (merged, options)
 
 
 # =============================================================================
