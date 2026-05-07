@@ -134,12 +134,35 @@ def _http_post_json(url: str, payload: dict, headers: dict, timeout: int = 120) 
     return json.loads(body)
 
 
+def _sampling_from_server(server: dict) -> dict:
+    """Pick sampling overrides off the server dict. Empty dict if the user has
+    enabled `use_model_default_sampling` or no LLMSamplingOptions node was
+    wired in."""
+    if not server.get("use_model_default_sampling", False):
+        keys = ("top_k", "top_p", "min_p", "repeat_penalty", "context_size")
+        return {k: server[k] for k in keys if server.get(k) is not None}
+    return {}
+
+
 def _call_ollama(endpoint: str, model: str, system: str, user: str, temperature: float,
                  request_json: bool = False, seed: int = 0,
-                 json_schema: dict | None = None) -> str:
+                 json_schema: dict | None = None,
+                 sampling: dict | None = None) -> str:
     options = {"temperature": float(temperature)}
     if seed:
         options["seed"] = int(seed)
+    if sampling:
+        # Ollama option names: top_k, top_p, min_p, repeat_penalty, num_ctx.
+        if "top_k" in sampling:
+            options["top_k"] = int(sampling["top_k"])
+        if "top_p" in sampling:
+            options["top_p"] = float(sampling["top_p"])
+        if "min_p" in sampling:
+            options["min_p"] = float(sampling["min_p"])
+        if "repeat_penalty" in sampling:
+            options["repeat_penalty"] = float(sampling["repeat_penalty"])
+        if "context_size" in sampling:
+            options["num_ctx"] = int(sampling["context_size"])
     payload = {
         "model": model,
         "messages": [
@@ -165,7 +188,8 @@ def _call_openai_compatible(endpoint: str, model: str, system: str, user: str,
                             request_json: bool = False, seed: int = 0,
                             json_schema: dict | None = None,
                             grammar: str | None = None,
-                            backend: str = "openai_compatible") -> str:
+                            backend: str = "openai_compatible",
+                            sampling: dict | None = None) -> str:
     payload = {
         "model": model or "local-model",
         "messages": [
@@ -176,6 +200,20 @@ def _call_openai_compatible(endpoint: str, model: str, system: str, user: str,
     }
     if seed:
         payload["seed"] = int(seed)
+    if sampling:
+        # llama.cpp's OpenAI-compat server accepts these as top-level fields.
+        # Real OpenAI ignores unknown fields, so this is safe to send unconditionally.
+        if "top_k" in sampling:
+            payload["top_k"] = int(sampling["top_k"])
+        if "top_p" in sampling:
+            payload["top_p"] = float(sampling["top_p"])
+        if "min_p" in sampling:
+            payload["min_p"] = float(sampling["min_p"])
+        if "repeat_penalty" in sampling:
+            payload["repeat_penalty"] = float(sampling["repeat_penalty"])
+        if "context_size" in sampling:
+            # llama.cpp server also accepts `n_ctx` on /v1/chat/completions.
+            payload["n_ctx"] = int(sampling["context_size"])
 
     # Enforcement path is mutually exclusive on llama.cpp: sending `grammar`
     # alongside `json_schema` (or `response_format`, which it converts to
@@ -227,15 +265,26 @@ def _server_call(server: dict, system: str, user: str,
     temp = float(temperature_override
                  if temperature_override is not None
                  else server.get("temperature", 0.9))
+    sampling = _sampling_from_server(server)
+    if server.get("show_everything_in_console", False):
+        print(
+            f"[LLMWildcard DEBUG] system={system!r}\n"
+            f"[LLMWildcard DEBUG] user={user!r}\n"
+            f"[LLMWildcard DEBUG] temperature={temp} sampling={sampling}"
+        )
     if backend == "ollama":
         # Ollama has no `grammar` field — schema is the only enforcement path.
-        return _call_ollama(endpoint, model, system, user, temp,
-                            request_json=request_json, seed=seed,
-                            json_schema=json_schema)
-    return _call_openai_compatible(endpoint, model, system, user, temp, api_key,
-                                   request_json=request_json, seed=seed,
-                                   json_schema=json_schema, grammar=grammar,
-                                   backend=backend)
+        reply = _call_ollama(endpoint, model, system, user, temp,
+                             request_json=request_json, seed=seed,
+                             json_schema=json_schema, sampling=sampling)
+    else:
+        reply = _call_openai_compatible(endpoint, model, system, user, temp, api_key,
+                                        request_json=request_json, seed=seed,
+                                        json_schema=json_schema, grammar=grammar,
+                                        backend=backend, sampling=sampling)
+    if server.get("show_everything_in_console", False):
+        print(f"[LLMWildcard DEBUG] reply={reply!r}")
+    return reply
 
 
 # -----------------------------------------------------------------------------
@@ -1236,6 +1285,106 @@ class LLMServerConfig:
 
 
 # =============================================================================
+# Node 1b: LLMSamplingOptions — optional override layer for an LLM_SERVER.
+#
+# Wire LLMServerConfig → LLMSamplingOptions → Manager/Resolver to add fine-grained
+# sampling controls (top_k, top_p, min_p, repeat_penalty, context_size) on top of
+# the base server. The output is still an LLM_SERVER so it slots in anywhere the
+# base server does.
+# =============================================================================
+class LLMSamplingOptions:
+    """ComfyUI node: layer extra sampling controls onto an existing LLM_SERVER.
+    Output is an enhanced LLM_SERVER that the Manager and Resolver accept as-is."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "server": ("LLM_SERVER",),
+            },
+            "optional": {
+                "use_model_default_sampling": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "If ON, drop all sampling overrides and let the model use its built-in defaults. Temperature from the base server is still applied.",
+                }),
+                "temperature": ("FLOAT", {
+                    "default": -1.0,
+                    "min": -1.0,
+                    "max": 2.0,
+                    "step": 0.01,
+                    "tooltip": "Override the server's temperature (-1 = keep server value). 0.0 = deterministic, 2.0 = very random.",
+                }),
+                "top_k": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 200,
+                    "step": 1,
+                    "tooltip": "Sample from top K tokens (0 = disabled / not sent).",
+                }),
+                "top_p": ("FLOAT", {
+                    "default": 0.0,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.01,
+                    "tooltip": "Nucleus sampling threshold (0.0 = not sent).",
+                }),
+                "min_p": ("FLOAT", {
+                    "default": 0.0,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.01,
+                    "tooltip": "Minimum probability relative to the top token (0.0 = not sent).",
+                }),
+                "repeat_penalty": ("FLOAT", {
+                    "default": 1.0,
+                    "min": 1.0,
+                    "max": 2.0,
+                    "step": 0.01,
+                    "tooltip": "Repetition penalty (1.0 = no penalty / not sent).",
+                }),
+                "context_size": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 131072,
+                    "step": 512,
+                    "tooltip": "Context window size in tokens (0 = use server default / not sent).",
+                }),
+                "show_everything_in_console": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Print system prompt, user prompt, sampling options, and raw replies to the ComfyUI console.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("LLM_SERVER",)
+    RETURN_NAMES = ("server",)
+    FUNCTION = "build"
+    CATEGORY = "prompt/wildcards"
+
+    def build(self, server, use_model_default_sampling=False, temperature=-1.0,
+              top_k=0, top_p=0.0, min_p=0.0, repeat_penalty=1.0,
+              context_size=0, show_everything_in_console=False):
+        # Shallow copy so we don't mutate the upstream server dict in place.
+        merged = dict(server)
+        if temperature is not None and float(temperature) >= 0.0:
+            merged["temperature"] = float(temperature)
+        merged["use_model_default_sampling"] = bool(use_model_default_sampling)
+        if not use_model_default_sampling:
+            if top_k and int(top_k) > 0:
+                merged["top_k"] = int(top_k)
+            if top_p and float(top_p) > 0.0:
+                merged["top_p"] = float(top_p)
+            if min_p and float(min_p) > 0.0:
+                merged["min_p"] = float(min_p)
+            if repeat_penalty and float(repeat_penalty) > 1.0:
+                merged["repeat_penalty"] = float(repeat_penalty)
+            if context_size and int(context_size) > 0:
+                merged["context_size"] = int(context_size)
+        merged["show_everything_in_console"] = bool(show_everything_in_console)
+        return (merged,)
+
+
+# =============================================================================
 # Node 2: LLMWildcardManager — designs the prompt template + suggests categories.
 # =============================================================================
 class LLMWildcardManager:
@@ -2016,12 +2165,14 @@ class LLMWildcardReport:
 
 NODE_CLASS_MAPPINGS = {
     "LLMServerConfig": LLMServerConfig,
+    "LLMSamplingOptions": LLMSamplingOptions,
     "LLMWildcardManager": LLMWildcardManager,
     "LLMWildcardResolver": LLMWildcardResolver,
     "LLMWildcardReport": LLMWildcardReport,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LLMServerConfig": "🎲 LLM Server Config",
+    "LLMSamplingOptions": "🎲 LLM Sampling Options",
     "LLMWildcardManager": "🎲 LLM Wildcard Manager",
     "LLMWildcardResolver": "🎲 LLM Wildcard Resolver",
     "LLMWildcardReport": "🎲 LLM Wildcard Report",
