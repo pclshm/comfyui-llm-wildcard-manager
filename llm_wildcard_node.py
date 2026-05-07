@@ -134,12 +134,35 @@ def _http_post_json(url: str, payload: dict, headers: dict, timeout: int = 120) 
     return json.loads(body)
 
 
+def _sampling_from_server(server: dict) -> dict:
+    """Pick sampling overrides off the server dict. Empty dict if the user has
+    enabled `use_model_default_sampling` or no LLMSamplingOptions node was
+    wired in."""
+    if not server.get("use_model_default_sampling", False):
+        keys = ("top_k", "top_p", "min_p", "repeat_penalty", "context_size")
+        return {k: server[k] for k in keys if server.get(k) is not None}
+    return {}
+
+
 def _call_ollama(endpoint: str, model: str, system: str, user: str, temperature: float,
                  request_json: bool = False, seed: int = 0,
-                 json_schema: dict | None = None) -> str:
+                 json_schema: dict | None = None,
+                 sampling: dict | None = None) -> str:
     options = {"temperature": float(temperature)}
     if seed:
         options["seed"] = int(seed)
+    if sampling:
+        # Ollama option names: top_k, top_p, min_p, repeat_penalty, num_ctx.
+        if "top_k" in sampling:
+            options["top_k"] = int(sampling["top_k"])
+        if "top_p" in sampling:
+            options["top_p"] = float(sampling["top_p"])
+        if "min_p" in sampling:
+            options["min_p"] = float(sampling["min_p"])
+        if "repeat_penalty" in sampling:
+            options["repeat_penalty"] = float(sampling["repeat_penalty"])
+        if "context_size" in sampling:
+            options["num_ctx"] = int(sampling["context_size"])
     payload = {
         "model": model,
         "messages": [
@@ -165,7 +188,8 @@ def _call_openai_compatible(endpoint: str, model: str, system: str, user: str,
                             request_json: bool = False, seed: int = 0,
                             json_schema: dict | None = None,
                             grammar: str | None = None,
-                            backend: str = "openai_compatible") -> str:
+                            backend: str = "openai_compatible",
+                            sampling: dict | None = None) -> str:
     payload = {
         "model": model or "local-model",
         "messages": [
@@ -176,6 +200,20 @@ def _call_openai_compatible(endpoint: str, model: str, system: str, user: str,
     }
     if seed:
         payload["seed"] = int(seed)
+    if sampling:
+        # llama.cpp's OpenAI-compat server accepts these as top-level fields.
+        # Real OpenAI ignores unknown fields, so this is safe to send unconditionally.
+        if "top_k" in sampling:
+            payload["top_k"] = int(sampling["top_k"])
+        if "top_p" in sampling:
+            payload["top_p"] = float(sampling["top_p"])
+        if "min_p" in sampling:
+            payload["min_p"] = float(sampling["min_p"])
+        if "repeat_penalty" in sampling:
+            payload["repeat_penalty"] = float(sampling["repeat_penalty"])
+        if "context_size" in sampling:
+            # llama.cpp server also accepts `n_ctx` on /v1/chat/completions.
+            payload["n_ctx"] = int(sampling["context_size"])
 
     # Enforcement path is mutually exclusive on llama.cpp: sending `grammar`
     # alongside `json_schema` (or `response_format`, which it converts to
@@ -227,15 +265,180 @@ def _server_call(server: dict, system: str, user: str,
     temp = float(temperature_override
                  if temperature_override is not None
                  else server.get("temperature", 0.9))
+    sampling = _sampling_from_server(server)
+    if server.get("show_everything_in_console", False):
+        print(
+            f"[LLMWildcard DEBUG] system={system!r}\n"
+            f"[LLMWildcard DEBUG] user={user!r}\n"
+            f"[LLMWildcard DEBUG] temperature={temp} sampling={sampling}"
+        )
     if backend == "ollama":
         # Ollama has no `grammar` field — schema is the only enforcement path.
-        return _call_ollama(endpoint, model, system, user, temp,
-                            request_json=request_json, seed=seed,
-                            json_schema=json_schema)
-    return _call_openai_compatible(endpoint, model, system, user, temp, api_key,
-                                   request_json=request_json, seed=seed,
-                                   json_schema=json_schema, grammar=grammar,
-                                   backend=backend)
+        reply = _call_ollama(endpoint, model, system, user, temp,
+                             request_json=request_json, seed=seed,
+                             json_schema=json_schema, sampling=sampling)
+    else:
+        reply = _call_openai_compatible(endpoint, model, system, user, temp, api_key,
+                                        request_json=request_json, seed=seed,
+                                        json_schema=json_schema, grammar=grammar,
+                                        backend=backend, sampling=sampling)
+    if server.get("show_everything_in_console", False):
+        print(f"[LLMWildcard DEBUG] reply={reply!r}")
+    return reply
+
+
+# -----------------------------------------------------------------------------
+# Vision-aware chat helper for the LLMPromptGenerator node.
+#
+# Talks directly to whatever endpoint the user already configured in their
+# LLM_SERVER. No subprocesses, no port management — purely a client.
+# Returns (content, reasoning) so callers can split a model's "thinking"
+# stream from its final answer.
+# -----------------------------------------------------------------------------
+_THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>([\s\S]*?)</think\s*>", re.IGNORECASE)
+
+
+def _split_thinking(text: str) -> tuple[str, str]:
+    """Pull <think>...</think> blocks out of `text` and return
+    (clean_content, joined_thinking_text)."""
+    if not text:
+        return "", ""
+    thinking_parts = [m.group(1).strip() for m in _THINK_BLOCK_RE.finditer(text)]
+    cleaned = _THINK_BLOCK_RE.sub("", text).strip()
+    return cleaned, "\n\n".join(p for p in thinking_parts if p)
+
+
+def _encode_comfy_image_to_b64(image_tensor, max_pixels: int = 2_000_000) -> str:
+    """Convert a ComfyUI IMAGE tensor (batch, H, W, 3) float 0..1 to PNG base64.
+    Lazy imports PIL/numpy/torch — only the IMAGE-using code path pulls them in."""
+    from PIL import Image
+    from io import BytesIO
+    import base64
+    import numpy as np
+
+    img = image_tensor[0]
+    if hasattr(img, "cpu"):
+        img = img.cpu()
+    if hasattr(img, "numpy"):
+        img = img.numpy()
+    arr = (np.clip(np.asarray(img), 0.0, 1.0) * 255).astype("uint8")
+    pil = Image.fromarray(arr)
+    w, h = pil.size
+    if w * h > max_pixels:
+        scale = (max_pixels / (w * h)) ** 0.5
+        pil = pil.resize((max(1, int(w * scale)), max(1, int(h * scale))),
+                         Image.Resampling.LANCZOS)
+    buf = BytesIO()
+    pil.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _chat_with_vision(server: dict, system: str, user: str,
+                      image_b64: str | None = None,
+                      seed: int = 0,
+                      enable_thinking: bool = False,
+                      timeout: int = 180) -> tuple[str, str]:
+    """Send a chat-completion to whichever endpoint the LLM_SERVER points at,
+    optionally with one base64-encoded PNG image. Returns (content, thinking).
+
+    Routing:
+      backend == "ollama"  → POST {endpoint}/api/chat   (native, images: [b64])
+      otherwise            → POST {endpoint}/chat/completions  (OpenAI-compat,
+                              image_url content array)
+    """
+    backend = server.get("backend", "ollama")
+    endpoint = server.get("endpoint", "")
+    model = server.get("model", "")
+    api_key = server.get("api_key", "")
+    temperature = float(server.get("temperature", 0.7))
+    sampling = _sampling_from_server(server)
+
+    if backend == "ollama":
+        options = {"temperature": temperature}
+        if seed:
+            options["seed"] = int(seed)
+        if "top_k" in sampling:
+            options["top_k"] = int(sampling["top_k"])
+        if "top_p" in sampling:
+            options["top_p"] = float(sampling["top_p"])
+        if "min_p" in sampling:
+            options["min_p"] = float(sampling["min_p"])
+        if "repeat_penalty" in sampling:
+            options["repeat_penalty"] = float(sampling["repeat_penalty"])
+        if "context_size" in sampling:
+            options["num_ctx"] = int(sampling["context_size"])
+
+        user_msg: dict = {"role": "user", "content": user}
+        if image_b64:
+            user_msg["images"] = [image_b64]
+        payload: dict = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                user_msg,
+            ],
+            "stream": False,
+            "options": options,
+        }
+        if enable_thinking:
+            # Newer Ollama (0.4+) honors `think` for reasoning-enabled models;
+            # older versions ignore unknown fields, so this is safe.
+            payload["think"] = True
+        url = endpoint.rstrip("/") + "/api/chat"
+        body = _http_post_json(url, payload, {"Content-Type": "application/json"},
+                               timeout=timeout)
+        message = body.get("message", {}) or {}
+        content_raw = (message.get("content") or "").strip()
+        thinking = (message.get("thinking") or "").strip()
+        content, inline_thinking = _split_thinking(content_raw)
+        if inline_thinking and not thinking:
+            thinking = inline_thinking
+        return content, thinking
+
+    # OpenAI-compatible path (llama.cpp server, real OpenAI, etc.)
+    if image_b64:
+        user_content = [
+            {"type": "image_url",
+             "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
+            {"type": "text", "text": user},
+        ]
+    else:
+        user_content = user
+    payload = {
+        "model": model or "local-model",
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_content},
+        ],
+        "temperature": temperature,
+        "stream": False,
+    }
+    if seed:
+        payload["seed"] = int(seed)
+    if "top_k" in sampling:
+        payload["top_k"] = int(sampling["top_k"])
+    if "top_p" in sampling:
+        payload["top_p"] = float(sampling["top_p"])
+    if "min_p" in sampling:
+        payload["min_p"] = float(sampling["min_p"])
+    if "repeat_penalty" in sampling:
+        payload["repeat_penalty"] = float(sampling["repeat_penalty"])
+    if "context_size" in sampling:
+        payload["n_ctx"] = int(sampling["context_size"])
+    if enable_thinking:
+        payload["chat_template_kwargs"] = {"enable_thinking": True}
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    url = endpoint.rstrip("/") + "/chat/completions"
+    body = _http_post_json(url, payload, headers, timeout=timeout)
+    message = body["choices"][0].get("message", {}) or {}
+    content_raw = (message.get("content") or "").strip()
+    thinking = (message.get("reasoning_content") or "").strip()
+    content, inline_thinking = _split_thinking(content_raw)
+    if inline_thinking and not thinking:
+        thinking = inline_thinking
+    return content, thinking
 
 
 # -----------------------------------------------------------------------------
@@ -1236,6 +1439,333 @@ class LLMServerConfig:
 
 
 # =============================================================================
+# Node 1b: LLMSamplingOptions — optional override layer for an LLM_SERVER.
+#
+# Wire LLMServerConfig → LLMSamplingOptions → Manager/Resolver to add fine-grained
+# sampling controls (top_k, top_p, min_p, repeat_penalty, context_size) on top of
+# the base server. The output is still an LLM_SERVER so it slots in anywhere the
+# base server does.
+#
+# Also emits an OPTIONS bundle on a second output, shaped to match the contract
+# used by the "Prompt Generator" node from
+# https://github.com/abdozmantar/ComfyUI-Prompt-Manager — wire it into that
+# node's `options` input to drive sampling/model/system_prompt from one place.
+# =============================================================================
+class LLMSamplingOptions:
+    """ComfyUI node: layer extra sampling controls onto an existing LLM_SERVER.
+    Outputs both an enhanced LLM_SERVER (for this package's Manager/Resolver)
+    and an OPTIONS dict compatible with the external Prompt Generator node."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "server": ("LLM_SERVER",),
+            },
+            "optional": {
+                "use_model_default_sampling": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "If ON, drop all sampling overrides and let the model use its built-in defaults. Temperature from the base server is still applied.",
+                }),
+                "temperature": ("FLOAT", {
+                    "default": -1.0,
+                    "min": -1.0,
+                    "max": 2.0,
+                    "step": 0.01,
+                    "tooltip": "Override the server's temperature (-1 = keep server value). 0.0 = deterministic, 2.0 = very random.",
+                }),
+                "top_k": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 200,
+                    "step": 1,
+                    "tooltip": "Sample from top K tokens (0 = disabled / not sent).",
+                }),
+                "top_p": ("FLOAT", {
+                    "default": 0.0,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.01,
+                    "tooltip": "Nucleus sampling threshold (0.0 = not sent).",
+                }),
+                "min_p": ("FLOAT", {
+                    "default": 0.0,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.01,
+                    "tooltip": "Minimum probability relative to the top token (0.0 = not sent).",
+                }),
+                "repeat_penalty": ("FLOAT", {
+                    "default": 1.0,
+                    "min": 1.0,
+                    "max": 2.0,
+                    "step": 0.01,
+                    "tooltip": "Repetition penalty (1.0 = no penalty / not sent).",
+                }),
+                "context_size": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 131072,
+                    "step": 512,
+                    "tooltip": "Context window size in tokens (0 = use server default / not sent).",
+                }),
+                "system_prompt": ("STRING", {
+                    "multiline": True,
+                    "default": "",
+                    "placeholder": "Optional system prompt. Honored by the external Prompt Generator node; the wildcard Manager/Resolver use their own per-step prompts and ignore this field.",
+                    "tooltip": "Custom system prompt. Used only when wired into a node that reads it (e.g. Prompt Generator). Leave empty to use the consumer's defaults.",
+                }),
+                "show_everything_in_console": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Print system prompt, user prompt, sampling options, and raw replies to the ComfyUI console.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("LLM_SERVER", "OPTIONS")
+    RETURN_NAMES = ("server", "options")
+    FUNCTION = "build"
+    CATEGORY = "prompt/wildcards"
+
+    def build(self, server, use_model_default_sampling=False, temperature=-1.0,
+              top_k=0, top_p=0.0, min_p=0.0, repeat_penalty=1.0,
+              context_size=0, system_prompt="", show_everything_in_console=False):
+        # Shallow copy so we don't mutate the upstream server dict in place.
+        merged = dict(server)
+        if temperature is not None and float(temperature) >= 0.0:
+            merged["temperature"] = float(temperature)
+        merged["use_model_default_sampling"] = bool(use_model_default_sampling)
+        if not use_model_default_sampling:
+            if top_k and int(top_k) > 0:
+                merged["top_k"] = int(top_k)
+            if top_p and float(top_p) > 0.0:
+                merged["top_p"] = float(top_p)
+            if min_p and float(min_p) > 0.0:
+                merged["min_p"] = float(min_p)
+            if repeat_penalty and float(repeat_penalty) > 1.0:
+                merged["repeat_penalty"] = float(repeat_penalty)
+            if context_size and int(context_size) > 0:
+                merged["context_size"] = int(context_size)
+        merged["show_everything_in_console"] = bool(show_everything_in_console)
+        if system_prompt and system_prompt.strip():
+            # Stored on the server dict but ignored by _server_call — kept here
+            # purely so a downstream node could pick it up if it wanted to.
+            merged["system_prompt"] = system_prompt
+
+        # OPTIONS bundle — shape matches the external Prompt Generator node's
+        # contract so users can wire `options` straight into it.
+        backend = server.get("backend", "ollama")
+        options: dict = {
+            "llm_backend": "ollama" if backend == "ollama" else "llama.cpp",
+            "use_model_default_sampling": bool(use_model_default_sampling),
+            "show_everything_in_console": bool(show_everything_in_console),
+        }
+        if server.get("model"):
+            options["model"] = server["model"]
+        if system_prompt and system_prompt.strip():
+            options["system_prompt"] = system_prompt
+        if temperature is not None and float(temperature) >= 0.0:
+            options["temperature"] = float(temperature)
+        elif "temperature" in server:
+            options["temperature"] = float(server["temperature"])
+        if not use_model_default_sampling:
+            if top_k and int(top_k) > 0:
+                options["top_k"] = int(top_k)
+            if top_p and float(top_p) > 0.0:
+                options["top_p"] = float(top_p)
+            if min_p and float(min_p) > 0.0:
+                options["min_p"] = float(min_p)
+            if repeat_penalty and float(repeat_penalty) > 1.0:
+                options["repeat_penalty"] = float(repeat_penalty)
+        if context_size and int(context_size) > 0:
+            options["context_size"] = int(context_size)
+
+        return (merged, options)
+
+
+# =============================================================================
+# Node 1c: LLMPromptGenerator — text/image → enhanced prompt, using LLM_SERVER.
+#
+# Important: this node never starts or stops a llama.cpp server. It only sends
+# HTTP requests to the endpoint already configured upstream in LLMServerConfig
+# (optionally enhanced by LLMSamplingOptions). If you want a model loaded, load
+# it once outside ComfyUI and point LLMServerConfig at the running endpoint.
+# =============================================================================
+_PG_DEFAULT_SYSTEM_PROMPTS: dict[str, str] = {
+    "Enhance Prompt (Image)": (
+        "You are an expert prompt engineer for text-to-image diffusion models. "
+        "Take the user's idea and rewrite it as a single polished prompt: "
+        "concrete subject, scene, lighting, composition, materials, style. "
+        "Output the prompt only — no preamble, no quotes, no explanations."
+    ),
+    "Enhance Prompt (Video)": (
+        "You are an expert prompt engineer for text-to-video models. "
+        "Take the user's idea and rewrite it as a single polished prompt that "
+        "covers subject, motion, camera movement, lighting, and style. "
+        "Output the prompt only — no preamble, no quotes, no explanations."
+    ),
+    "Analyze Image": (
+        "Describe the provided image as a prompt suitable for regenerating it "
+        "with a text-to-image model. Concrete subject, scene, lighting, "
+        "composition, style. Output the prompt only — no preamble."
+    ),
+    "Analyze Image with Prompt": (
+        "Follow the user's instructions to describe or analyze the provided "
+        "image. Be concrete and visual. Output only what the user asked for."
+    ),
+}
+
+_PG_DEFAULT_IMAGE_ACTION = "Describe this image in vivid, concrete detail."
+
+_PG_JSON_SUFFIX = (
+    "\n\nReturn the result as a single JSON object with keys "
+    '"subject", "scene", "style", "lighting", "composition". '
+    "No prose outside the JSON."
+)
+
+_PG_VISION_MODES = {"Analyze Image", "Analyze Image with Prompt"}
+
+
+class LLMPromptGenerator:
+    """ComfyUI node: enhance a text prompt or analyze an image using the LLM
+    endpoint configured in LLMServerConfig. Drop-in replacement for the external
+    Prompt Generator node, but it never spawns its own llama.cpp subprocess —
+    it just talks to whichever endpoint you've already set up."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "server": ("LLM_SERVER",),
+                "seed": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 0xffffffffffffffff,
+                    "tooltip": "Seed for reproducible generation. 0 lets the server pick.",
+                    "control_after_generate": True,
+                }),
+            },
+            "optional": {
+                "mode": (list(_PG_DEFAULT_SYSTEM_PROMPTS.keys()), {
+                    "default": "Enhance Prompt (Image)",
+                    "tooltip": "Enhance text prompt | Analyze image | Analyze image with custom instructions",
+                }),
+                "prompt": ("STRING", {
+                    "multiline": True,
+                    "default": "",
+                    "placeholder": "Your prompt or instructions…",
+                    "tooltip": "Required for Enhance Prompt modes; optional for Analyze Image modes.",
+                }),
+                "image": ("IMAGE", {
+                    "tooltip": "Required for the Analyze Image modes.",
+                }),
+                "format_as_json": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Append JSON-formatting instructions to the system prompt.",
+                }),
+                "enable_thinking": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Ask the model for explicit reasoning. Captured separately into the `thoughts` output. Ignored by models that don't support it.",
+                }),
+                "system_prompt": ("STRING", {
+                    "multiline": True,
+                    "default": "",
+                    "placeholder": "Override the default system prompt for this mode (optional).",
+                    "tooltip": "Custom system prompt. Leave empty to use the per-mode default.",
+                }),
+                "timeout_seconds": ("INT", {
+                    "default": 180,
+                    "min": 10,
+                    "max": 1800,
+                    "step": 10,
+                    "tooltip": "HTTP timeout for the LLM call.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("output", "thoughts")
+    FUNCTION = "generate"
+    CATEGORY = "prompt/wildcards"
+
+    @classmethod
+    def IS_CHANGED(cls, seed, **kwargs):
+        return seed
+
+    def generate(self, server, seed, mode="Enhance Prompt (Image)", prompt="",
+                 image=None, format_as_json=False, enable_thinking=False,
+                 system_prompt="", timeout_seconds=180):
+        is_vision = mode in _PG_VISION_MODES
+
+        if not is_vision and not (prompt and prompt.strip()):
+            raise RuntimeError(f"Mode '{mode}' requires a non-empty prompt.")
+        if is_vision and image is None:
+            raise RuntimeError(
+                f"Mode '{mode}' requires an image. Connect an IMAGE input or "
+                f"switch to an Enhance Prompt mode."
+            )
+
+        # System prompt: explicit user input wins, then any system_prompt that
+        # arrived on the LLM_SERVER (e.g. from LLMSamplingOptions), then the
+        # per-mode default baked in here.
+        if system_prompt and system_prompt.strip():
+            sys_prompt = system_prompt.strip()
+        elif server.get("system_prompt"):
+            sys_prompt = server["system_prompt"]
+        else:
+            sys_prompt = _PG_DEFAULT_SYSTEM_PROMPTS[mode]
+
+        if format_as_json:
+            sys_prompt = sys_prompt + _PG_JSON_SUFFIX
+
+        # User content per mode.
+        if mode == "Analyze Image":
+            user_content = _PG_DEFAULT_IMAGE_ACTION
+        elif mode == "Analyze Image with Prompt":
+            user_content = (prompt.strip() if prompt and prompt.strip()
+                            else _PG_DEFAULT_IMAGE_ACTION)
+        else:
+            user_content = prompt
+
+        image_b64 = _encode_comfy_image_to_b64(image) if is_vision else None
+
+        debug = bool(server.get("show_everything_in_console", False))
+        if debug:
+            print(f"[LLMPromptGenerator] backend={server.get('backend')} "
+                  f"endpoint={server.get('endpoint')} model={server.get('model')} "
+                  f"mode={mode} vision={'yes' if is_vision else 'no'} "
+                  f"thinking={enable_thinking} json={format_as_json}")
+            print(f"[LLMPromptGenerator] system: {sys_prompt}")
+            print(f"[LLMPromptGenerator] user:   {user_content}")
+
+        try:
+            content, thinking = _chat_with_vision(
+                server=server,
+                system=sys_prompt,
+                user=user_content,
+                image_b64=image_b64,
+                seed=int(seed) if seed else 0,
+                enable_thinking=bool(enable_thinking),
+                timeout=int(timeout_seconds),
+            )
+        except urllib.error.URLError as e:
+            raise RuntimeError(
+                f"LLMPromptGenerator: could not reach {server.get('endpoint')!r} "
+                f"({e}). Make sure your llama.cpp / Ollama server is running on "
+                f"that endpoint."
+            )
+
+        if debug:
+            print(f"[LLMPromptGenerator] thinking: {thinking!r}")
+            print(f"[LLMPromptGenerator] output:   {content!r}")
+
+        if not content:
+            content = prompt if prompt else ""
+
+        return (content, thinking)
+
+
+# =============================================================================
 # Node 2: LLMWildcardManager — designs the prompt template + suggests categories.
 # =============================================================================
 class LLMWildcardManager:
@@ -2016,12 +2546,16 @@ class LLMWildcardReport:
 
 NODE_CLASS_MAPPINGS = {
     "LLMServerConfig": LLMServerConfig,
+    "LLMSamplingOptions": LLMSamplingOptions,
+    "LLMPromptGenerator": LLMPromptGenerator,
     "LLMWildcardManager": LLMWildcardManager,
     "LLMWildcardResolver": LLMWildcardResolver,
     "LLMWildcardReport": LLMWildcardReport,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LLMServerConfig": "🎲 LLM Server Config",
+    "LLMSamplingOptions": "🎲 LLM Sampling Options",
+    "LLMPromptGenerator": "🎲 LLM Prompt Generator",
     "LLMWildcardManager": "🎲 LLM Wildcard Manager",
     "LLMWildcardResolver": "🎲 LLM Wildcard Resolver",
     "LLMWildcardReport": "🎲 LLM Wildcard Report",
