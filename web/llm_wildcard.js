@@ -242,33 +242,27 @@ function makeEditable(placeholder, value) {
 function injectStyles() {
     if (document.getElementById("lwm-styles")) return;
     const css = `
-        /* Root fills the widget container exactly and never overflows; the
-           scroll area is delegated to .lwm-scroll inside. The classic flex
-           pattern: flex column with overflow:hidden, plus a child with
-           flex:1 1 auto + min-height:0 + overflow:auto. */
+        /* Root always wraps its content so nothing inside is clipped by
+           overflow. The node frame grows with the wrapper (see
+           updateManagerSize / fitWidgetToContent). Inner panels expand to
+           their full content height — no internal scrollbars. */
         .lwm-root { display:flex; flex-direction:column; gap:8px;
-            padding:6px; box-sizing:border-box; width:100%; height:100%;
+            padding:6px; box-sizing:border-box; width:100%; height:auto;
             max-width:100%; min-width:0; min-height:0;
-            overflow:hidden;
+            overflow:visible;
             font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI",
                 Roboto, sans-serif; color:#dcdcdc;
         }
-        /* Manager variant: height tracks content so the node grows with the
-           list instead of clipping it. No internal scroll on the categories. */
         .lwm-root.lwm-root-fit { height:auto; overflow:visible; }
         .lwm-root * { box-sizing:border-box; }
         .lwm-fixed { flex:0 0 auto; min-height:0; }
-        .lwm-scroll { flex:1 1 auto; min-height:0; min-width:0;
-            overflow-y:auto; overflow-x:hidden; padding-right:2px; }
-        .lwm-scroll.lwm-cap-cats   { max-height:260px; }
-        .lwm-scroll.lwm-cap-slots  { max-height:240px; }
-        /* Report uses a flexible split: slots and raw textarea share the
-           leftover vertical space and grow with the node frame. */
-        .lwm-scroll.lwm-grow       { flex:1 1 0; min-height:120px; }
-        .lwm-scroll::-webkit-scrollbar { width:8px; }
-        .lwm-scroll::-webkit-scrollbar-thumb {
-            background:#2c3138; border-radius:4px; }
-        .lwm-scroll::-webkit-scrollbar-thumb:hover { background:#3a4250; }
+        /* Legacy `.lwm-scroll` containers now flow naturally — kept so we
+           don't have to rip out class names everywhere. */
+        .lwm-scroll { flex:0 0 auto; min-height:0; min-width:0;
+            overflow:visible; padding-right:2px; }
+        .lwm-scroll.lwm-cap-cats,
+        .lwm-scroll.lwm-cap-slots,
+        .lwm-scroll.lwm-grow { max-height:none; overflow:visible; flex:0 0 auto; }
         .lwm-section-label { font-size:10px; letter-spacing:.06em;
             text-transform:uppercase; color:#7d8693; margin:2px 2px -2px; }
         .lwm-toolbar { display:flex; gap:6px; align-items:center;
@@ -286,10 +280,12 @@ function injectStyles() {
             border-color:#4d8cd0; box-shadow:0 0 0 2px rgba(77,140,208,.18);
         }
         /* Contenteditable inputs (used instead of <input> in the manager so
-           password managers like Dashlane don't try to autofill them). */
+           password managers like Dashlane don't try to autofill them).
+           Wrap long content instead of hiding behind ellipsis so the user
+           can always see what they typed. */
         .lwm-input[contenteditable] {
-            white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
-            cursor:text; line-height:1.3;
+            white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word;
+            overflow:visible; cursor:text; line-height:1.3;
         }
         .lwm-input[contenteditable]:empty::before {
             content: attr(data-placeholder);
@@ -298,12 +294,12 @@ function injectStyles() {
         .lwm-textarea { width:100%; resize:none;
             font-family: ui-monospace, Menlo, Consolas, monospace;
             font-size:11px; line-height:1.4; white-space:pre; }
-        /* Report's raw view wraps long lines and keeps a fixed height so the
-           node body wraps the content instead of stretching with it. */
+        /* Report's raw view wraps long lines and grows with content so the
+           full reply is always visible inside the node. */
         .lwm-textarea.lwm-raw-textarea {
-            height:200px; min-height:120px;
+            min-height:120px; height:auto;
             white-space:pre-wrap; word-break:break-word;
-            overflow:auto;
+            overflow:visible;
         }
         .lwm-btn { padding:6px 10px; font-size:12px;
             background:#2c5b86; color:#fff; border:none; border-radius:4px;
@@ -317,15 +313,15 @@ function injectStyles() {
         .lwm-btn-icon { width:26px; padding:5px 0; text-align:center; }
         .lwm-pathline { font-size:10px; color:#6c7480;
             font-family: ui-monospace, Menlo, Consolas, monospace;
-            min-width:0; overflow:hidden; text-overflow:ellipsis;
-            white-space:nowrap; }
+            min-width:0; overflow-wrap:anywhere; word-break:break-all;
+            white-space:normal; }
         .lwm-prompt-panel {
             background:#0f1114; color:#e6e6e6;
             border:1px solid #262a31; border-radius:4px;
             padding:6px 8px; font-size:11.5px; line-height:1.45;
             font-family: ui-monospace, Menlo, Consolas, monospace;
             white-space:pre-wrap; word-break:break-word;
-            min-width:0; max-width:100%; max-height:140px; overflow:auto;
+            min-width:0; max-width:100%; overflow:visible;
         }
         .lwm-prompt-panel.lwm-empty { color:#6c7480; font-style:italic; }
         .lwm-prompt-panel.lwm-error { border-color:#5b2c2c; color:#ff9b9b; }
@@ -365,7 +361,7 @@ function injectStyles() {
             padding:6px 8px; font-size:11px; line-height:1.45;
             font-family: ui-monospace, Menlo, Consolas, monospace;
             white-space:pre-wrap; word-break:break-word;
-            max-height:240px; overflow:auto; margin:0;
+            overflow:visible; margin:0;
         }
         .lwm-raw-reply.lwm-error-border { border-color:#5b2c2c; }
         .lwm-raw-reply.lwm-empty { color:#6c7480; font-style:italic; }
@@ -382,7 +378,7 @@ function injectStyles() {
         .lwm-row:hover { border-color:#3a4250; }
         .lwm-row.lwm-row-user { border-color:#3a5a82; }
         .lwm-row-head { display:flex; gap:6px; align-items:center;
-            min-width:0; max-width:100%; }
+            flex-wrap:wrap; min-width:0; max-width:100%; }
         .lwm-row-head > * { min-width:0; }
         .lwm-expand { width:24px; height:24px; flex:0 0 24px;
             background:#22262b; color:#cfd3d8;
@@ -414,11 +410,16 @@ function injectStyles() {
             border:1px solid transparent; border-radius:4px;
             margin-top:0; padding:0 8px;
             font-family: ui-monospace, Menlo, Consolas, monospace;
-            font-size:11px; line-height:1.45; white-space:pre;
+            font-size:11px; line-height:1.45;
+            white-space:pre-wrap; word-break:break-word;
         }
+        /* Open state expands to the full entry list (no internal scroll).
+           A very large max-height keeps the CSS transition working while
+           effectively letting the panel grow to whatever the content needs;
+           the node frame grows to match via updateManagerSize(). */
         .lwm-entries.lwm-open {
-            max-height:220px; margin-top:6px; padding:6px 8px;
-            border-color:#262a31; overflow:auto;
+            max-height:none; margin-top:6px; padding:6px 8px;
+            border-color:#262a31; overflow:visible;
         }
         .lwm-entries.lwm-empty { color:#6c7480; font-style:italic; }
         /* Report-specific */
@@ -436,14 +437,15 @@ function injectStyles() {
             border:1px solid #2a2e34; border-radius:5px;
             padding:6px 6px 4px; min-width:0; }
         .lwm-slot-head { display:flex; gap:8px; align-items:center;
-            min-width:0; }
+            flex-wrap:wrap; min-width:0; }
         .lwm-slot-head > .lwm-slot-name { font-weight:600; color:#e6e6e6;
             flex:0 0 auto; }
         .lwm-slot-head > .lwm-slot-value {
             flex:1 1 auto; min-width:0; color:#cfd3d8;
             font-family: ui-monospace, Menlo, Consolas, monospace;
-            font-size:11px; overflow:hidden; text-overflow:ellipsis;
-            white-space:nowrap; }
+            font-size:11px; overflow:visible;
+            white-space:normal; overflow-wrap:anywhere;
+            word-break:break-word; }
         .lwm-status {
             flex:0 0 auto; padding:1px 6px; font-size:10.5px;
             border-radius:10px; border:1px solid #2a2e34; background:#1f2228;
@@ -465,8 +467,8 @@ function injectStyles() {
             word-break:break-word;
         }
         .lwm-slot-detail.lwm-open {
-            max-height:280px; margin-top:6px; padding:6px 8px;
-            border-color:#262a31; overflow:auto;
+            max-height:none; margin-top:6px; padding:6px 8px;
+            border-color:#262a31; overflow:visible;
         }
         .lwm-detail-row { margin-bottom:2px; }
         .lwm-detail-key { color:#7d8693; }
@@ -481,7 +483,7 @@ function injectStyles() {
             min-width:0; max-width:100%;
         }
         .lwm-brief-row { display:flex; gap:6px; align-items:flex-start;
-            min-width:0; max-width:100%; }
+            flex-wrap:wrap; min-width:0; max-width:100%; }
         .lwm-brief-label {
             flex:0 0 96px; font-size:10px; letter-spacing:.06em;
             text-transform:uppercase; color:#7d8693; padding-top:6px;
@@ -515,11 +517,12 @@ function injectStyles() {
         .lwm-chip.lwm-chip-scene { background:#281616; color:#ff9b9b; border-color:#5b2c2c; }
         .lwm-chip.lwm-chip-fixed { background:#15281d; color:#9be8a4; border-color:#2c5b3a; }
         .lwm-chip-text {
-            white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
-            max-width:280px;
+            white-space:normal; overflow-wrap:anywhere;
+            word-break:break-word; overflow:visible;
+            max-width:100%;
         }
         .lwm-chip-text[contenteditable] { cursor:text; min-width:14px;
-            white-space:nowrap; overflow:hidden; }
+            white-space:normal; overflow:visible; overflow-wrap:anywhere; }
         .lwm-chip-x {
             width:16px; height:16px; line-height:14px;
             text-align:center; cursor:pointer; border-radius:50%;
@@ -1224,29 +1227,26 @@ app.registerExtension({
                 slotsLabel.textContent = "Per-slot details";
                 root.appendChild(slotsLabel);
 
-                // slots list scrolls inside its own container, capped at
-                // 240px so a long run doesn't push the node off-screen.
-                const slotsScroll = document.createElement("div");
-                slotsScroll.className = "lwm-scroll lwm-cap-slots";
+                // Slot list flows naturally; the node frame grows to wrap
+                // every slot so nothing gets hidden behind a scrollbar.
                 const slots = document.createElement("div");
                 slots.className = "lwm-list";
-                slotsScroll.appendChild(slots);
-                root.appendChild(slotsScroll);
+                root.appendChild(slots);
 
                 const rawLabel = document.createElement("div");
                 rawLabel.className = "lwm-section-label lwm-fixed";
                 rawLabel.textContent = "Raw report";
                 root.appendChild(rawLabel);
 
-                // Raw textarea wraps long lines and has a fixed height; it
-                // owns its own scrollbar instead of growing the node body.
-                const rawTA = document.createElement("textarea");
-                rawTA.readOnly = true;
-                rawTA.spellcheck = false;
-                rawTA.className = "lwm-textarea lwm-raw-textarea";
-                root.appendChild(rawTA);
+                // Raw report is rendered as a <pre>: read-only, auto-grows
+                // with content (no fixed height + no internal scrollbar),
+                // so the whole report is visible inside the node.
+                const rawPre = document.createElement("pre");
+                rawPre.className = "lwm-raw-reply lwm-fixed";
+                rawPre.textContent = "";
+                root.appendChild(rawPre);
 
-                node._rawTA = rawTA;
+                node._rawTA = rawPre;
                 node._reportRoot = root;
 
                 function buildSlot(rec) {
@@ -1310,6 +1310,9 @@ app.registerExtension({
                     expand.addEventListener("click", () => {
                         const open = detail.classList.toggle("lwm-open");
                         expand.classList.toggle("lwm-open", open);
+                        // Grow / shrink the node frame so the expanded
+                        // detail isn't clipped by the previous frame size.
+                        node._updateReportSize?.();
                     });
                     return slot;
                 }
@@ -1355,12 +1358,13 @@ app.registerExtension({
                 node.size = [Math.max(node.size[0], 560), node.size[1]];
                 const updateReportSize =
                     fitWidgetToContent(node, reportWidget, root, 560);
+                node._updateReportSize = updateReportSize;
                 updateReportSize();
 
                 node._renderReport = (payload) => {
                     renderTallies(payload?.tallies, payload?.raw);
                     renderRecords(payload?.records);
-                    rawTA.value = payload?.raw || "";
+                    rawPre.textContent = payload?.raw || "";
                     updateReportSize();
                 };
             };
