@@ -41,6 +41,7 @@ LAST_REPORT_JSON = WILDCARDS_DIR / ".last_report.json"
 LAST_TEMPLATE_PATH = WILDCARDS_DIR / ".last_template.txt"
 LAST_REPLY_PATH = WILDCARDS_DIR / ".last_reply.json"
 LAST_RESOLVER_PATH = WILDCARDS_DIR / ".last_resolver.json"
+LAST_BRIEF_PATH = WILDCARDS_DIR / ".last_brief.json"
 
 
 # -----------------------------------------------------------------------------
@@ -477,6 +478,34 @@ def resolve_direction(direction: str) -> str:
 # System prompts — one per small, focused step. No "WRONG OUTPUTS" lists, no
 # rule recitations: just say what to produce.
 # -----------------------------------------------------------------------------
+BRIEF_SYSTEM_PROMPT = (
+    "Read the user's idea and turn it into a design brief that locks the "
+    "downstream prompt to what the user actually wants.\n"
+    "Return four fields:\n"
+    " - refined_idea: one sentence restating the idea concretely. Keep every "
+    "specific descriptor the user named (materials, patterns, named subjects, "
+    "settings, era). Do not invent new specifics; do not generalize away from "
+    "the user's wording.\n"
+    " - fixed_traits: short literal phrases that the user named or strongly "
+    "implied as mandatory. These are attributes that must appear verbatim in "
+    "every generated image and must NEVER become wildcards. Pull only what "
+    "the user already said; do not invent. Examples of the shape: a fabric "
+    "pattern the user named, a named subject, a specific location, a named "
+    "garment, a stated era. Each phrase is 1-5 words, no leading article.\n"
+    " - forbidden_axes: snake_case names of attribute axes whose values are "
+    "already pinned by fixed_traits and therefore must NOT become wildcard "
+    "placeholders. Derive these directly from fixed_traits (e.g. if a fixed "
+    "trait names a fabric pattern, the axis is 'pattern'; if it names a "
+    "location, the axis is 'location'). One- or two-word snake_case only.\n"
+    " - scene_bans: things that must not appear in the image, inferred from "
+    "negation language in the user's idea (\"no X\", \"without X\", \"never X\"). "
+    "Leave empty if the user did not negate anything.\n"
+    "Be conservative. If the user idea is vague, return empty lists rather "
+    "than guessing. The user can edit the brief afterwards.\n"
+    'Output JSON: {"refined_idea": "...", "fixed_traits": ["..."], '
+    '"forbidden_axes": ["..."], "scene_bans": ["..."]}'
+)
+
 PARSE_NEGATIVE_SYSTEM_PROMPT = (
     "Classify each item in a user's negative-prompt list as one of two kinds.\n"
     " - axis_ban: the item names a variable attribute axis that must NOT "
@@ -497,19 +526,30 @@ PARSE_NEGATIVE_SYSTEM_PROMPT = (
 DRAFT_SYSTEM_PROMPT = (
     "Write one image-prompt sentence from the user's idea and direction. "
     "Concrete, visual, present tense. No preamble, no quotes — sentence only.\n"
+    "If a list of fixed traits is provided, every phrase in that list MUST "
+    "appear verbatim (or as a near-identical substring) in the sentence. Do "
+    "not paraphrase, abstract, or substitute them.\n"
     "If a list of forbidden scene elements is provided, the sentence MUST "
-    "NOT depict or imply any of them (no clever rephrasings)."
+    "NOT depict or imply any of them (no clever rephrasings).\n"
+    "Stay tight to the user's idea. Do not add details that the idea does "
+    "not name or strongly imply."
 )
 
 WILDCARDIFY_SYSTEM_PROMPT = (
     "Rewrite the image-prompt sentence by replacing variable elements with "
     "__snake_case__ placeholders (double underscores on each side).\n"
-    "Pick the most impactful variables: subject action, pose, lighting, "
-    "mood, composition, props, materials, color palette, era markers — "
-    "whatever fits the sentence.\n"
+    "Pick the most impactful VARIABLE dimensions only: subject action, pose, "
+    "lighting, mood, composition, props, materials, color palette, era "
+    "markers — whatever fits the sentence and is not already fixed.\n"
+    "Fixed traits (provided in the user message) are mandatory specifics of "
+    "this concept. The phrases in that list MUST remain verbatim concrete "
+    "words in the rewritten sentence. You must NOT turn any fixed trait — or "
+    "any near-synonym of one — into a placeholder. The axes those fixed "
+    "traits sit on are also off-limits for placeholders.\n"
     "Stay within the placeholder count range you are given. To reach the "
-    "minimum, wildcardify additional variables; to stay under the maximum, "
-    "leave the rest as concrete words.\n"
+    "minimum, wildcardify additional VARIABLE dimensions; to stay under the "
+    "maximum, leave the rest as concrete words. Do not invent placeholders "
+    "for things the original sentence does not mention.\n"
     "If a list of forbidden placeholder names is provided, you MUST NOT "
     "create any of those placeholders. Keep that aspect as concrete words.\n"
     'Output JSON: {"prompt": "...with __placeholders__...", '
@@ -523,6 +563,8 @@ DESCRIBE_SYSTEM_PROMPT = (
     "wrong, broad enough to allow variety.\n"
     "Avoid bland category-only definitions like 'an outfit'. Reference the "
     "tone, era, setting, or aesthetic when relevant.\n"
+    "If a list of fixed traits is provided, no description may invite "
+    "values that contradict, replace, or restate any of those fixed traits.\n"
     "If a list of forbidden scene elements is provided, no description may "
     "invite values that introduce those elements.\n"
     'Output JSON: {"<name>": "<short description>", ...}'
@@ -545,6 +587,8 @@ LIST_SYSTEM_PROMPT = (
     "Existing values are forbidden and signal which combinations are "
     "already covered — your new values must explore combinations the pool "
     "has not.\n"
+    "If a list of fixed traits is provided, no value may contradict, "
+    "replace, or restate any of them.\n"
     "If a list of forbidden scene elements is provided, no value may "
     "contain or imply any of them.\n"
     'Output JSON: {"values": ["...", "...", ...]}'
@@ -553,6 +597,17 @@ LIST_SYSTEM_PROMPT = (
 
 # Light per-step JSON schemas. No `pattern` constraints, no GBNF — failures
 # surface as parse errors rather than getting masked by salvage paths.
+BRIEF_JSON_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "refined_idea": {"type": "string"},
+        "fixed_traits": {"type": "array", "items": {"type": "string"}},
+        "forbidden_axes": {"type": "array", "items": {"type": "string"}},
+        "scene_bans": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["refined_idea", "fixed_traits", "forbidden_axes", "scene_bans"],
+}
+
 PARSE_NEGATIVE_JSON_SCHEMA: dict = {
     "type": "object",
     "properties": {
@@ -853,6 +908,84 @@ class ManagerStepError(Exception):
         self.raw = raw or ""
 
 
+def _normalize_brief_list(raw, *, snake_case: bool = False) -> list[str]:
+    """Dedupe a list of strings from an LLM brief reply. When `snake_case` is
+    set, normalise to snake_case axis names (used for `forbidden_axes`)."""
+    out: list[str] = []
+    seen: set[str] = set()
+    if not isinstance(raw, list):
+        return out
+    for entry in raw:
+        s = str(entry or "").strip().strip('"').strip("'")
+        if not s:
+            continue
+        if snake_case:
+            n = _to_snake_case(s)
+            if not n or not _KEY_RE.match(n):
+                continue
+            if n in seen:
+                continue
+            seen.add(n)
+            out.append(n)
+        else:
+            key = s.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(s)
+    return out
+
+
+def _empty_brief() -> dict:
+    return {"refined_idea": "", "fixed_traits": [], "forbidden_axes": [],
+            "scene_bans": []}
+
+
+def normalize_brief(raw) -> dict:
+    """Coerce an arbitrary JSON object (LLM reply or user-edited widget) into
+    a clean brief dict with the four expected keys. Unknown keys are dropped,
+    list entries are deduped, axes are normalised to snake_case."""
+    if not isinstance(raw, dict):
+        return _empty_brief()
+    refined = str(raw.get("refined_idea") or "").strip()
+    fixed = _normalize_brief_list(raw.get("fixed_traits"))
+    axes = _normalize_brief_list(raw.get("forbidden_axes"), snake_case=True)
+    scene = _normalize_brief_list(raw.get("scene_bans"))
+    return {"refined_idea": refined, "fixed_traits": fixed,
+            "forbidden_axes": axes, "scene_bans": scene}
+
+
+def _format_fixed_traits(fixed_traits: list[str]) -> str:
+    """Render fixed_traits as a bullet list for injection into user messages.
+    Returns "" when the list is empty so callers can skip the section."""
+    if not fixed_traits:
+        return ""
+    return "\n".join(f"- {s}" for s in fixed_traits)
+
+
+def llm_design_brief(idea: str, direction_text: str, server: dict,
+                     seed: int = 0) -> tuple[dict, str]:
+    """Step 0 — turn the raw user idea into a structured design brief.
+
+    The brief locks specific phrases the user named (fixed_traits) so they
+    cannot drift downstream; the axes those phrases sit on (forbidden_axes)
+    are blocked from becoming wildcard placeholders. Returns (brief, raw_reply).
+    Empty idea short-circuits to an empty brief without calling the LLM."""
+    text = (idea or "").strip()
+    if not text:
+        return _empty_brief(), ""
+    parts = [f"User idea:\n{text}"]
+    if direction_text and direction_text.strip():
+        parts.append(f"Direction:\n{direction_text.strip()}")
+    parts.append("Output the JSON object now.")
+    user = "\n\n".join(parts)
+    raw = _server_call(server, BRIEF_SYSTEM_PROMPT, user,
+                       request_json=True, seed=seed,
+                       json_schema=BRIEF_JSON_SCHEMA)
+    parsed = _extract_json_object(raw)
+    return normalize_brief(parsed), raw
+
+
 def llm_parse_negative(negative_prompt: str, server: dict, seed: int = 0,
                        ) -> tuple[list[str], list[str], str]:
     """Step 0 — split the raw negative-prompt text into structured bans.
@@ -908,14 +1041,19 @@ def _format_scene_bans(scene_bans: list[str]) -> str:
 
 def llm_draft_prompt(idea: str, direction_text: str, server: dict,
                      seed: int = 0, scene_bans: list[str] | None = None,
+                     fixed_traits: list[str] | None = None,
                      ) -> tuple[str, str]:
     """Step 1 — turn the user idea + direction into a single image-prompt
-    sentence. `scene_bans` lists scene elements the sentence must avoid
-    (already extracted from the raw negative prompt by llm_parse_negative).
+    sentence. `scene_bans` lists scene elements the sentence must avoid;
+    `fixed_traits` lists literal phrases the sentence must contain (so the
+    LLM can't paraphrase away the user's required specifics).
     Returns (sentence, raw_reply)."""
     parts = [f"User idea:\n{(idea or '').strip() or '(no example provided)'}"]
     if direction_text and direction_text.strip():
         parts.append(f"Direction:\n{direction_text.strip()}")
+    fixed = _format_fixed_traits(fixed_traits or [])
+    if fixed:
+        parts.append(f"Fixed traits (must appear verbatim in the sentence):\n{fixed}")
     bans = _format_scene_bans(scene_bans or [])
     if bans:
         parts.append(f"Forbidden scene elements (must not appear):\n{bans}")
@@ -985,6 +1123,7 @@ def llm_wildcardify_prompt(draft_prompt: str, server: dict,
                            min_categories: int = 0,
                            max_categories: int = 0,
                            forbidden_names: list[str] | None = None,
+                           fixed_traits: list[str] | None = None,
                            ) -> tuple[str, list[str], str]:
     """Step 2 — rewrite the draft with __placeholders__ already inserted, plus
     the list of placeholder names. Returns (template, names, raw_reply).
@@ -1007,6 +1146,13 @@ def llm_wildcardify_prompt(draft_prompt: str, server: dict,
               prev_names: list[str] | None = None) -> tuple[str, list[str], list[str], str]:
         cap_line = _build_wildcardify_cap_line(lo, hi)
         parts = [f"Image prompt:\n{draft_prompt}"]
+        fixed_block = _format_fixed_traits(fixed_traits or [])
+        if fixed_block:
+            parts.append(
+                "Fixed traits (must remain verbatim concrete words; do NOT "
+                "wildcardify these or any near-synonym):\n"
+                f"{fixed_block}"
+            )
         if forbidden_set:
             listed = ", ".join(f"__{n}__" for n in sorted(forbidden_set))
             parts.append(
@@ -1080,6 +1226,7 @@ def llm_describe_wildcards(names: list[str], server: dict,
                            direction_text: str = "",
                            template: str = "",
                            scene_bans: list[str] | None = None,
+                           fixed_traits: list[str] | None = None,
                            ) -> tuple[dict[str, str], str]:
     """Step 3 — short shape-of-value description for each wildcard name.
     Returns (descriptions, raw_reply).
@@ -1099,6 +1246,12 @@ def llm_describe_wildcards(names: list[str], server: dict,
         parts.append(f"Direction:\n{direction_text.strip()}")
     if template and template.strip():
         parts.append(f"Prompt template:\n{template.strip()}")
+    fixed = _format_fixed_traits(fixed_traits or [])
+    if fixed:
+        parts.append(
+            "Fixed traits (no description may invite values that contradict, "
+            f"replace, or restate any of these):\n{fixed}"
+        )
     bans = _format_scene_bans(scene_bans or [])
     if bans:
         parts.append(f"Forbidden scene elements (no description may invite them):\n{bans}")
@@ -1125,6 +1278,7 @@ def llm_generate_value_list(category: str, description: str,
                             template: str = "",
                             direction_text: str = "",
                             scene_bans: list[str] | None = None,
+                            fixed_traits: list[str] | None = None,
                             ) -> tuple[list[str], str]:
     """Resolver step — generate distinct values for one wildcard slot.
 
@@ -1139,6 +1293,12 @@ def llm_generate_value_list(category: str, description: str,
         parts.append(f"Image prompt template:\n{template.strip()}")
     if direction_text and direction_text.strip():
         parts.append(f"Direction:\n{direction_text.strip()}")
+    fixed = _format_fixed_traits(fixed_traits or [])
+    if fixed:
+        parts.append(
+            "Fixed traits (no value may contradict, replace, or restate "
+            f"any of these):\n{fixed}"
+        )
     bans = _format_scene_bans(scene_bans or [])
     if bans:
         parts.append(f"Forbidden scene elements (no value may contain or imply them):\n{bans}")
@@ -1294,7 +1454,8 @@ def build_manager_snapshot(effective_categories: dict, *,
                            direction: str = "none",
                            negative_prompt: str = "",
                            generated_prompt: str = "",
-                           user_overrides: dict | None = None) -> dict:
+                           user_overrides: dict | None = None,
+                           brief: dict | None = None) -> dict:
     # The category list shown by the UI tracks the *current* template plus any
     # user override. We deliberately do NOT union in every disk file — that
     # would make the list look identical across runs regardless of the prompt.
@@ -1319,6 +1480,7 @@ def build_manager_snapshot(effective_categories: dict, *,
         "direction_presets": DIRECTION_PRESETS,
         "negative_prompt": negative_prompt,
         "generated_prompt": generated_prompt,
+        "brief": normalize_brief(brief) if brief is not None else _empty_brief(),
         "rows": rows,
     }
 
@@ -1347,7 +1509,16 @@ try:
         display_cats = {n: all_cats.get(n, DEFAULT_CATEGORIES.get(n, ""))
                         for n in sorted(used)}
 
-        snap = build_manager_snapshot(display_cats, generated_prompt=last_template)
+        last_brief: dict = _empty_brief()
+        if LAST_BRIEF_PATH.exists():
+            try:
+                last_brief = normalize_brief(json.loads(
+                    LAST_BRIEF_PATH.read_text(encoding="utf-8")))
+            except Exception:
+                last_brief = _empty_brief()
+        snap = build_manager_snapshot(display_cats,
+                                      generated_prompt=last_template,
+                                      brief=last_brief)
 
         if LAST_REPLY_PATH.exists():
             try:
@@ -1900,6 +2071,16 @@ class LLMWildcardManager:
                     "default": "{}",
                     "placeholder": "User overrides — edited via the table UI on the node.",
                 }),
+                # Hidden JSON widget mirroring the design brief
+                # (refined_idea, fixed_traits, forbidden_axes, scene_bans).
+                # Empty/default → the Manager calls the LLM to fill it.
+                # Non-empty → the Manager treats it as the user's edited brief
+                # and skips the LLM brief call. The UI panel reads/writes here.
+                "design_brief": ("STRING", {
+                    "multiline": True,
+                    "default": "{}",
+                    "placeholder": "Design brief — edited via the brief panel on the node.",
+                }),
             },
         }
 
@@ -1912,11 +2093,34 @@ class LLMWildcardManager:
     def manage(self, server, example_prompt, lock_template, seed, direction,
                negative_prompt, forbidden_placeholders,
                min_categories, max_categories,
-               system_prompt_override, categories):
+               system_prompt_override, categories,
+               design_brief=""):
         direction = (direction or "").strip() or "none"
         direction_text = resolve_direction(direction)
         negative = (negative_prompt or "").strip()
         forbidden_names = _parse_forbidden_names(forbidden_placeholders or "")
+
+        # Parse the user-edited brief (or default {}). Non-empty means the
+        # user has reviewed/edited the brief and the LLM brief step is skipped;
+        # empty means we run the LLM to generate one. The brief is the single
+        # source of truth for fixed_traits / forbidden_axes / scene_bans that
+        # the user can edit, on top of the implicit derivation from the idea.
+        user_brief: dict | None = None
+        brief_text = (design_brief or "").strip()
+        if brief_text and brief_text not in ("{}", ""):
+            try:
+                parsed_brief = json.loads(brief_text)
+                user_brief = normalize_brief(parsed_brief)
+                # An object whose fields are all empty is treated as "no brief"
+                # so the LLM still runs (avoids the UI default trapping users).
+                if not (user_brief["refined_idea"]
+                        or user_brief["fixed_traits"]
+                        or user_brief["forbidden_axes"]
+                        or user_brief["scene_bans"]):
+                    user_brief = None
+            except Exception as e:
+                print(f"[LLMWildcardManager] Bad design_brief JSON: {e}")
+                user_brief = None
 
         # `system_prompt_override` is kept on the input for backward compat,
         # but the manager now drives four small calls — a single override
@@ -1967,6 +2171,8 @@ class LLMWildcardManager:
         suggested_cats: dict[str, str] = {}
         used_names: list[str] = []
         scene_bans: list[str] = []
+        fixed_traits: list[str] = []
+        brief: dict = _empty_brief()
         status = "ok"
         status_message = ""
         raw_sections: list[tuple[str, str]] = []
@@ -2004,54 +2210,117 @@ class LLMWildcardManager:
                     "locked",
                     "(no cached template — toggle Lock off to generate)",
                 ))
+            # Pull the cached brief so the Resolver still gets fixed_traits /
+            # scene_bans even on the locked path.
+            if user_brief is not None:
+                brief = user_brief
+            elif LAST_BRIEF_PATH.exists():
+                try:
+                    brief = normalize_brief(json.loads(
+                        LAST_BRIEF_PATH.read_text(encoding="utf-8")))
+                except Exception:
+                    brief = _empty_brief()
+            fixed_traits = list(brief.get("fixed_traits") or [])
+            scene_bans = list(brief.get("scene_bans") or [])
         else:
             axis_bans: list[str] = []
             try:
-                # Step 0 — split the raw negative prompt into structured bans.
-                # axis_bans names attribute axes that MUST NOT become
-                # placeholders (e.g. 'no age' → 'age'); scene_bans names
-                # things that must not appear in the image.
+                # Step 0 — design brief. Distils the user's idea into
+                # refined_idea + fixed_traits (mandatory specifics that must
+                # appear verbatim) + forbidden_axes (axis names already pinned
+                # by fixed_traits, so they MUST NOT become wildcards) +
+                # scene_bans (things to keep out, inferred from negation in
+                # the idea). If the user already edited the brief on the node,
+                # we skip this LLM call and use their version as-is.
+                if user_brief is not None:
+                    brief = user_brief
+                    raw_sections.append((
+                        "brief",
+                        "(LLM brief skipped — using the edited brief from the node)",
+                    ))
+                else:
+                    brief, raw_brief = llm_design_brief(
+                        example_prompt or "", direction_text, server,
+                        seed=effective_seed,
+                    )
+                    raw_sections.append(("brief", raw_brief))
+
+                fixed_traits = list(brief.get("fixed_traits") or [])
+                brief_forbidden_axes = list(brief.get("forbidden_axes") or [])
+                brief_scene_bans = list(brief.get("scene_bans") or [])
+
+                # Step 0b — split the raw negative prompt (user-supplied free
+                # text) into structured bans. Skipped when the user left the
+                # negative_prompt empty.
+                raw_neg_axis_bans: list[str] = []
+                raw_neg_scene_bans: list[str] = []
                 if negative:
-                    axis_bans, scene_bans, raw_parse_neg = llm_parse_negative(
-                        negative, server, seed=effective_seed,
+                    raw_neg_axis_bans, raw_neg_scene_bans, raw_parse_neg = (
+                        llm_parse_negative(negative, server, seed=effective_seed)
                     )
                     raw_sections.append(("parse_negative", raw_parse_neg))
+                axis_bans = raw_neg_axis_bans
 
-                # Merge auto-derived axis bans into the user's explicit
-                # forbidden_placeholders list. This is the actual fix for
-                # 'no age, no gender' producing __age__/__gender__ anyway:
-                # the user no longer has to repeat themselves in two fields.
+                # Merge scene_bans from the brief + the parsed negative prompt.
+                scene_bans = []
+                seen_scene: set[str] = set()
+                for s in brief_scene_bans + raw_neg_scene_bans:
+                    key = s.lower()
+                    if key in seen_scene:
+                        continue
+                    seen_scene.add(key)
+                    scene_bans.append(s)
+
+                # Merge auto-derived axis bans (from brief + negative prompt)
+                # into the user's explicit forbidden_placeholders list. This
+                # is the actual fix for required attributes leaking into
+                # placeholders: 'a woman in a polkadot dress' → the brief
+                # produces forbidden_axes=['pattern'] → __pattern__ is denied.
                 effective_forbidden_names: list[str] = []
                 seen_forbidden: set[str] = set()
-                for n in axis_bans + forbidden_names:
+                for n in brief_forbidden_axes + raw_neg_axis_bans + forbidden_names:
                     if n and n not in seen_forbidden:
                         seen_forbidden.add(n)
                         effective_forbidden_names.append(n)
 
+                # Use the refined idea (when present) as the input for the
+                # drafting step — it keeps the LLM tighter to what the user
+                # actually asked for, while the raw idea remains available as
+                # extra context. Falls back to the raw idea when the brief
+                # produced nothing.
+                idea_for_draft = (brief.get("refined_idea") or "").strip() \
+                    or (example_prompt or "")
+
                 # Step 1 — draft the prompt sentence from idea + direction.
                 draft, raw_draft = llm_draft_prompt(
-                    example_prompt or "", direction_text, server,
+                    idea_for_draft, direction_text, server,
                     seed=effective_seed,
                     scene_bans=scene_bans,
+                    fixed_traits=fixed_traits,
                 )
                 raw_sections.append(("draft", raw_draft))
 
-                # Step 2 — wildcardify with the merged deny-list.
+                # Step 2 — wildcardify with the merged deny-list. Fixed traits
+                # are passed so the LLM is told not to wildcardify any of
+                # them; if it ignores the instruction, the forbidden_axes from
+                # the brief still strip the offending placeholders post-hoc.
                 template, used_names, raw_wildcardify = llm_wildcardify_prompt(
                     draft, server, seed=effective_seed,
                     min_categories=min_cats,
                     max_categories=max_cats,
                     forbidden_names=effective_forbidden_names,
+                    fixed_traits=fixed_traits,
                 )
                 raw_sections.append(("wildcardify", raw_wildcardify))
 
                 # Step 3 — describe each wildcard.
                 descs, raw_describe = llm_describe_wildcards(
                     used_names, server, seed=effective_seed,
-                    idea=example_prompt or "",
+                    idea=idea_for_draft,
                     direction_text=direction_text,
                     template=template,
                     scene_bans=scene_bans,
+                    fixed_traits=fixed_traits,
                 )
                 raw_sections.append(("describe", raw_describe))
                 suggested_cats = descs
@@ -2101,6 +2370,19 @@ class LLMWildcardManager:
             except Exception as e:
                 print(f"[LLMWildcardManager] Could not persist template: {e}")
 
+        # Persist the brief only when one was produced (success path or
+        # user-edited brief on the locked path). Failed runs should not
+        # poison the cache. The Resolver-only path picks this up too.
+        if status == "ok" and (brief.get("refined_idea")
+                               or brief.get("fixed_traits")
+                               or brief.get("forbidden_axes")
+                               or brief.get("scene_bans")):
+            try:
+                LAST_BRIEF_PATH.write_text(
+                    json.dumps(brief, indent=2), encoding="utf-8")
+            except Exception as e:
+                print(f"[LLMWildcardManager] Could not persist brief: {e}")
+
         # Persist the raw reply + status so the UI can show it after reload.
         try:
             LAST_REPLY_PATH.write_text(json.dumps({
@@ -2123,6 +2405,7 @@ class LLMWildcardManager:
             "flair": direction_text,
             "negative": negative,
             "scene_bans": list(scene_bans),
+            "fixed_traits": list(fixed_traits),
             "category_overrides": dict(effective),
             "intended_names": list(used_names),
         }
@@ -2138,6 +2421,7 @@ class LLMWildcardManager:
             negative_prompt=negative,
             generated_prompt=template,
             user_overrides=user_overrides,
+            brief=brief,
         )
         snapshot["raw_reply"] = raw_reply
         snapshot["status"] = status
@@ -2221,6 +2505,7 @@ class LLMWildcardResolver:
         flair_text = ""
         negative_text = ""
         scene_bans: list[str] = []
+        fixed_traits: list[str] = []
         intended_names: list[str] = []
         if isinstance(prompts, dict):
             flair_text = prompts.get("flair") or ""
@@ -2228,6 +2513,9 @@ class LLMWildcardResolver:
             raw_scene = prompts.get("scene_bans") or []
             if isinstance(raw_scene, list):
                 scene_bans = [str(s) for s in raw_scene if str(s).strip()]
+            raw_fixed = prompts.get("fixed_traits") or []
+            if isinstance(raw_fixed, list):
+                fixed_traits = [str(s) for s in raw_fixed if str(s).strip()]
             cfg_overrides = prompts.get("category_overrides") or {}
             if isinstance(cfg_overrides, dict):
                 categories.update(cfg_overrides)
@@ -2335,6 +2623,7 @@ class LLMWildcardResolver:
                     template=template or "",
                     direction_text=flair_text,
                     scene_bans=scene_bans,
+                    fixed_traits=fixed_traits,
                 )
                 rec["raw"] = raw
                 # Drop any LLM-returned values that violate the negative
@@ -2365,6 +2654,7 @@ class LLMWildcardResolver:
                             template=template or "",
                             direction_text=flair_text,
                             scene_bans=scene_bans,
+                            fixed_traits=fixed_traits,
                         )
                         rec["retry_raw"] = retry_raw
                         values = [v for v in retry_values

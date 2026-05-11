@@ -36,6 +36,65 @@ function writeCategoriesJSON(widget, rows) {
     widget.value = JSON.stringify(obj, null, 2);
 }
 
+// Design-brief widget helpers.
+// The brief mirrors the Python `normalize_brief` shape:
+//   { refined_idea: string, fixed_traits: [..], forbidden_axes: [..],
+//     scene_bans: [..] }
+// Empty/missing widget value means "let the LLM generate one"; any non-empty
+// content means "user has edited; use as-is and skip the LLM brief step".
+function emptyBrief() {
+    return { refined_idea: "", fixed_traits: [],
+             forbidden_axes: [], scene_bans: [] };
+}
+
+function readBriefJSON(widget) {
+    try {
+        const raw = JSON.parse(widget.value || "{}");
+        if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+            return emptyBrief();
+        }
+        const norm = emptyBrief();
+        if (typeof raw.refined_idea === "string") {
+            norm.refined_idea = raw.refined_idea;
+        }
+        for (const k of ["fixed_traits", "forbidden_axes", "scene_bans"]) {
+            if (Array.isArray(raw[k])) {
+                norm[k] = raw[k]
+                    .map(s => String(s ?? "").trim())
+                    .filter(Boolean);
+            }
+        }
+        return norm;
+    } catch {
+        return emptyBrief();
+    }
+}
+
+function briefIsEmpty(brief) {
+    return !brief.refined_idea
+        && !brief.fixed_traits.length
+        && !brief.forbidden_axes.length
+        && !brief.scene_bans.length;
+}
+
+function writeBriefJSON(widget, brief) {
+    // When empty, persist "{}" so the Manager treats it as "regenerate".
+    if (briefIsEmpty(brief)) {
+        widget.value = "{}";
+    } else {
+        widget.value = JSON.stringify(brief, null, 2);
+    }
+}
+
+// Snake_case axis names — keep parity with the Python `_to_snake_case`.
+function toSnakeCase(s) {
+    return String(s ?? "")
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9_]+/g, "_")
+        .replace(/^_+|_+$/g, "");
+}
+
 // Hide a built-in widget without removing it (so its value still serializes).
 function hideWidget(node, widget) {
     widget.computeSize = () => [0, -4];
@@ -415,6 +474,71 @@ function injectStyles() {
             display:flex; flex-direction:column; min-width:0; }
         .lwm-flex-fill > textarea {
             flex:1 1 auto; min-height:0; height:100%; width:100%; }
+        /* Design brief panel */
+        .lwm-brief-panel {
+            background:#13161a; border:1px solid #262a31; border-radius:5px;
+            padding:6px 8px; display:flex; flex-direction:column; gap:6px;
+            min-width:0; max-width:100%;
+        }
+        .lwm-brief-row { display:flex; gap:6px; align-items:flex-start;
+            min-width:0; max-width:100%; }
+        .lwm-brief-label {
+            flex:0 0 96px; font-size:10px; letter-spacing:.06em;
+            text-transform:uppercase; color:#7d8693; padding-top:6px;
+        }
+        .lwm-brief-field { flex:1 1 auto; min-width:0;
+            display:flex; flex-direction:column; gap:4px; }
+        .lwm-brief-idea {
+            background:#0f1114; color:#e6e6e6;
+            border:1px solid #2e3338; border-radius:4px;
+            padding:6px 8px; font-size:12px; line-height:1.4;
+            min-height:30px; outline:none;
+            font-family: ui-sans-serif, system-ui, sans-serif;
+            white-space:pre-wrap; word-break:break-word;
+        }
+        .lwm-brief-idea[contenteditable]:focus {
+            border-color:#4d8cd0; box-shadow:0 0 0 2px rgba(77,140,208,.18);
+        }
+        .lwm-brief-idea[contenteditable]:empty::before {
+            content: attr(data-placeholder);
+            color:#5a606a; pointer-events:none;
+        }
+        .lwm-chip-row { display:flex; flex-wrap:wrap; gap:4px;
+            align-items:center; min-width:0; }
+        .lwm-chip {
+            display:inline-flex; align-items:center; gap:4px;
+            padding:2px 4px 2px 8px; font-size:11px;
+            background:#1a2434; color:#9ec5ff; border:1px solid #2c4467;
+            border-radius:10px; max-width:100%; min-width:0;
+        }
+        .lwm-chip.lwm-chip-axis  { background:#152030; color:#9ec5ff; border-color:#2c4467; }
+        .lwm-chip.lwm-chip-scene { background:#281616; color:#ff9b9b; border-color:#5b2c2c; }
+        .lwm-chip.lwm-chip-fixed { background:#15281d; color:#9be8a4; border-color:#2c5b3a; }
+        .lwm-chip-text {
+            white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+            max-width:280px;
+        }
+        .lwm-chip-text[contenteditable] { cursor:text; min-width:14px;
+            white-space:nowrap; overflow:hidden; }
+        .lwm-chip-x {
+            width:16px; height:16px; line-height:14px;
+            text-align:center; cursor:pointer; border-radius:50%;
+            background:transparent; color:inherit; border:none;
+            font-size:12px; opacity:.7; padding:0;
+        }
+        .lwm-chip-x:hover { opacity:1; background:rgba(255,255,255,.08); }
+        .lwm-chip-add {
+            background:transparent; color:#7d8693;
+            border:1px dashed #3a4250; border-radius:10px;
+            padding:2px 8px; font-size:11px; cursor:text;
+            min-width:80px; outline:none;
+        }
+        .lwm-chip-add:focus { color:#e6e6e6; border-color:#4d8cd0; }
+        .lwm-chip-add[contenteditable]:empty::before {
+            content: attr(data-placeholder);
+            color:#5a606a; pointer-events:none;
+        }
+        .lwm-brief-empty { color:#6c7480; font-size:11px; font-style:italic; }
         .lwm-entries::-webkit-scrollbar, .lwm-textarea::-webkit-scrollbar,
         .lwm-prompt-panel::-webkit-scrollbar, .lwm-slot-detail::-webkit-scrollbar {
             width:8px; height:8px; }
@@ -475,6 +599,12 @@ app.registerExtension({
                 if (!jsonWidget) return;
                 hideWidget(node, jsonWidget);
 
+                // Hidden JSON widget mirroring the design brief. The Python
+                // side reads it; the brief panel below reads/writes it.
+                const briefWidget =
+                    node.widgets.find(w => w.name === "design_brief");
+                if (briefWidget) hideWidget(node, briefWidget);
+
                 // Shrink the oversized multiline STRING widgets so the node
                 // header doesn't eat all the space before the DOM table.
                 shrinkMultilineWidget(node, "example_prompt", 64);
@@ -526,6 +656,215 @@ app.registerExtension({
                     rawPanel.style.display = open ? "block" : "none";
                     updateManagerSize();
                 });
+
+                // ---- design brief panel ----
+                // Lets the user review and edit the auto-derived design brief
+                // (refined idea + fixed traits + forbidden axes + scene bans)
+                // before the next queue. Empty widget = "regenerate from the
+                // LLM"; any non-empty content = "use as-is and skip the brief
+                // LLM call". Edits flow into the hidden `design_brief` widget.
+
+                const briefLabel = document.createElement("div");
+                briefLabel.className = "lwm-section-label lwm-fixed";
+                briefLabel.style.display = "flex";
+                briefLabel.style.gap = "6px";
+                briefLabel.style.alignItems = "center";
+                const briefLabelText = document.createElement("span");
+                briefLabelText.style.flex = "1 1 auto";
+                briefLabelText.textContent =
+                    "Design brief — locks the LLM to the user's idea";
+                const briefRegenBtn = document.createElement("button");
+                briefRegenBtn.textContent = "↻ Regenerate brief";
+                briefRegenBtn.title =
+                    "Clear the edited brief so the next queue regenerates it " +
+                    "from your idea via the LLM";
+                briefRegenBtn.className = "lwm-btn lwm-btn-ghost";
+                briefRegenBtn.style.fontSize = "10px";
+                briefRegenBtn.style.padding = "3px 8px";
+                briefRegenBtn.style.letterSpacing = "0";
+                briefRegenBtn.style.textTransform = "none";
+                briefLabel.appendChild(briefLabelText);
+                briefLabel.appendChild(briefRegenBtn);
+                root.appendChild(briefLabel);
+
+                const briefPanel = document.createElement("div");
+                briefPanel.className = "lwm-brief-panel lwm-fixed";
+                root.appendChild(briefPanel);
+
+                // Local working copy of the brief; UI events mutate this, then
+                // commitBrief() pushes it back into the hidden widget.
+                let currentBrief = emptyBrief();
+                if (briefWidget) currentBrief = readBriefJSON(briefWidget);
+
+                function commitBrief() {
+                    if (briefWidget) writeBriefJSON(briefWidget, currentBrief);
+                    node.setDirtyCanvas(true, true);
+                }
+
+                // Build a removable chip. `value` is the visible text, `kind`
+                // controls colour, `onChange` receives the edited text on blur
+                // (empty/duplicate values are pruned by the caller), `onRemove`
+                // deletes the chip.
+                function buildChip(value, kind, onChange, onRemove) {
+                    const chip = document.createElement("span");
+                    chip.className = `lwm-chip lwm-chip-${kind}`;
+                    const txt = makeEditable("", value);
+                    txt.className = "lwm-chip-text";
+                    txt.addEventListener("blur", () => {
+                        const next = (txt.textContent || "").trim();
+                        onChange(next);
+                    });
+                    const rm = document.createElement("button");
+                    rm.className = "lwm-chip-x";
+                    rm.textContent = "×";
+                    rm.title = "Remove";
+                    rm.addEventListener("click", () => onRemove());
+                    chip.appendChild(txt);
+                    chip.appendChild(rm);
+                    return chip;
+                }
+
+                // Build the "+" adder element for a chip row. On Enter or blur
+                // (with content), pushes the value into `list` via `onAdd` and
+                // re-renders the row.
+                function buildChipAdd(placeholder, onAdd) {
+                    const add = document.createElement("span");
+                    add.className = "lwm-chip-add";
+                    add.setAttribute("contenteditable",
+                        add.contentEditable === "plaintext-only"
+                            ? "plaintext-only" : "true");
+                    add.dataset.placeholder = placeholder;
+                    add.spellcheck = false;
+                    add.setAttribute("data-1p-ignore", "true");
+                    add.setAttribute("data-lpignore", "true");
+                    function commitAdd() {
+                        const v = (add.textContent || "").trim();
+                        add.textContent = "";
+                        if (v) onAdd(v);
+                    }
+                    add.addEventListener("keydown", (e) => {
+                        if (e.key === "Enter" || e.key === ",") {
+                            e.preventDefault();
+                            commitAdd();
+                        }
+                    });
+                    add.addEventListener("blur", commitAdd);
+                    return add;
+                }
+
+                function renderBrief() {
+                    briefPanel.innerHTML = "";
+
+                    // Refined idea row.
+                    const ideaRow = document.createElement("div");
+                    ideaRow.className = "lwm-brief-row";
+                    const ideaLabel = document.createElement("div");
+                    ideaLabel.className = "lwm-brief-label";
+                    ideaLabel.textContent = "Refined idea";
+                    const ideaField = document.createElement("div");
+                    ideaField.className = "lwm-brief-field";
+                    const ideaEdit = document.createElement("div");
+                    ideaEdit.className = "lwm-brief-idea";
+                    ideaEdit.setAttribute("contenteditable",
+                        ideaEdit.contentEditable === "plaintext-only"
+                            ? "plaintext-only" : "true");
+                    ideaEdit.dataset.placeholder =
+                        "(no brief yet — queue the workflow to generate one " +
+                        "from your idea)";
+                    ideaEdit.spellcheck = false;
+                    ideaEdit.textContent = currentBrief.refined_idea || "";
+                    ideaEdit.addEventListener("blur", () => {
+                        const v = (ideaEdit.textContent || "").trim();
+                        if (v === currentBrief.refined_idea) return;
+                        currentBrief.refined_idea = v;
+                        commitBrief();
+                    });
+                    ideaField.appendChild(ideaEdit);
+                    ideaRow.appendChild(ideaLabel);
+                    ideaRow.appendChild(ideaField);
+                    briefPanel.appendChild(ideaRow);
+
+                    // Build a chip-list row for one of the three array fields.
+                    function buildListRow(labelText, key, kind, addPh, normFn) {
+                        const row = document.createElement("div");
+                        row.className = "lwm-brief-row";
+                        const lab = document.createElement("div");
+                        lab.className = "lwm-brief-label";
+                        lab.textContent = labelText;
+                        const field = document.createElement("div");
+                        field.className = "lwm-brief-field";
+                        const chips = document.createElement("div");
+                        chips.className = "lwm-chip-row";
+                        const items = currentBrief[key] || [];
+                        items.forEach((val, idx) => {
+                            chips.appendChild(buildChip(val, kind,
+                                (next) => {
+                                    const v = normFn ? normFn(next) : next;
+                                    if (!v) {
+                                        currentBrief[key].splice(idx, 1);
+                                    } else {
+                                        // Dedupe against the rest of the list.
+                                        const dup = currentBrief[key].some(
+                                            (x, j) => j !== idx && x === v);
+                                        if (dup) {
+                                            currentBrief[key].splice(idx, 1);
+                                        } else {
+                                            currentBrief[key][idx] = v;
+                                        }
+                                    }
+                                    commitBrief();
+                                    renderBrief();
+                                    updateManagerSize();
+                                },
+                                () => {
+                                    currentBrief[key].splice(idx, 1);
+                                    commitBrief();
+                                    renderBrief();
+                                    updateManagerSize();
+                                }
+                            ));
+                        });
+                        chips.appendChild(buildChipAdd(addPh, (val) => {
+                            const v = normFn ? normFn(val) : val.trim();
+                            if (!v) return;
+                            if (!currentBrief[key].includes(v)) {
+                                currentBrief[key].push(v);
+                            }
+                            commitBrief();
+                            renderBrief();
+                            updateManagerSize();
+                        }));
+                        field.appendChild(chips);
+                        row.appendChild(lab);
+                        row.appendChild(field);
+                        briefPanel.appendChild(row);
+                    }
+
+                    buildListRow(
+                        "Fixed traits", "fixed_traits", "fixed",
+                        "+ add trait",
+                        (v) => String(v ?? "").trim(),
+                    );
+                    buildListRow(
+                        "Forbidden axes", "forbidden_axes", "axis",
+                        "+ add axis (snake_case)",
+                        (v) => toSnakeCase(v),
+                    );
+                    buildListRow(
+                        "Scene bans", "scene_bans", "scene",
+                        "+ add ban",
+                        (v) => String(v ?? "").trim(),
+                    );
+                }
+
+                briefRegenBtn.addEventListener("click", () => {
+                    currentBrief = emptyBrief();
+                    commitBrief();
+                    renderBrief();
+                    updateManagerSize();
+                });
+
+                renderBrief();
 
                 // ---- categories toolbar (fixed) ----
                 const headLabel = document.createElement("div");
@@ -735,6 +1074,26 @@ app.registerExtension({
                     renderPrompt(snapshot?.generated_prompt, snapshot?.status);
                     renderStatus(snapshot?.status, snapshot?.status_message);
                     renderRawReply(snapshot?.raw_reply, snapshot?.status);
+                    // Adopt the brief from the snapshot only when the user
+                    // hasn't already edited one on the node — preserves
+                    // in-flight edits across re-execute / state refreshes.
+                    const widgetBrief = briefWidget
+                        ? readBriefJSON(briefWidget) : emptyBrief();
+                    const userHasEdits = !briefIsEmpty(widgetBrief);
+                    if (!userHasEdits && snapshot?.brief) {
+                        const snap = snapshot.brief;
+                        currentBrief = {
+                            refined_idea: snap.refined_idea || "",
+                            fixed_traits: Array.isArray(snap.fixed_traits)
+                                ? snap.fixed_traits.slice() : [],
+                            forbidden_axes: Array.isArray(snap.forbidden_axes)
+                                ? snap.forbidden_axes.slice() : [],
+                            scene_bans: Array.isArray(snap.scene_bans)
+                                ? snap.scene_bans.slice() : [],
+                        };
+                        commitBrief();
+                        renderBrief();
+                    }
                     for (const r of (snapshot?.rows || [])) {
                         list.appendChild(buildRow({
                             name: r.name,
@@ -756,6 +1115,10 @@ app.registerExtension({
                         list.appendChild(buildRow({
                             name: n, desc: d, user_override: true,
                         }));
+                    }
+                    if (briefWidget) {
+                        currentBrief = readBriefJSON(briefWidget);
+                        renderBrief();
                     }
                     updateManagerSize();
                 }
