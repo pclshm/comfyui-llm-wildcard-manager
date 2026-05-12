@@ -480,35 +480,34 @@ def resolve_direction(direction: str) -> str:
 # -----------------------------------------------------------------------------
 BRIEF_SYSTEM_PROMPT = (
     "The user gives you a seed idea — usually a short concept, not a finished "
-    "scene. Your job is to invent a vivid scenario around that seed and "
-    "package it as a design brief. Downstream steps will turn the scenario "
-    "into a wildcard template so MANY varied images of this same scenario "
-    "can be generated.\n"
+    "scene. Invent a vivid scenario around that seed and package it as a "
+    "design brief. Downstream steps will turn the scenario into a wildcard "
+    "template so MANY varied images of this same scenario can be generated.\n"
     "Return four fields:\n"
-    " - refined_idea: two or three sentences describing a concrete imagined "
-    "scenario built from the user's seed. INVENT the supporting details the "
-    "user did not specify: setting, time of day, atmosphere, what the subject "
-    "is doing, framing, mood, era, supporting elements. Be specific and "
-    "evocative — picture an actual moment, not a category. Do not contradict "
-    "anything the user explicitly said; expand around it.\n"
-    " - fixed_traits: short literal phrases that the user explicitly named "
-    "(or unambiguously implied) as mandatory. These will appear verbatim in "
-    "every generated image and must NEVER become wildcards. Pull only what "
-    "the user already said; do NOT include details you invented in "
-    "refined_idea. Each phrase 1-5 words, no leading article. Examples of "
-    "shape: a fabric pattern the user named, a named subject, a specific "
-    "location, a named garment, a stated era.\n"
-    " - forbidden_axes: snake_case names of attribute axes whose values are "
-    "already pinned by fixed_traits and therefore must NOT become wildcard "
-    "placeholders. Derive these directly from fixed_traits (e.g. a named "
-    "fabric pattern → 'pattern'; a stated location → 'location'). "
-    "One- or two-word snake_case only. Empty list if no fixed_traits.\n"
-    " - scene_bans: things that must not appear in the image, inferred from "
-    "negation language in the user's idea (\"no X\", \"without X\", \"never X\"). "
-    "Leave empty if the user did not negate anything.\n"
-    "Invent confidently in refined_idea; stay strict and literal in "
-    "fixed_traits / forbidden_axes / scene_bans. The user can edit the "
-    "brief afterwards.\n"
+    " - refined_idea: ONE or TWO sentences describing a concrete imagined "
+    "moment built from the user's seed. Invent supporting detail the user "
+    "did not specify (setting, time, atmosphere, framing, era) but stay "
+    "lean — this is a brief, not a paragraph. Do not contradict anything "
+    "the user said.\n"
+    " - fixed_traits: short LITERAL NOUN PHRASES the user explicitly named "
+    "(subject, named object, garment, fabric/pattern, named location, "
+    "stated era). 1-5 words each, no leading article, no verbs, no actions, "
+    "no moods, no atmospherics. \"brewing a potion\" is an ACTIVITY and "
+    "does NOT belong here. \"potion\" (the object) does. Pull only what "
+    "the user wrote — never invent fixed_traits from refined_idea.\n"
+    " - forbidden_axes: snake_case axis names that are already pinned by a "
+    "concrete fixed_trait and therefore must NOT become wildcard "
+    "placeholders. Derive ONLY from concrete fixed_traits (e.g. a named "
+    "fabric pattern → 'pattern'; a named garment → 'garment'; a stated "
+    "location → 'location'). Do NOT include generic axes like 'subject', "
+    "'subject_role', 'activity', 'action', 'mood' — those would gut the "
+    "variation space. One- or two-word snake_case only. Empty list if no "
+    "concrete fixed_traits.\n"
+    " - scene_bans: items the user explicitly negated (\"no X\", \"without X\", "
+    "\"never X\"). Output each ban as the bare noun phrase from the user's "
+    "text. Do NOT generalize \"no phone\" into \"smart devices\" or \"modern "
+    "technology\" — keep one entry per thing the user actually named. Empty "
+    "list if the user did not negate anything.\n"
     'Output JSON: {"refined_idea": "...", "fixed_traits": ["..."], '
     '"forbidden_axes": ["..."], "scene_bans": ["..."]}\n'
     "\n"
@@ -516,13 +515,14 @@ BRIEF_SYSTEM_PROMPT = (
     "User idea: a witch in a tartan cloak brewing a potion, no phone\n"
     "Output:\n"
     '{"refined_idea": "An elderly witch hunches over a bubbling copper '
-    "cauldron in a cluttered stone cottage at midnight, stirring a luminous "
-    "green potion with a gnarled wooden ladle while moonlight pours through "
-    "a leaded window across shelves crowded with corked bottles and dried "
-    'herbs.", '
+    "cauldron in a stone cottage at midnight, stirring a luminous green "
+    'potion as moonlight pours through a leaded window.", '
     '"fixed_traits": ["witch", "tartan cloak", "potion"], '
-    '"forbidden_axes": ["subject", "garment", "pattern"], '
-    '"scene_bans": ["phone"]}'
+    '"forbidden_axes": ["garment", "pattern"], '
+    '"scene_bans": ["phone"]}\n'
+    "(Note: 'brewing a potion' is NOT a fixed_trait — it's an activity. "
+    "'subject' / 'activity' are NOT forbidden_axes — those need to vary. "
+    "'phone' was not expanded to 'modern technology'.)"
 )
 
 PARSE_NEGATIVE_SYSTEM_PROMPT = (
@@ -550,83 +550,92 @@ PARSE_NEGATIVE_SYSTEM_PROMPT = (
 )
 
 DRAFT_SYSTEM_PROMPT = (
-    "Write one rich image-prompt sentence that fully realises the scenario "
-    "described in the user message. Concrete, visual, present tense. No "
-    "preamble, no quotes — sentence only.\n"
-    "Flesh the scenario out with specific visual content: the subject and "
-    "what they are doing, their clothing or appearance, the setting and "
-    "props, the lighting and atmosphere, the framing or composition, the "
-    "overall mood. Pack in concrete details — this single sentence is the "
-    "blueprint for many generated images, so it must paint a vivid picture, "
-    "not stay abstract. Aim for a long, descriptive sentence (comma-joined "
-    "clauses are fine).\n"
+    "Write ONE image-prompt sentence that realises the scenario in the user "
+    "message. Concrete, visual, present tense. No preamble, no quotes — the "
+    "sentence only.\n"
+    "Hard length budget: 25-45 words, ONE sentence, at most three "
+    "comma-joined clauses. This is a tight blueprint, not a paragraph — "
+    "wildcardification happens in the next step, so leave room. Do NOT "
+    "stack decorative subclauses (\"capturing a moment of...\", "
+    "\"evoking a sense of...\", \"as if suspended in time\"). Do NOT "
+    "restate the same element twice with different adjectives.\n"
+    "Name the SUBJECT, what they are DOING, the SETTING, and the LIGHTING. "
+    "Stop there. Mood and meta-commentary are forbidden.\n"
     "If a list of fixed traits is provided, every phrase in that list MUST "
-    "appear verbatim (or as a near-identical substring) in the sentence. Do "
-    "not paraphrase, abstract, or substitute them. Build the rest of the "
-    "scene around those locked phrases.\n"
+    "appear verbatim (or as a near-identical substring) in the sentence. "
+    "Do not paraphrase or substitute them.\n"
     "If a list of forbidden scene elements is provided, the sentence MUST "
-    "NOT depict or imply any of them (no clever rephrasings).\n"
-    "Do not contradict the scenario the user gave you, but you SHOULD invent "
-    "concrete supporting detail that fits it. The point is a fully imagined "
-    "scene, not a restatement of the seed idea.\n"
+    "NOT depict or imply any of them.\n"
     "\n"
     "Example —\n"
-    "User idea: an elderly witch brewing a potion in a stone cottage at "
-    "midnight\n"
+    "User idea: An elderly witch hunches over a bubbling copper cauldron "
+    "in a stone cottage at midnight, stirring a luminous green potion as "
+    "moonlight pours through a leaded window.\n"
     "Fixed traits: witch, tartan cloak, potion\n"
     "Forbidden scene elements: phone\n"
     "Output:\n"
-    "An elderly witch in a heavy tartan cloak hunches over a bubbling copper "
-    "cauldron in a cluttered stone cottage at midnight, stirring a luminous "
-    "green potion with a gnarled wooden ladle as moonlight spills through "
-    "the leaded window behind her, glinting off rows of corked bottles and "
-    "bundles of dried herbs hanging from the rafters."
+    "An elderly witch in a tartan cloak stirs a luminous green potion in a "
+    "bubbling copper cauldron inside a stone cottage at midnight, lit by "
+    "moonlight through a leaded window."
 )
 
 WILDCARDIFY_SYSTEM_PROMPT = (
-    "Rewrite the image-prompt sentence by replacing variable elements with "
-    "__snake_case__ placeholders (double underscores on each side). The "
-    "rewritten template will be sampled many times to produce a diverse set "
-    "of images that all depict the SAME scenario — so the placeholders you "
-    "pick should be the dimensions that most usefully vary between those "
-    "images.\n"
-    "Pick the most impactful VARIABLE dimensions only: subject action, pose, "
-    "lighting, mood, composition, props, materials, color palette, era "
-    "markers — whatever fits the sentence and is not already fixed.\n"
-    "Fixed traits (provided in the user message) are mandatory specifics of "
-    "this concept. The phrases in that list MUST remain verbatim concrete "
-    "words in the rewritten sentence. You must NOT turn any fixed trait — or "
-    "any near-synonym of one — into a placeholder. The axes those fixed "
-    "traits sit on are also off-limits for placeholders.\n"
-    "Stay within the placeholder count range you are given. To reach the "
-    "minimum, wildcardify additional VARIABLE dimensions; to stay under the "
-    "maximum, leave the rest as concrete words. Do not invent placeholders "
-    "for things the original sentence does not mention.\n"
+    "Rewrite the image-prompt sentence by REPLACING individual words or "
+    "short phrases with __snake_case__ placeholders (double underscores "
+    "each side). The rewritten template is sampled many times to produce "
+    "varied images of the SAME scenario, so placeholders mark the "
+    "dimensions that should vary.\n"
+    "\n"
+    "HARD RULES — break any of these and the output is unusable:\n"
+    " 1. REPLACE-ONLY. Do not add new clauses, new sentences, new "
+    "descriptive phrases, or new content of any kind to fit more "
+    "placeholders. The rewritten sentence must be roughly the same length "
+    "as the input and have the same clause structure. If you cannot reach "
+    "the minimum placeholder count without adding text, output FEWER "
+    "placeholders.\n"
+    " 2. The \"prompt\" field contains the rewritten sentence and NOTHING "
+    "else. No thinking, no notes, no \"Wait, let me also...\", no "
+    "bullet lists, no markdown. Pure sentence.\n"
+    " 3. The \"categories\" array contains BARE snake_case names: "
+    '["age", "lighting"]. Never with underscores around them: '
+    'NOT ["__age__", "__lighting__"].\n'
+    " 4. Each placeholder name appears EXACTLY ONCE in the sentence. No "
+    "duplicate placeholders.\n"
+    " 5. Pick concrete VISUAL dimensions tied to specific words in the "
+    "sentence (the colour of a thing, the material of a thing, the time, "
+    "the lighting). Avoid catch-all buckets like __mood__, "
+    "__color_palette__, __composition__, __atmosphere__, __era_markers__, "
+    "__materials__, __props__ — those don't map to specific words and "
+    "produce abstract slop at sampling time.\n"
+    "\n"
+    "Fixed traits (provided in the user message) must remain verbatim "
+    "concrete words. You must NOT turn any fixed trait — or any "
+    "near-synonym of one — into a placeholder. The axes those fixed "
+    "traits sit on are off-limits.\n"
     "If a list of forbidden placeholder names is provided, you MUST NOT "
-    "create any of those placeholders. Keep that aspect as concrete words.\n"
+    "create any of those.\n"
+    "Stay within the placeholder count range. Prefer the lower end if the "
+    "sentence is short.\n"
     'Output JSON: {"prompt": "...with __placeholders__...", '
     '"categories": ["name1", "name2", ...]}\n'
     "\n"
     "Example —\n"
-    "Image prompt: An elderly witch in a heavy tartan cloak hunches over a "
-    "bubbling copper cauldron in a cluttered stone cottage at midnight, "
-    "stirring a luminous green potion with a gnarled wooden ladle as "
-    "moonlight spills through the leaded window behind her, glinting off "
-    "rows of corked bottles and bundles of dried herbs hanging from the "
-    "rafters.\n"
+    "Image prompt: An elderly witch in a tartan cloak stirs a luminous "
+    "green potion in a bubbling copper cauldron inside a stone cottage at "
+    "midnight, lit by moonlight through a leaded window.\n"
     "Fixed traits: witch, tartan cloak, potion\n"
-    "Use between 6 and 10 placeholders.\n"
+    "Forbidden placeholder names: __garment__, __pattern__\n"
+    "Use between 5 and 8 placeholders.\n"
     "Output:\n"
-    '{"prompt": "An __age__ witch in a heavy tartan cloak hunches over a '
-    "__cauldron_state__ copper cauldron in a __setting__ at __time__, "
-    "stirring a __potion_color__ potion with a __tool__ as __lighting__ "
-    "spills through the __window_style__ window behind her, glinting off "
-    'rows of __shelf_items__ hanging from the rafters.", '
-    '"categories": ["age", "cauldron_state", "setting", "time", '
-    '"potion_color", "tool", "lighting", "window_style", "shelf_items"]}\n'
-    "(Note how 'witch', 'tartan cloak', and 'potion' stayed verbatim — "
-    "they are fixed traits — and no placeholder was created for subject, "
-    "garment, or pattern.)"
+    '{"prompt": "An __age__ witch in a tartan cloak stirs a '
+    "__potion_color__ potion in a bubbling __cauldron_material__ "
+    "cauldron inside a __setting__ at __time__, lit by __lighting__ "
+    'through a __window_style__ window.", '
+    '"categories": ["age", "potion_color", "cauldron_material", '
+    '"setting", "time", "lighting", "window_style"]}\n'
+    "(Note: same sentence length and shape as the input — only words were "
+    "swapped, no clauses added. 'witch', 'tartan cloak', and 'potion' "
+    "stayed verbatim. No __garment__, __pattern__, or generic __mood__.)"
 )
 
 DESCRIBE_SYSTEM_PROMPT = (
@@ -643,19 +652,20 @@ DESCRIBE_SYSTEM_PROMPT = (
     'Output JSON: {"<name>": "<short description>", ...}\n'
     "\n"
     "Example —\n"
-    "Prompt template: An __age__ witch ... stirring a __potion_color__ "
-    "potion with a __tool__ as __lighting__ spills through the window.\n"
-    "Wildcard names: age, potion_color, tool, lighting\n"
+    "Prompt template: An __age__ witch in a tartan cloak stirs a "
+    "__potion_color__ potion in a bubbling __cauldron_material__ cauldron "
+    "inside a __setting__ at __time__, lit by __lighting__ through a "
+    "__window_style__ window.\n"
+    "Wildcard names: age, potion_color, lighting, window_style\n"
     "Output:\n"
     '{"age": "an adult age band fitting a seasoned witch — middle-aged, '
     'elderly, ancient, weathered crone", '
     '"potion_color": "an eerie luminous brew color seen at midnight — '
     'viridian, sulphur yellow, bruised purple, blood crimson", '
-    '"tool": "a hand-held stirring implement fitting a rustic witch '
-    "workshop — gnarled wooden ladle, bone wand, twisted iron rod, "
-    'antler spoon", '
     '"lighting": "cold nocturnal light entering the cottage — silver '
-    'moonlight, pale starlight, faint blue dusk-glow"}'
+    'moonlight, pale starlight, faint blue dusk-glow", '
+    '"window_style": "a leaded or shuttered cottage window in '
+    'rustic stonework — diamond-paned, mullioned, narrow arched slit"}'
 )
 
 ALIGN_SYSTEM_PROMPT = (
@@ -691,20 +701,20 @@ LIST_SYSTEM_PROMPT = (
     'Output JSON: {"values": ["...", "...", ...]}\n'
     "\n"
     "Example —\n"
-    "Category: tool\n"
-    "Description: a hand-held stirring implement fitting a rustic witch "
-    "workshop\n"
-    "Image prompt template: An __age__ witch ... stirring a "
-    "__potion_color__ potion with a __tool__ as __lighting__ spills "
-    "through the window.\n"
-    "Already used: gnarled wooden ladle\n"
+    "Category: potion_color\n"
+    "Description: an eerie luminous brew color seen at midnight — viridian, "
+    "sulphur yellow, bruised purple, blood crimson\n"
+    "Image prompt template: An __age__ witch in a tartan cloak stirs a "
+    "__potion_color__ potion in a bubbling __cauldron_material__ cauldron "
+    "inside a __setting__ at __time__.\n"
+    "Already used: viridian\n"
     "Produce 5 distinct new values.\n"
     "Output:\n"
-    '{"values": ["bone-handled iron spoon", "twisted antler wand", '
-    '"blackened copper stirring rod", "polished river-stone pestle", '
-    '"hooked silver ladle inlaid with runes"]}\n'
-    "(Note how each entry varies on a different dimension — material, "
-    "shape, ornament — rather than restating 'wooden ladle' in synonyms.)"
+    '{"values": ["sulphur yellow", "bruised purple", "blood crimson", '
+    '"glacier blue", "ember orange"]}\n'
+    "(Note how each entry varies on the color dimension — not on material "
+    "or shape — and none restate 'viridian' in a near-synonym like "
+    "'emerald green'.)"
 )
 
 
@@ -1276,8 +1286,13 @@ def llm_wildcardify_prompt(draft_prompt: str, server: dict,
             parts.append(cap_line)
         if attempt > 0 and prev_count >= 0 and lo and prev_count < lo:
             parts.append(
-                f"Previous attempt produced {prev_count} placeholder(s); "
-                f"need at least {lo}. Keep them and add more.\n"
+                f"Previous attempt produced only {prev_count} placeholder(s); "
+                f"need at least {lo}. Find {lo - prev_count} more candidate "
+                "word(s) ALREADY PRESENT in the original image prompt above "
+                "and replace them with placeholders. Do NOT add new clauses, "
+                "new descriptive phrases, or invent dimensions that weren't "
+                "in the original sentence. The sentence length must stay "
+                "roughly the same.\n"
                 f"Previous template:\n{prev_template}"
             )
         parts.append("Output the JSON object now.")
