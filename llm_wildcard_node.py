@@ -491,62 +491,40 @@ BRIEF_SYSTEM_PROMPT = (
     "the user said.\n"
     " - fixed_traits: short LITERAL NOUN PHRASES the user explicitly named "
     "(subject, named object, garment, fabric/pattern, named location, "
-    "stated era). 1-5 words each, no leading article, no verbs, no actions, "
-    "no moods, no atmospherics. \"brewing a potion\" is an ACTIVITY and "
-    "does NOT belong here. \"potion\" (the object) does. Pull only what "
-    "the user wrote — never invent fixed_traits from refined_idea.\n"
+    "stated era). 1-5 words each, no leading article. No verbs. No "
+    "activities or actions (a verb phrase describing what the subject is "
+    "doing is NOT a fixed_trait — keep only the object/actor nouns from "
+    "that phrase). No moods. No atmospherics. Pull only what the user "
+    "wrote — never invent fixed_traits from refined_idea.\n"
     " - forbidden_axes: snake_case axis names that are already pinned by a "
     "concrete fixed_trait and therefore must NOT become wildcard "
-    "placeholders. Derive ONLY from concrete fixed_traits (e.g. a named "
-    "fabric pattern → 'pattern'; a named garment → 'garment'; a stated "
-    "location → 'location'). Do NOT include generic axes like 'subject', "
+    "placeholders. Derive ONLY from concrete fixed_traits (a named "
+    "pattern → 'pattern'; a named garment → 'garment'; a stated location "
+    "→ 'location'). Do NOT include generic axes like 'subject', "
     "'subject_role', 'activity', 'action', 'mood' — those would gut the "
     "variation space. One- or two-word snake_case only. Empty list if no "
     "concrete fixed_traits.\n"
     " - scene_bans: items the user explicitly negated (\"no X\", \"without X\", "
     "\"never X\"). Output each ban as the bare noun phrase from the user's "
-    "text. Do NOT generalize \"no phone\" into \"smart devices\" or \"modern "
-    "technology\" — keep one entry per thing the user actually named. Empty "
-    "list if the user did not negate anything.\n"
+    "text. Do NOT generalize a specific banned item into a broader category "
+    "(if the user named one object, ban that object — not its whole class). "
+    "Keep one entry per thing the user actually named. Empty list if the "
+    "user did not negate anything.\n"
     'Output JSON: {"refined_idea": "...", "fixed_traits": ["..."], '
-    '"forbidden_axes": ["..."], "scene_bans": ["..."]}\n'
-    "\n"
-    "Example —\n"
-    "User idea: a witch in a tartan cloak brewing a potion, no phone\n"
-    "Output:\n"
-    '{"refined_idea": "An elderly witch hunches over a bubbling copper '
-    "cauldron in a stone cottage at midnight, stirring a luminous green "
-    'potion as moonlight pours through a leaded window.", '
-    '"fixed_traits": ["witch", "tartan cloak", "potion"], '
-    '"forbidden_axes": ["garment", "pattern"], '
-    '"scene_bans": ["phone"]}\n'
-    "(Note: 'brewing a potion' is NOT a fixed_trait — it's an activity. "
-    "'subject' / 'activity' are NOT forbidden_axes — those need to vary. "
-    "'phone' was not expanded to 'modern technology'.)"
+    '"forbidden_axes": ["..."], "scene_bans": ["..."]}'
 )
 
 PARSE_NEGATIVE_SYSTEM_PROMPT = (
     "Classify each item in a user's negative-prompt list as one of two kinds.\n"
-    " - axis_ban: the item names a variable attribute axis that must NOT "
-    "become a wildcard placeholder. The downstream wildcardifier will refuse "
-    "to create that placeholder. Examples: 'no age', 'no gender', "
-    "'no ethnicity', 'no body type'. Output the snake_case axis name only "
-    "(e.g. 'age', 'gender', 'body_type').\n"
-    " - scene_ban: the item names a thing or quality that must NOT appear in "
-    "the image (objects, props, atmosphere, composition, text). Output the "
-    "item as a short phrase suitable for 'do not depict ___'. Examples: "
-    "'no phone', 'no text', 'multiple images in one'.\n"
+    " - axis_ban: the item names a variable attribute axis (a dimension of "
+    "the subject, not a thing in the scene) that must NOT become a wildcard "
+    "placeholder. Output the snake_case axis name only.\n"
+    " - scene_ban: the item names a thing or quality that must NOT appear "
+    "in the image (objects, props, atmosphere, composition, text). Output "
+    "the item as a short phrase suitable for 'do not depict ___'.\n"
     "If unsure, prefer scene_ban — only mark as axis_ban when the item is "
     "clearly an attribute axis name (one or two words naming a dimension).\n"
-    'Output JSON: {"axis_bans": ["age", "gender"], '
-    '"scene_bans": ["phone", "text in the image", ...]}\n'
-    "\n"
-    "Example —\n"
-    "Negative prompt items: no age, no body type, no phone, no text, "
-    "split panels\n"
-    "Output:\n"
-    '{"axis_bans": ["age", "body_type"], '
-    '"scene_bans": ["phone", "text in the image", "split panels"]}'
+    'Output JSON: {"axis_bans": [...], "scene_bans": [...]}'
 )
 
 DRAFT_SYSTEM_PROMPT = (
@@ -556,27 +534,16 @@ DRAFT_SYSTEM_PROMPT = (
     "Hard length budget: 25-45 words, ONE sentence, at most three "
     "comma-joined clauses. This is a tight blueprint, not a paragraph — "
     "wildcardification happens in the next step, so leave room. Do NOT "
-    "stack decorative subclauses (\"capturing a moment of...\", "
-    "\"evoking a sense of...\", \"as if suspended in time\"). Do NOT "
-    "restate the same element twice with different adjectives.\n"
+    "stack decorative wrap-up subclauses about the moment, the feeling, or "
+    "the timelessness of the scene. Do NOT restate the same element twice "
+    "with different adjectives.\n"
     "Name the SUBJECT, what they are DOING, the SETTING, and the LIGHTING. "
-    "Stop there. Mood and meta-commentary are forbidden.\n"
+    "Stop there. Mood adjectives and meta-commentary are forbidden.\n"
     "If a list of fixed traits is provided, every phrase in that list MUST "
     "appear verbatim (or as a near-identical substring) in the sentence. "
     "Do not paraphrase or substitute them.\n"
     "If a list of forbidden scene elements is provided, the sentence MUST "
-    "NOT depict or imply any of them.\n"
-    "\n"
-    "Example —\n"
-    "User idea: An elderly witch hunches over a bubbling copper cauldron "
-    "in a stone cottage at midnight, stirring a luminous green potion as "
-    "moonlight pours through a leaded window.\n"
-    "Fixed traits: witch, tartan cloak, potion\n"
-    "Forbidden scene elements: phone\n"
-    "Output:\n"
-    "An elderly witch in a tartan cloak stirs a luminous green potion in a "
-    "bubbling copper cauldron inside a stone cottage at midnight, lit by "
-    "moonlight through a leaded window."
+    "NOT depict or imply any of them."
 )
 
 WILDCARDIFY_SYSTEM_PROMPT = (
@@ -594,19 +561,19 @@ WILDCARDIFY_SYSTEM_PROMPT = (
     "the minimum placeholder count without adding text, output FEWER "
     "placeholders.\n"
     " 2. The \"prompt\" field contains the rewritten sentence and NOTHING "
-    "else. No thinking, no notes, no \"Wait, let me also...\", no "
-    "bullet lists, no markdown. Pure sentence.\n"
-    " 3. The \"categories\" array contains BARE snake_case names: "
-    '["age", "lighting"]. Never with underscores around them: '
-    'NOT ["__age__", "__lighting__"].\n'
+    "else. No thinking, no notes, no reasoning aloud, no bullet lists, "
+    "no markdown. Pure sentence.\n"
+    " 3. The \"categories\" array contains BARE snake_case names with NO "
+    "surrounding underscores.\n"
     " 4. Each placeholder name appears EXACTLY ONCE in the sentence. No "
     "duplicate placeholders.\n"
     " 5. Pick concrete VISUAL dimensions tied to specific words in the "
-    "sentence (the colour of a thing, the material of a thing, the time, "
-    "the lighting). Avoid catch-all buckets like __mood__, "
-    "__color_palette__, __composition__, __atmosphere__, __era_markers__, "
-    "__materials__, __props__ — those don't map to specific words and "
-    "produce abstract slop at sampling time.\n"
+    "sentence (the colour of a thing, the material of a thing, the time "
+    "of day, the lighting source). Avoid catch-all buckets like "
+    "__mood__, __color_palette__, __composition__, __atmosphere__, "
+    "__era_markers__, __materials__, __props__, __style__, "
+    "__aesthetic__ — those don't map to specific words and produce "
+    "abstract slop at sampling time.\n"
     "\n"
     "Fixed traits (provided in the user message) must remain verbatim "
     "concrete words. You must NOT turn any fixed trait — or any "
@@ -617,25 +584,7 @@ WILDCARDIFY_SYSTEM_PROMPT = (
     "Stay within the placeholder count range. Prefer the lower end if the "
     "sentence is short.\n"
     'Output JSON: {"prompt": "...with __placeholders__...", '
-    '"categories": ["name1", "name2", ...]}\n'
-    "\n"
-    "Example —\n"
-    "Image prompt: An elderly witch in a tartan cloak stirs a luminous "
-    "green potion in a bubbling copper cauldron inside a stone cottage at "
-    "midnight, lit by moonlight through a leaded window.\n"
-    "Fixed traits: witch, tartan cloak, potion\n"
-    "Forbidden placeholder names: __garment__, __pattern__\n"
-    "Use between 5 and 8 placeholders.\n"
-    "Output:\n"
-    '{"prompt": "An __age__ witch in a tartan cloak stirs a '
-    "__potion_color__ potion in a bubbling __cauldron_material__ "
-    "cauldron inside a __setting__ at __time__, lit by __lighting__ "
-    'through a __window_style__ window.", '
-    '"categories": ["age", "potion_color", "cauldron_material", '
-    '"setting", "time", "lighting", "window_style"]}\n'
-    "(Note: same sentence length and shape as the input — only words were "
-    "swapped, no clauses added. 'witch', 'tartan cloak', and 'potion' "
-    "stayed verbatim. No __garment__, __pattern__, or generic __mood__.)"
+    '"categories": ["name1", "name2", ...]}'
 )
 
 DESCRIBE_SYSTEM_PROMPT = (
@@ -643,44 +592,23 @@ DESCRIBE_SYSTEM_PROMPT = (
     "describing what kind of value belongs in that slot, tied to the "
     "specific image prompt. Specific enough that off-topic values feel "
     "wrong, broad enough to allow variety.\n"
-    "Avoid bland category-only definitions like 'an outfit'. Reference the "
-    "tone, era, setting, or aesthetic when relevant.\n"
+    "Avoid bland category-only definitions. Reference the tone, era, "
+    "setting, or aesthetic of the prompt when relevant.\n"
+    "Do NOT enumerate concrete example values inside the description "
+    "(no \"e.g. X, Y, Z\" lists) — that's the value-listing step's job, "
+    "and seeding values here narrows the downstream variety. Describe "
+    "the SHAPE of acceptable values, not the values themselves.\n"
     "If a list of fixed traits is provided, no description may invite "
     "values that contradict, replace, or restate any of those fixed traits.\n"
     "If a list of forbidden scene elements is provided, no description may "
     "invite values that introduce those elements.\n"
-    'Output JSON: {"<name>": "<short description>", ...}\n'
-    "\n"
-    "Example —\n"
-    "Prompt template: An __age__ witch in a tartan cloak stirs a "
-    "__potion_color__ potion in a bubbling __cauldron_material__ cauldron "
-    "inside a __setting__ at __time__, lit by __lighting__ through a "
-    "__window_style__ window.\n"
-    "Wildcard names: age, potion_color, lighting, window_style\n"
-    "Output:\n"
-    '{"age": "an adult age band fitting a seasoned witch — middle-aged, '
-    'elderly, ancient, weathered crone", '
-    '"potion_color": "an eerie luminous brew color seen at midnight — '
-    'viridian, sulphur yellow, bruised purple, blood crimson", '
-    '"lighting": "cold nocturnal light entering the cottage — silver '
-    'moonlight, pale starlight, faint blue dusk-glow", '
-    '"window_style": "a leaded or shuttered cottage window in '
-    'rustic stonework — diamond-paned, mullioned, narrow arched slit"}'
+    'Output JSON: {"<name>": "<short description>", ...}'
 )
 
 ALIGN_SYSTEM_PROMPT = (
     "Smooth the grammar of the image prompt — articles, pluralization, "
     "joining words. Do NOT change, rephrase, or remove any descriptive "
-    "phrase. Output the corrected sentence only.\n"
-    "\n"
-    "Example —\n"
-    "Image prompt: An elderly witch in heavy tartan cloak hunches over "
-    "bubbling copper cauldron in cluttered stone cottage at midnight, "
-    "stirring viridian potion with gnarled wooden ladle.\n"
-    "Output:\n"
-    "An elderly witch in a heavy tartan cloak hunches over a bubbling "
-    "copper cauldron in a cluttered stone cottage at midnight, stirring "
-    "a viridian potion with a gnarled wooden ladle."
+    "phrase. Output the corrected sentence only."
 )
 
 LIST_SYSTEM_PROMPT = (
@@ -698,23 +626,7 @@ LIST_SYSTEM_PROMPT = (
     "replace, or restate any of them.\n"
     "If a list of forbidden scene elements is provided, no value may "
     "contain or imply any of them.\n"
-    'Output JSON: {"values": ["...", "...", ...]}\n'
-    "\n"
-    "Example —\n"
-    "Category: potion_color\n"
-    "Description: an eerie luminous brew color seen at midnight — viridian, "
-    "sulphur yellow, bruised purple, blood crimson\n"
-    "Image prompt template: An __age__ witch in a tartan cloak stirs a "
-    "__potion_color__ potion in a bubbling __cauldron_material__ cauldron "
-    "inside a __setting__ at __time__.\n"
-    "Already used: viridian\n"
-    "Produce 5 distinct new values.\n"
-    "Output:\n"
-    '{"values": ["sulphur yellow", "bruised purple", "blood crimson", '
-    '"glacier blue", "ember orange"]}\n'
-    "(Note how each entry varies on the color dimension — not on material "
-    "or shape — and none restate 'viridian' in a near-synonym like "
-    "'emerald green'.)"
+    'Output JSON: {"values": ["...", "...", ...]}'
 )
 
 
