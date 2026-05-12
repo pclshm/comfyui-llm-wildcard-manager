@@ -510,7 +510,19 @@ BRIEF_SYSTEM_PROMPT = (
     "fixed_traits / forbidden_axes / scene_bans. The user can edit the "
     "brief afterwards.\n"
     'Output JSON: {"refined_idea": "...", "fixed_traits": ["..."], '
-    '"forbidden_axes": ["..."], "scene_bans": ["..."]}'
+    '"forbidden_axes": ["..."], "scene_bans": ["..."]}\n'
+    "\n"
+    "Example —\n"
+    "User idea: a witch in a tartan cloak brewing a potion, no phone\n"
+    "Output:\n"
+    '{"refined_idea": "An elderly witch hunches over a bubbling copper '
+    "cauldron in a cluttered stone cottage at midnight, stirring a luminous "
+    "green potion with a gnarled wooden ladle while moonlight pours through "
+    "a leaded window across shelves crowded with corked bottles and dried "
+    'herbs.", '
+    '"fixed_traits": ["witch", "tartan cloak", "potion"], '
+    '"forbidden_axes": ["subject", "garment", "pattern"], '
+    '"scene_bans": ["phone"]}'
 )
 
 PARSE_NEGATIVE_SYSTEM_PROMPT = (
@@ -527,7 +539,14 @@ PARSE_NEGATIVE_SYSTEM_PROMPT = (
     "If unsure, prefer scene_ban — only mark as axis_ban when the item is "
     "clearly an attribute axis name (one or two words naming a dimension).\n"
     'Output JSON: {"axis_bans": ["age", "gender"], '
-    '"scene_bans": ["phone", "text in the image", ...]}'
+    '"scene_bans": ["phone", "text in the image", ...]}\n'
+    "\n"
+    "Example —\n"
+    "Negative prompt items: no age, no body type, no phone, no text, "
+    "split panels\n"
+    "Output:\n"
+    '{"axis_bans": ["age", "body_type"], '
+    '"scene_bans": ["phone", "text in the image", "split panels"]}'
 )
 
 DRAFT_SYSTEM_PROMPT = (
@@ -549,7 +568,19 @@ DRAFT_SYSTEM_PROMPT = (
     "NOT depict or imply any of them (no clever rephrasings).\n"
     "Do not contradict the scenario the user gave you, but you SHOULD invent "
     "concrete supporting detail that fits it. The point is a fully imagined "
-    "scene, not a restatement of the seed idea."
+    "scene, not a restatement of the seed idea.\n"
+    "\n"
+    "Example —\n"
+    "User idea: an elderly witch brewing a potion in a stone cottage at "
+    "midnight\n"
+    "Fixed traits: witch, tartan cloak, potion\n"
+    "Forbidden scene elements: phone\n"
+    "Output:\n"
+    "An elderly witch in a heavy tartan cloak hunches over a bubbling copper "
+    "cauldron in a cluttered stone cottage at midnight, stirring a luminous "
+    "green potion with a gnarled wooden ladle as moonlight spills through "
+    "the leaded window behind her, glinting off rows of corked bottles and "
+    "bundles of dried herbs hanging from the rafters."
 )
 
 WILDCARDIFY_SYSTEM_PROMPT = (
@@ -574,7 +605,28 @@ WILDCARDIFY_SYSTEM_PROMPT = (
     "If a list of forbidden placeholder names is provided, you MUST NOT "
     "create any of those placeholders. Keep that aspect as concrete words.\n"
     'Output JSON: {"prompt": "...with __placeholders__...", '
-    '"categories": ["name1", "name2", ...]}'
+    '"categories": ["name1", "name2", ...]}\n'
+    "\n"
+    "Example —\n"
+    "Image prompt: An elderly witch in a heavy tartan cloak hunches over a "
+    "bubbling copper cauldron in a cluttered stone cottage at midnight, "
+    "stirring a luminous green potion with a gnarled wooden ladle as "
+    "moonlight spills through the leaded window behind her, glinting off "
+    "rows of corked bottles and bundles of dried herbs hanging from the "
+    "rafters.\n"
+    "Fixed traits: witch, tartan cloak, potion\n"
+    "Use between 6 and 10 placeholders.\n"
+    "Output:\n"
+    '{"prompt": "An __age__ witch in a heavy tartan cloak hunches over a '
+    "__cauldron_state__ copper cauldron in a __setting__ at __time__, "
+    "stirring a __potion_color__ potion with a __tool__ as __lighting__ "
+    "spills through the __window_style__ window behind her, glinting off "
+    'rows of __shelf_items__ hanging from the rafters.", '
+    '"categories": ["age", "cauldron_state", "setting", "time", '
+    '"potion_color", "tool", "lighting", "window_style", "shelf_items"]}\n'
+    "(Note how 'witch', 'tartan cloak', and 'potion' stayed verbatim — "
+    "they are fixed traits — and no placeholder was created for subject, "
+    "garment, or pattern.)"
 )
 
 DESCRIBE_SYSTEM_PROMPT = (
@@ -588,13 +640,37 @@ DESCRIBE_SYSTEM_PROMPT = (
     "values that contradict, replace, or restate any of those fixed traits.\n"
     "If a list of forbidden scene elements is provided, no description may "
     "invite values that introduce those elements.\n"
-    'Output JSON: {"<name>": "<short description>", ...}'
+    'Output JSON: {"<name>": "<short description>", ...}\n'
+    "\n"
+    "Example —\n"
+    "Prompt template: An __age__ witch ... stirring a __potion_color__ "
+    "potion with a __tool__ as __lighting__ spills through the window.\n"
+    "Wildcard names: age, potion_color, tool, lighting\n"
+    "Output:\n"
+    '{"age": "an adult age band fitting a seasoned witch — middle-aged, '
+    'elderly, ancient, weathered crone", '
+    '"potion_color": "an eerie luminous brew color seen at midnight — '
+    'viridian, sulphur yellow, bruised purple, blood crimson", '
+    '"tool": "a hand-held stirring implement fitting a rustic witch '
+    "workshop — gnarled wooden ladle, bone wand, twisted iron rod, "
+    'antler spoon", '
+    '"lighting": "cold nocturnal light entering the cottage — silver '
+    'moonlight, pale starlight, faint blue dusk-glow"}'
 )
 
 ALIGN_SYSTEM_PROMPT = (
     "Smooth the grammar of the image prompt — articles, pluralization, "
     "joining words. Do NOT change, rephrase, or remove any descriptive "
-    "phrase. Output the corrected sentence only."
+    "phrase. Output the corrected sentence only.\n"
+    "\n"
+    "Example —\n"
+    "Image prompt: An elderly witch in heavy tartan cloak hunches over "
+    "bubbling copper cauldron in cluttered stone cottage at midnight, "
+    "stirring viridian potion with gnarled wooden ladle.\n"
+    "Output:\n"
+    "An elderly witch in a heavy tartan cloak hunches over a bubbling "
+    "copper cauldron in a cluttered stone cottage at midnight, stirring "
+    "a viridian potion with a gnarled wooden ladle."
 )
 
 LIST_SYSTEM_PROMPT = (
@@ -612,7 +688,23 @@ LIST_SYSTEM_PROMPT = (
     "replace, or restate any of them.\n"
     "If a list of forbidden scene elements is provided, no value may "
     "contain or imply any of them.\n"
-    'Output JSON: {"values": ["...", "...", ...]}'
+    'Output JSON: {"values": ["...", "...", ...]}\n'
+    "\n"
+    "Example —\n"
+    "Category: tool\n"
+    "Description: a hand-held stirring implement fitting a rustic witch "
+    "workshop\n"
+    "Image prompt template: An __age__ witch ... stirring a "
+    "__potion_color__ potion with a __tool__ as __lighting__ spills "
+    "through the window.\n"
+    "Already used: gnarled wooden ladle\n"
+    "Produce 5 distinct new values.\n"
+    "Output:\n"
+    '{"values": ["bone-handled iron spoon", "twisted antler wand", '
+    '"blackened copper stirring rod", "polished river-stone pestle", '
+    '"hooked silver ladle inlaid with runes"]}\n'
+    "(Note how each entry varies on a different dimension — material, "
+    "shape, ornament — rather than restating 'wooden ladle' in synonyms.)"
 )
 
 
