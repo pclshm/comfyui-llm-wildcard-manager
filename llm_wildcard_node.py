@@ -475,6 +475,133 @@ def resolve_direction(direction: str) -> str:
 
 
 # -----------------------------------------------------------------------------
+# Production-tier presets — what KIND of making this is. Orthogonal to the
+# aesthetic `direction`: "homemade" tells downstream steps to pick phone-camera
+# / available-light / casual-outfit values without changing the visual style.
+# -----------------------------------------------------------------------------
+TIER_PRESETS: dict[str, str] = {
+    "none": "",
+    "homemade": (
+        "Homemade / phone-snapshot context. Casual, off-the-cuff, available "
+        "light, ordinary indoor setting, unposed framing. No studio gear, no "
+        "professional lighting, no styled set dressing."
+    ),
+    "amateur_snapshot": (
+        "Amateur snapshot — on-camera flash or ambient light, slight motion "
+        "blur or soft focus is fine, plain everyday composition. Not staged."
+    ),
+    "candid": (
+        "Candid moment — subject caught mid-action, natural expression, "
+        "unposed body language, documentary feel."
+    ),
+    "editorial": (
+        "Editorial photography — polished composition, considered styling, "
+        "magazine-grade lighting and wardrobe."
+    ),
+    "studio_professional": (
+        "Professional studio shoot — controlled lighting, deliberate posing, "
+        "styled wardrobe, clean backdrop or set."
+    ),
+    "cinematic_production": (
+        "Cinematic production — staged scene, theatrical lighting, "
+        "production-design level set, intentional blocking."
+    ),
+}
+
+
+# -----------------------------------------------------------------------------
+# Mood presets — emotional tone of the scene. Influences pose, expression,
+# activity, time-of-day choices without dictating the visual style or
+# production tier.
+# -----------------------------------------------------------------------------
+MOOD_PRESETS: dict[str, str] = {
+    "none": "",
+    "mundane": (
+        "Mundane, everyday mood — ordinary moment, nothing dramatic, "
+        "low-stakes atmosphere."
+    ),
+    "intimate": (
+        "Intimate, quiet mood — close, personal, soft and private feel."
+    ),
+    "playful": (
+        "Playful, light mood — relaxed energy, hint of amusement, easy body "
+        "language."
+    ),
+    "tense": (
+        "Tense, charged mood — held breath, restrained gesture, uneasy "
+        "atmosphere."
+    ),
+    "melancholic": (
+        "Melancholic, wistful mood — subdued, reflective, a touch of "
+        "loneliness."
+    ),
+    "energetic": (
+        "Energetic, kinetic mood — motion, momentum, alert posture."
+    ),
+}
+
+
+def resolve_tier(tier: str) -> str:
+    if tier is None:
+        return ""
+    key = tier.strip()
+    if not key:
+        return ""
+    if key in TIER_PRESETS:
+        return TIER_PRESETS[key]
+    return key
+
+
+def resolve_mood(mood: str) -> str:
+    if mood is None:
+        return ""
+    key = mood.strip()
+    if not key:
+        return ""
+    if key in MOOD_PRESETS:
+        return MOOD_PRESETS[key]
+    return key
+
+
+def _parse_anchors(text: str) -> list[str]:
+    """Parse the Manager's `anchors` field — comma- or newline-separated short
+    phrases that must survive verbatim to the final prompt. Returns a deduped
+    list preserving first-seen order. Empty input → []."""
+    if not text:
+        return []
+    parts: list[str] = []
+    for chunk in str(text).replace("\r", "\n").split("\n"):
+        for piece in chunk.split(","):
+            s = piece.strip().strip('"').strip("'")
+            if s:
+                parts.append(s)
+    seen: set[str] = set()
+    out: list[str] = []
+    for p in parts:
+        key = p.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return out
+
+
+def _format_intent_block(direction_text: str, tier_text: str,
+                        mood_text: str) -> list[str]:
+    """Render the three intent facets as labelled user-message sections.
+    Returns a list of pre-formatted strings ready to be appended to the
+    `parts` list each LLM-call builder maintains. Empty facets are skipped."""
+    out: list[str] = []
+    if direction_text and direction_text.strip():
+        out.append(f"Direction:\n{direction_text.strip()}")
+    if tier_text and tier_text.strip():
+        out.append(f"Production tier:\n{tier_text.strip()}")
+    if mood_text and mood_text.strip():
+        out.append(f"Mood:\n{mood_text.strip()}")
+    return out
+
+
+# -----------------------------------------------------------------------------
 # System prompts — one per small, focused step. No "WRONG OUTPUTS" lists, no
 # rule recitations: just say what to produce.
 # -----------------------------------------------------------------------------
@@ -483,6 +610,12 @@ BRIEF_SYSTEM_PROMPT = (
     "scene. Invent a vivid scenario around that seed and package it as a "
     "design brief. Downstream steps will turn the scenario into a wildcard "
     "template so MANY varied images of this same scenario can be generated.\n"
+    "If the user message includes a 'Production tier' or 'Mood' section, the "
+    "refined_idea you invent MUST be consistent with them (e.g. a 'homemade' "
+    "tier means a phone-snapshot moment, not a styled shoot). Do not "
+    "contradict either field.\n"
+    "If the user message includes a 'User-anchored phrases' section, every "
+    "phrase listed there MUST appear verbatim in fixed_traits.\n"
     "Return four fields:\n"
     " - refined_idea: ONE or TWO sentences describing a concrete imagined "
     "moment built from the user's seed. Invent supporting detail the user "
@@ -543,7 +676,12 @@ DRAFT_SYSTEM_PROMPT = (
     "appear verbatim (or as a near-identical substring) in the sentence. "
     "Do not paraphrase or substitute them.\n"
     "If a list of forbidden scene elements is provided, the sentence MUST "
-    "NOT depict or imply any of them."
+    "NOT depict or imply any of them.\n"
+    "If a 'Production tier' section is provided, the depicted scene MUST be "
+    "consistent with that tier (e.g. 'homemade' → phone snapshot in an "
+    "ordinary space; 'studio' → controlled lighting and styled set). "
+    "If a 'Mood' section is provided, the action and posing MUST match that "
+    "mood, without adding flowery mood adjectives to the sentence."
 )
 
 WILDCARDIFY_SYSTEM_PROMPT = (
@@ -615,7 +753,11 @@ LIST_SYSTEM_PROMPT = (
     "Generate distinct values for one image-prompt wildcard slot. Each "
     "value is a concise, specific phrase — not a sentence.\n"
     "Every value must fit the surrounding image prompt and respect its "
-    "direction. Use the description to identify the dimensions of the "
+    "direction, production tier, and mood (when those sections are "
+    "present). A 'homemade' tier means amateur/everyday-grade values, NOT "
+    "professional-grade. A mood section biases the value space toward "
+    "phrases that read with that emotional tone. Use the description to "
+    "identify the dimensions of the "
     "value (e.g. hair = color + length + texture + style); spread entries "
     "across different dimensional combinations, do not return synonyms or "
     "near-paraphrases.\n"
@@ -999,19 +1141,34 @@ def _format_fixed_traits(fixed_traits: list[str]) -> str:
 
 
 def llm_design_brief(idea: str, direction_text: str, server: dict,
-                     seed: int = 0) -> tuple[dict, str]:
+                     seed: int = 0, tier_text: str = "",
+                     mood_text: str = "",
+                     anchors: list[str] | None = None,
+                     ) -> tuple[dict, str]:
     """Step 0 — turn the raw user idea into a structured design brief.
 
     The brief locks specific phrases the user named (fixed_traits) so they
     cannot drift downstream; the axes those phrases sit on (forbidden_axes)
     are blocked from becoming wildcard placeholders. Returns (brief, raw_reply).
-    Empty idea short-circuits to an empty brief without calling the LLM."""
+    Empty idea short-circuits to an empty brief without calling the LLM.
+
+    `tier_text` / `mood_text` are the resolved production-tier and mood strings;
+    passed so the brief can shape `refined_idea` to match. `anchors` lists
+    user-supplied phrases that MUST end up in fixed_traits — they're listed
+    to the LLM as required entries; they are also merged into fixed_traits
+    post-hoc by the caller as a backstop."""
     text = (idea or "").strip()
     if not text:
         return _empty_brief(), ""
     parts = [f"User idea:\n{text}"]
-    if direction_text and direction_text.strip():
-        parts.append(f"Direction:\n{direction_text.strip()}")
+    parts.extend(_format_intent_block(direction_text, tier_text, mood_text))
+    anchor_list = [a for a in (anchors or []) if a]
+    if anchor_list:
+        listed = "\n".join(f"- {a}" for a in anchor_list)
+        parts.append(
+            "User-anchored phrases (MUST appear verbatim in fixed_traits and "
+            f"survive into the final prompt):\n{listed}"
+        )
     parts.append("Output the JSON object now.")
     user = "\n\n".join(parts)
     raw = _server_call(server, BRIEF_SYSTEM_PROMPT, user,
@@ -1077,15 +1234,18 @@ def _format_scene_bans(scene_bans: list[str]) -> str:
 def llm_draft_prompt(idea: str, direction_text: str, server: dict,
                      seed: int = 0, scene_bans: list[str] | None = None,
                      fixed_traits: list[str] | None = None,
+                     tier_text: str = "", mood_text: str = "",
                      ) -> tuple[str, str]:
     """Step 1 — turn the user idea + direction into a single image-prompt
     sentence. `scene_bans` lists scene elements the sentence must avoid;
     `fixed_traits` lists literal phrases the sentence must contain (so the
     LLM can't paraphrase away the user's required specifics).
+    `tier_text` and `mood_text` shape the kind of moment depicted
+    (e.g. homemade vs. studio, intimate vs. energetic) without changing the
+    visual style.
     Returns (sentence, raw_reply)."""
     parts = [f"User idea:\n{(idea or '').strip() or '(no example provided)'}"]
-    if direction_text and direction_text.strip():
-        parts.append(f"Direction:\n{direction_text.strip()}")
+    parts.extend(_format_intent_block(direction_text, tier_text, mood_text))
     fixed = _format_fixed_traits(fixed_traits or [])
     if fixed:
         parts.append(f"Fixed traits (must appear verbatim in the sentence):\n{fixed}")
@@ -1267,6 +1427,8 @@ def llm_describe_wildcards(names: list[str], server: dict,
                            template: str = "",
                            scene_bans: list[str] | None = None,
                            fixed_traits: list[str] | None = None,
+                           tier_text: str = "",
+                           mood_text: str = "",
                            ) -> tuple[dict[str, str], str]:
     """Step 3 — short shape-of-value description for each wildcard name.
     Returns (descriptions, raw_reply).
@@ -1282,8 +1444,7 @@ def llm_describe_wildcards(names: list[str], server: dict,
     parts: list[str] = []
     if idea and idea.strip():
         parts.append(f"User idea:\n{idea.strip()}")
-    if direction_text and direction_text.strip():
-        parts.append(f"Direction:\n{direction_text.strip()}")
+    parts.extend(_format_intent_block(direction_text, tier_text, mood_text))
     if template and template.strip():
         parts.append(f"Prompt template:\n{template.strip()}")
     fixed = _format_fixed_traits(fixed_traits or [])
@@ -1319,11 +1480,16 @@ def llm_generate_value_list(category: str, description: str,
                             direction_text: str = "",
                             scene_bans: list[str] | None = None,
                             fixed_traits: list[str] | None = None,
+                            tier_text: str = "",
+                            mood_text: str = "",
                             ) -> tuple[list[str], str]:
     """Resolver step — generate distinct values for one wildcard slot.
 
     `template`, `direction_text`, and `scene_bans` keep each value consistent
-    with the overall image and away from forbidden scene elements. Returns
+    with the overall image and away from forbidden scene elements.
+    `tier_text` and `mood_text` bias the value space — e.g. a "homemade /
+    intimate" intent skews `outfit` toward pyjamas, not cocktail dresses,
+    without restating that anywhere in the template. Returns
     (values, raw_reply)."""
     parts = [
         f"Category: {category}",
@@ -1331,8 +1497,7 @@ def llm_generate_value_list(category: str, description: str,
     ]
     if template and template.strip():
         parts.append(f"Image prompt template:\n{template.strip()}")
-    if direction_text and direction_text.strip():
-        parts.append(f"Direction:\n{direction_text.strip()}")
+    parts.extend(_format_intent_block(direction_text, tier_text, mood_text))
     fixed = _format_fixed_traits(fixed_traits or [])
     if fixed:
         parts.append(
@@ -1495,7 +1660,10 @@ def build_manager_snapshot(effective_categories: dict, *,
                            negative_prompt: str = "",
                            generated_prompt: str = "",
                            user_overrides: dict | None = None,
-                           brief: dict | None = None) -> dict:
+                           brief: dict | None = None,
+                           production_tier: str = "none",
+                           mood: str = "none",
+                           anchors: list[str] | None = None) -> dict:
     # The category list shown by the UI tracks the *current* template plus any
     # user override. We deliberately do NOT union in every disk file — that
     # would make the list look identical across runs regardless of the prompt.
@@ -1518,6 +1686,13 @@ def build_manager_snapshot(effective_categories: dict, *,
         "direction": direction,
         "direction_text": resolve_direction(direction),
         "direction_presets": DIRECTION_PRESETS,
+        "production_tier": production_tier,
+        "production_tier_text": resolve_tier(production_tier),
+        "tier_presets": TIER_PRESETS,
+        "mood": mood,
+        "mood_text": resolve_mood(mood),
+        "mood_presets": MOOD_PRESETS,
+        "anchors": list(anchors or []),
         "negative_prompt": negative_prompt,
         "generated_prompt": generated_prompt,
         "brief": normalize_brief(brief) if brief is not None else _empty_brief(),
@@ -2025,6 +2200,52 @@ class LLMWildcardManager:
                     "default": "none",
                     "placeholder": "preset key (e.g. 'cinematic') or any custom steering text",
                 }),
+                "production_tier": ("STRING", {
+                    "default": "none",
+                    "placeholder": (
+                        "preset key (e.g. 'homemade', 'editorial', "
+                        "'studio_professional') or custom tier text"
+                    ),
+                    "tooltip": (
+                        "What KIND of making this is. Orthogonal to "
+                        "direction — 'homemade' steers per-slot values "
+                        "toward amateur/phone-snapshot equivalents (casual "
+                        "outfit, ambient light, plain pose) without "
+                        "touching the aesthetic style."
+                    ),
+                }),
+                "mood": ("STRING", {
+                    "default": "none",
+                    "placeholder": (
+                        "preset key (e.g. 'intimate', 'mundane', "
+                        "'playful') or custom mood text"
+                    ),
+                    "tooltip": (
+                        "Emotional tone of the scene. Biases pose, "
+                        "expression, activity and time-of-day choices "
+                        "without dictating the visual style."
+                    ),
+                }),
+                "anchors": ("STRING", {
+                    "multiline": True,
+                    "default": "",
+                    "placeholder": (
+                        "Short phrases from your idea that MUST survive "
+                        "verbatim to the final prompt.\n"
+                        "Comma- or newline-separated.\n"
+                        "Examples: bedroom, teenage girl, denim jacket\n"
+                        "Anchored phrases are merged into fixed_traits so "
+                        "the wildcardify step won't replace them, and the "
+                        "matching axes won't become wildcards."
+                    ),
+                    "tooltip": (
+                        "User-pinned phrases. Each anchor is force-added "
+                        "to fixed_traits so the LLM cannot wildcardify it "
+                        "or paraphrase it away. Use this when the idea "
+                        "names something specific (a setting, a garment) "
+                        "and you don't want the resolver to re-roll it."
+                    ),
+                }),
                 "negative_prompt": ("STRING", {
                     "multiline": True,
                     "default": "",
@@ -2131,12 +2352,18 @@ class LLMWildcardManager:
     OUTPUT_NODE = True
 
     def manage(self, server, example_prompt, lock_template, seed, direction,
+               production_tier, mood, anchors,
                negative_prompt, forbidden_placeholders,
                min_categories, max_categories,
                system_prompt_override, categories,
                design_brief=""):
         direction = (direction or "").strip() or "none"
         direction_text = resolve_direction(direction)
+        tier = (production_tier or "").strip() or "none"
+        tier_text = resolve_tier(tier)
+        mood_key = (mood or "").strip() or "none"
+        mood_text = resolve_mood(mood_key)
+        anchor_list = _parse_anchors(anchors or "")
         negative = (negative_prompt or "").strip()
         forbidden_names = _parse_forbidden_names(forbidden_placeholders or "")
 
@@ -2260,6 +2487,17 @@ class LLMWildcardManager:
                         LAST_BRIEF_PATH.read_text(encoding="utf-8")))
                 except Exception:
                     brief = _empty_brief()
+            # On the locked path the brief is cached, but the current
+            # `anchors` widget is live input — merge anchors in so the user
+            # can pin extra phrases without regenerating the template.
+            if anchor_list:
+                merged_fixed = list(brief.get("fixed_traits") or [])
+                seen_fixed = {t.lower() for t in merged_fixed}
+                for a in anchor_list:
+                    if a.lower() not in seen_fixed:
+                        seen_fixed.add(a.lower())
+                        merged_fixed.append(a)
+                brief["fixed_traits"] = merged_fixed
             fixed_traits = list(brief.get("fixed_traits") or [])
             scene_bans = list(brief.get("scene_bans") or [])
         else:
@@ -2282,8 +2520,25 @@ class LLMWildcardManager:
                     brief, raw_brief = llm_design_brief(
                         example_prompt or "", direction_text, server,
                         seed=effective_seed,
+                        tier_text=tier_text,
+                        mood_text=mood_text,
+                        anchors=anchor_list,
                     )
                     raw_sections.append(("brief", raw_brief))
+
+                # Backstop: merge user-anchored phrases into fixed_traits so
+                # they survive even if the LLM brief (or a user-edited brief)
+                # missed them. Anchors are user authority — the wildcardify
+                # step will refuse to replace any fixed trait, and the draft
+                # step is required to include each fixed trait verbatim.
+                if anchor_list:
+                    merged_fixed = list(brief.get("fixed_traits") or [])
+                    seen_fixed = {t.lower() for t in merged_fixed}
+                    for a in anchor_list:
+                        if a.lower() not in seen_fixed:
+                            seen_fixed.add(a.lower())
+                            merged_fixed.append(a)
+                    brief["fixed_traits"] = merged_fixed
 
                 fixed_traits = list(brief.get("fixed_traits") or [])
                 brief_forbidden_axes = list(brief.get("forbidden_axes") or [])
@@ -2337,6 +2592,8 @@ class LLMWildcardManager:
                     seed=effective_seed,
                     scene_bans=scene_bans,
                     fixed_traits=fixed_traits,
+                    tier_text=tier_text,
+                    mood_text=mood_text,
                 )
                 raw_sections.append(("draft", raw_draft))
 
@@ -2361,6 +2618,8 @@ class LLMWildcardManager:
                     template=template,
                     scene_bans=scene_bans,
                     fixed_traits=fixed_traits,
+                    tier_text=tier_text,
+                    mood_text=mood_text,
                 )
                 raw_sections.append(("describe", raw_describe))
                 suggested_cats = descs
@@ -2443,6 +2702,9 @@ class LLMWildcardManager:
         bundle = {
             "system_prompt": "",
             "flair": direction_text,
+            "tier": tier_text,
+            "mood": mood_text,
+            "anchors": list(anchor_list),
             "negative": negative,
             "scene_bans": list(scene_bans),
             "fixed_traits": list(fixed_traits),
@@ -2462,6 +2724,9 @@ class LLMWildcardManager:
             generated_prompt=template,
             user_overrides=user_overrides,
             brief=brief,
+            production_tier=tier,
+            mood=mood_key,
+            anchors=anchor_list,
         )
         snapshot["raw_reply"] = raw_reply
         snapshot["status"] = status
@@ -2543,12 +2808,16 @@ class LLMWildcardResolver:
 
         categories = load_category_config()
         flair_text = ""
+        tier_text = ""
+        mood_text = ""
         negative_text = ""
         scene_bans: list[str] = []
         fixed_traits: list[str] = []
         intended_names: list[str] = []
         if isinstance(prompts, dict):
             flair_text = prompts.get("flair") or ""
+            tier_text = prompts.get("tier") or ""
+            mood_text = prompts.get("mood") or ""
             negative_text = prompts.get("negative") or ""
             raw_scene = prompts.get("scene_bans") or []
             if isinstance(raw_scene, list):
@@ -2664,6 +2933,8 @@ class LLMWildcardResolver:
                     direction_text=flair_text,
                     scene_bans=scene_bans,
                     fixed_traits=fixed_traits,
+                    tier_text=tier_text,
+                    mood_text=mood_text,
                 )
                 rec["raw"] = raw
                 # Drop any LLM-returned values that violate the negative
@@ -2695,6 +2966,8 @@ class LLMWildcardResolver:
                             direction_text=flair_text,
                             scene_bans=scene_bans,
                             fixed_traits=fixed_traits,
+                            tier_text=tier_text,
+                            mood_text=mood_text,
                         )
                         rec["retry_raw"] = retry_raw
                         values = [v for v in retry_values
