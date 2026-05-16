@@ -934,6 +934,53 @@ _NEG_PREFIXES = (
 _NEG_ARTICLES = ("the ", "a ", "an ")
 
 
+def _add_morphology_variants(term: str) -> set[str]:
+    """Expand a forbidden term into nearby English morphology variants.
+
+    The user writes "no phones" but the LLM produces "a phone" — without
+    variant expansion the whole-word match misses. This is intentionally
+    a small, fast set, not a full lemmatizer:
+      - phones ↔ phone
+      - watches ↔ watch
+      - babies ↔ baby (y/ies)
+      - kissing ↔ kiss / kisses
+      - kissed ↔ kiss
+    Only single-word terms are expanded; multi-word phrases are returned
+    unchanged."""
+    variants: set[str] = {term}
+    if not term or " " in term or "-" in term:
+        return variants
+    t = term
+    # Plural <-> singular
+    if len(t) > 4 and t.endswith("ies"):
+        variants.add(t[:-3] + "y")
+    elif len(t) > 4 and t.endswith("ves"):
+        variants.add(t[:-3] + "f")
+        variants.add(t[:-3] + "fe")
+    elif len(t) > 4 and t.endswith("es") and t[-3] in "shxz":
+        variants.add(t[:-2])
+    elif len(t) > 3 and t.endswith("s") and not t.endswith("ss"):
+        variants.add(t[:-1])
+    else:
+        # singular → add common plural
+        if t.endswith("y") and len(t) > 3 and t[-2] not in "aeiou":
+            variants.add(t[:-1] + "ies")
+        elif t.endswith(("s", "x", "z", "ch", "sh")):
+            variants.add(t + "es")
+        else:
+            variants.add(t + "s")
+    # Verb forms: kissing → kiss; kissed → kiss
+    if len(t) > 4 and t.endswith("ing"):
+        variants.add(t[:-3])
+        if len(t) > 5 and t[-4] == t[-5]:  # running → run
+            variants.add(t[:-4])
+    if len(t) > 3 and t.endswith("ed"):
+        variants.add(t[:-2])
+        if len(t) > 4 and t[-3] == t[-4]:  # stopped → stop
+            variants.add(t[:-3])
+    return {v for v in variants if len(v) >= 3}
+
+
 def _negative_terms(text: str) -> list[str]:
     """Break a free-form negative prompt into a list of forbidden phrases.
 
@@ -941,7 +988,11 @@ def _negative_terms(text: str) -> list[str]:
     " or ") is treated as one phrase. Common leading negation words and
     articles are stripped so the user can write "no old people" or "old
     people" interchangeably. Phrases shorter than three characters are dropped
-    to avoid stray-letter matches."""
+    to avoid stray-letter matches.
+
+    Single-word terms are expanded with light English morphology variants
+    (phones ↔ phone, kissing ↔ kiss) so the user's plural doesn't miss the
+    LLM's singular and vice versa."""
     if not text or not text.strip():
         return []
     parts = re.split(r"[,;\n\r/|]+| and | or ", text.lower())
@@ -961,7 +1012,7 @@ def _negative_terms(text: str) -> list[str]:
                     p = p[len(art):].strip()
                     changed = True
         if len(p) >= 3:
-            terms.add(p)
+            terms.update(_add_morphology_variants(p))
     # Longest first so report output and any overlap checks see specific
     # phrases before their substrings.
     return sorted(terms, key=len, reverse=True)
@@ -983,6 +1034,136 @@ def _value_violates_negative(value: str, terms: list[str]) -> bool:
             if t in v:
                 return True
     return False
+
+
+def _matched_negative_terms(value: str, terms: list[str]) -> list[str]:
+    """Same matching as _value_violates_negative but returns the list of
+    matched terms (in the order they were given). Empty list if no violations."""
+    if not value or not terms:
+        return []
+    v = value.lower()
+    hits: list[str] = []
+    for t in terms:
+        try:
+            if re.search(r"(?<![a-z0-9])" + re.escape(t) + r"(?![a-z0-9])", v):
+                hits.append(t)
+        except re.error:
+            if t in v:
+                hits.append(t)
+    return hits
+
+
+def _strip_negative_clauses(text: str, terms: list[str]) -> tuple[str, list[str]]:
+    """Remove comma-separated clauses from `text` that contain any forbidden
+    term. Returns (cleaned_text, dropped_clauses). If every clause matches,
+    falls back to a single-pass per-word excision so we never return ""
+    when the input had usable content.
+
+    The first pass splits on commas only (the resolver's templates almost
+    always use comma-joined clauses). If a clause without commas still
+    violates, the second pass scrubs the violating words plus their
+    immediate articles ("a phone" → "")."""
+    if not text or not terms:
+        return text or "", []
+
+    parts = [p for p in re.split(r",", text)]
+    kept: list[str] = []
+    dropped: list[str] = []
+    for clause in parts:
+        if _value_violates_negative(clause, terms):
+            stripped = clause.strip()
+            if stripped:
+                dropped.append(stripped)
+            continue
+        kept.append(clause)
+
+    cleaned = ",".join(kept)
+    cleaned = re.sub(r"\s*,\s*,\s*", ", ", cleaned)
+    cleaned = re.sub(r"^\s*,\s*", "", cleaned)
+    cleaned = re.sub(r"\s*,\s*$", "", cleaned).strip()
+
+    if cleaned and not _value_violates_negative(cleaned, terms):
+        return cleaned, dropped
+
+    # Second-pass: scrub the violating words themselves (plus a leading
+    # article when present) so single-clause sentences don't get wiped out
+    # entirely.
+    fallback = cleaned or text
+    for t in terms:
+        pattern = (
+            r"(?i)(?:\b(?:a|an|the|her|his|their|its|with|and|holding|carrying)\s+)?"
+            + re.escape(t)
+            + r"(?![a-z0-9])"
+        )
+        try:
+            fallback = re.sub(pattern, "", fallback)
+        except re.error:
+            fallback = fallback.replace(t, "")
+    fallback = re.sub(r"\s{2,}", " ", fallback)
+    fallback = re.sub(r"\s*,\s*,\s*", ", ", fallback)
+    fallback = re.sub(r"^\s*,\s*", "", fallback)
+    fallback = re.sub(r"\s*,\s*$", "", fallback).strip()
+
+    if fallback and not _value_violates_negative(fallback, terms):
+        return fallback, dropped or [text.strip()]
+
+    return cleaned or text, dropped
+
+
+def compile_negative_prompt(user_negative: str = "",
+                            scene_bans: list[str] | None = None,
+                            axis_bans: list[str] | None = None,
+                            forbidden_placeholders: list[str] | None = None,
+                            ) -> str:
+    """Build the final comma-separated negative-prompt string that downstream
+    CLIPTextEncode nodes should consume.
+
+    Combines (in order):
+      1. The user's raw negative_prompt text (preserved verbatim, split on
+         lines/commas).
+      2. The parsed scene_bans (concrete things that must not appear).
+      3. Axis bans / forbidden placeholders rendered as plain English negations
+         (e.g. 'age' → 'no varied age'), so the image model still sees them.
+
+    Deduplicates case-insensitively while preserving the first occurrence."""
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _push(item: str) -> None:
+        s = (item or "").strip().strip(",").strip()
+        if not s:
+            return
+        key = s.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(s)
+
+    raw_user = (user_negative or "").strip()
+    if raw_user:
+        for chunk in re.split(r"[\n,;]+", raw_user):
+            _push(chunk)
+
+    for s in (scene_bans or []):
+        _push(str(s))
+
+    for n in (axis_bans or []):
+        token = str(n or "").strip().strip("_").strip()
+        if not token:
+            continue
+        readable = token.replace("_", " ").strip()
+        if readable:
+            _push(f"varied {readable}")
+
+    for n in (forbidden_placeholders or []):
+        token = str(n or "").strip().strip("_").strip()
+        if not token:
+            continue
+        readable = token.replace("_", " ").strip()
+        if readable and readable not in seen:
+            _push(readable)
+
+    return ", ".join(out)
 
 
 WILDCARD_RE = re.compile(r"__(!)?([A-Za-z0-9_\-]+)__")
@@ -2045,6 +2226,23 @@ class LLMPromptGenerator:
                 "image": ("IMAGE", {
                     "tooltip": "Required for the Analyze Image modes.",
                 }),
+                "negative_prompt": ("STRING", {
+                    "multiline": True,
+                    "default": "",
+                    "forceInput": False,
+                    "placeholder": (
+                        "Comma- or newline-separated terms the enhanced "
+                        "output must NOT contain. Wired typically from the "
+                        "Manager's or Resolver's negative_prompt output."
+                    ),
+                    "tooltip": (
+                        "Hard deny-list applied to the LLM-enhanced prompt. "
+                        "Injected into the system prompt as a forbidden "
+                        "list; the output is post-filtered and the same "
+                        "string is re-emitted as the negative_prompt output "
+                        "for CLIPTextEncode (negative)."
+                    ),
+                }),
                 "format_as_json": ("BOOLEAN", {
                     "default": False,
                     "tooltip": "Append JSON-formatting instructions to the system prompt.",
@@ -2069,8 +2267,8 @@ class LLMPromptGenerator:
             },
         }
 
-    RETURN_TYPES = ("STRING", "STRING")
-    RETURN_NAMES = ("output", "thoughts")
+    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_NAMES = ("output", "thoughts", "negative_prompt")
     FUNCTION = "generate"
     CATEGORY = "prompt/wildcards"
 
@@ -2079,8 +2277,8 @@ class LLMPromptGenerator:
         return seed
 
     def generate(self, server, seed, mode="Enhance Prompt (Image)", prompt="",
-                 image=None, format_as_json=False, enable_thinking=False,
-                 system_prompt="", timeout_seconds=180):
+                 image=None, negative_prompt="", format_as_json=False,
+                 enable_thinking=False, system_prompt="", timeout_seconds=180):
         is_vision = mode in _PG_VISION_MODES
 
         if not is_vision and not (prompt and prompt.strip()):
@@ -2103,6 +2301,22 @@ class LLMPromptGenerator:
 
         if format_as_json:
             sys_prompt = sys_prompt + _PG_JSON_SUFFIX
+
+        # Splice the negative-prompt deny-list into the system prompt so the
+        # LLM is told up-front what it cannot include. Post-filtering below
+        # handles models that ignore the instruction.
+        neg_input = (negative_prompt or "").strip()
+        neg_terms = _negative_terms(neg_input) if neg_input else []
+        if neg_input:
+            sys_prompt = (
+                f"{sys_prompt}\n\n"
+                "ABSOLUTE FORBIDDEN — the rewritten prompt MUST NOT contain, "
+                "depict, or imply any of the following items (case-insensitive, "
+                "whole word match). If your draft includes any of them, rewrite "
+                "the draft to remove them before responding. Do NOT acknowledge "
+                "this list in the output — just produce a clean prompt.\n"
+                f"Forbidden items: {neg_input}"
+            )
 
         # User content per mode.
         if mode == "Analyze Image":
@@ -2148,7 +2362,52 @@ class LLMPromptGenerator:
         if not content:
             content = prompt if prompt else ""
 
-        return (content, thinking)
+        # Negative-prompt enforcement: if the model ignored the deny-list,
+        # retry once with the violations spelled out, then strip violating
+        # clauses as a last resort so banned terms never reach CLIPTextEncode
+        # (positive).
+        if neg_terms and content:
+            hits = _matched_negative_terms(content, neg_terms)
+            if hits:
+                retry_sys = (
+                    f"{sys_prompt}\n\n"
+                    "Your previous draft contained forbidden item(s): "
+                    f"{', '.join(hits)}. Rewrite the prompt now WITHOUT "
+                    "those item(s) and without naming substitutes that "
+                    "imply the same thing."
+                )
+                try:
+                    retry_content, retry_thinking = _chat_with_vision(
+                        server=server,
+                        system=retry_sys,
+                        user=user_content,
+                        image_b64=image_b64,
+                        seed=int(seed) + 1 if seed else 0,
+                        enable_thinking=bool(enable_thinking),
+                        timeout=int(timeout_seconds),
+                    )
+                    if retry_content and not _matched_negative_terms(
+                            retry_content, neg_terms):
+                        content = retry_content
+                        thinking = retry_thinking or thinking
+                    elif retry_content:
+                        # Retry still violated — strip clauses from
+                        # whichever draft has less damage.
+                        cand_retry, _ = _strip_negative_clauses(
+                            retry_content, neg_terms)
+                        cand_first, _ = _strip_negative_clauses(
+                            content, neg_terms)
+                        content = (cand_retry if len(cand_retry)
+                                   >= len(cand_first) else cand_first)
+                    else:
+                        content, _ = _strip_negative_clauses(
+                            content, neg_terms)
+                except Exception as e:
+                    if debug:
+                        print(f"[LLMPromptGenerator] negative-retry failed: {e}")
+                    content, _ = _strip_negative_clauses(content, neg_terms)
+
+        return (content, thinking, neg_input)
 
 
 # =============================================================================
@@ -2345,8 +2604,8 @@ class LLMWildcardManager:
             },
         }
 
-    RETURN_TYPES = ("STRING", "WILDCARD_PROMPTS")
-    RETURN_NAMES = ("prompt_template", "prompts")
+    RETURN_TYPES = ("STRING", "WILDCARD_PROMPTS", "STRING")
+    RETURN_NAMES = ("prompt_template", "prompts", "negative_prompt")
     FUNCTION = "manage"
     CATEGORY = "prompt/wildcards"
     OUTPUT_NODE = True
@@ -2597,6 +2856,52 @@ class LLMWildcardManager:
                 )
                 raw_sections.append(("draft", raw_draft))
 
+                # Backstop: the draft step is instructed to avoid scene_bans,
+                # but LLMs ignore that instruction often enough to matter
+                # ("no phones" → "a girl holding a phone"). Combine the raw
+                # negative + parsed scene_bans into match terms, and if the
+                # draft still contains a violation, retry once with the
+                # violations spelled out, then strip violating clauses as a
+                # last resort. This is the fix for forbidden traits leaking
+                # all the way through to the final image prompt.
+                neg_match_terms = _negative_terms(negative)
+                for s in scene_bans:
+                    for extra in _negative_terms(s):
+                        if extra not in neg_match_terms:
+                            neg_match_terms.append(extra)
+                neg_match_terms.sort(key=len, reverse=True)
+                hits = _matched_negative_terms(draft, neg_match_terms)
+                if hits:
+                    forced_bans = list(scene_bans)
+                    for hit in hits:
+                        if hit not in {s.lower() for s in forced_bans}:
+                            forced_bans.append(hit)
+                    try:
+                        retry_draft, retry_raw = llm_draft_prompt(
+                            idea_for_draft, direction_text, server,
+                            seed=effective_seed + 1,
+                            scene_bans=forced_bans,
+                            fixed_traits=fixed_traits,
+                            tier_text=tier_text,
+                            mood_text=mood_text,
+                        )
+                        raw_sections.append(("draft (retry, negative)", retry_raw))
+                        if not _matched_negative_terms(retry_draft,
+                                                      neg_match_terms):
+                            draft = retry_draft
+                        else:
+                            draft, _dropped = _strip_negative_clauses(
+                                retry_draft, neg_match_terms)
+                            if not draft.strip():
+                                draft, _dropped = _strip_negative_clauses(
+                                    retry_draft if retry_draft else draft,
+                                    neg_match_terms)
+                    except ManagerStepError as e:
+                        raw_sections.append(
+                            ("draft (retry, failed)", e.raw or ""))
+                        draft, _dropped = _strip_negative_clauses(
+                            draft, neg_match_terms)
+
                 # Step 2 — wildcardify with the merged deny-list. Fixed traits
                 # are passed so the LLM is told not to wildcardify any of
                 # them; if it ignores the instruction, the forbidden_axes from
@@ -2693,12 +2998,26 @@ class LLMWildcardManager:
         except Exception as e:
             print(f"[LLMWildcardManager] Could not persist last reply: {e}")
 
+        # Compile the deterministic negative prompt that downstream
+        # CLIPTextEncode (negative) should consume. Combines the user's raw
+        # negative text, the parsed scene_bans (from brief + parse_negative),
+        # the axis bans, and any user-supplied forbidden_placeholders. This
+        # is intentionally not LLM-rewritten — the user asked for a stable
+        # negative that isn't influenced by the model.
+        compiled_negative = compile_negative_prompt(
+            user_negative=negative,
+            scene_bans=scene_bans,
+            axis_bans=list(brief.get("forbidden_axes") or []),
+            forbidden_placeholders=forbidden_names,
+        )
+
         # Build the bundle handed to the Resolver. `scene_bans` is the
         # structured list of forbidden scene elements derived from the raw
         # negative prompt; the Resolver passes it to llm_generate_value_list
         # so per-slot values can't reintroduce them. Falls back to the raw
         # text via _negative_terms when the locked-template path skipped
-        # the parse_negative step.
+        # the parse_negative step. `compiled_negative` is the precomputed
+        # CLIP-ready negative the Resolver re-emits as an output.
         bundle = {
             "system_prompt": "",
             "flair": direction_text,
@@ -2708,6 +3027,9 @@ class LLMWildcardManager:
             "negative": negative,
             "scene_bans": list(scene_bans),
             "fixed_traits": list(fixed_traits),
+            "forbidden_axes": list(brief.get("forbidden_axes") or []),
+            "forbidden_placeholders": list(forbidden_names),
+            "compiled_negative": compiled_negative,
             "category_overrides": dict(effective),
             "intended_names": list(used_names),
         }
@@ -2736,7 +3058,7 @@ class LLMWildcardManager:
             "ui": {
                 "manager_state": [json.dumps(snapshot)],
             },
-            "result": (template, bundle),
+            "result": (template, bundle, compiled_negative),
         }
 
     @classmethod
@@ -2791,8 +3113,8 @@ class LLMWildcardResolver:
             },
         }
 
-    RETURN_TYPES = ("STRING", "STRING")
-    RETURN_NAMES = ("resolved_prompt", "report")
+    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_NAMES = ("resolved_prompt", "report", "negative_prompt")
     FUNCTION = "resolve"
     CATEGORY = "prompt/wildcards"
     OUTPUT_NODE = True
@@ -2811,6 +3133,9 @@ class LLMWildcardResolver:
         tier_text = ""
         mood_text = ""
         negative_text = ""
+        compiled_negative = ""
+        forbidden_axes: list[str] = []
+        forbidden_placeholders: list[str] = []
         scene_bans: list[str] = []
         fixed_traits: list[str] = []
         intended_names: list[str] = []
@@ -2819,6 +3144,13 @@ class LLMWildcardResolver:
             tier_text = prompts.get("tier") or ""
             mood_text = prompts.get("mood") or ""
             negative_text = prompts.get("negative") or ""
+            compiled_negative = prompts.get("compiled_negative") or ""
+            raw_axes = prompts.get("forbidden_axes") or []
+            if isinstance(raw_axes, list):
+                forbidden_axes = [str(s) for s in raw_axes if str(s).strip()]
+            raw_fp = prompts.get("forbidden_placeholders") or []
+            if isinstance(raw_fp, list):
+                forbidden_placeholders = [str(s) for s in raw_fp if str(s).strip()]
             raw_scene = prompts.get("scene_bans") or []
             if isinstance(raw_scene, list):
                 scene_bans = [str(s) for s in raw_scene if str(s).strip()]
@@ -2838,6 +3170,19 @@ class LLMWildcardResolver:
         # active in value generation either way.
         if not scene_bans and negative_text:
             scene_bans = list(_negative_terms(negative_text))
+
+        # Compile the negative prompt the Resolver re-emits to downstream
+        # CLIPTextEncode. If the Manager already produced one, pass it through.
+        # Otherwise build it from whatever the Resolver actually has — that
+        # way users wiring the Resolver standalone still get a usable
+        # negative output.
+        if not compiled_negative:
+            compiled_negative = compile_negative_prompt(
+                user_negative=negative_text,
+                scene_bans=scene_bans,
+                axis_bans=forbidden_axes,
+                forbidden_placeholders=forbidden_placeholders,
+            )
 
         # If the manager bundled a list of intended wildcard names, repair any
         # template tokens that lost their double underscores (e.g. `_subject_`
@@ -3022,17 +3367,38 @@ class LLMWildcardResolver:
                 )
                 lower_aligned = aligned.lower()
                 # Only accept the alignment if every populated value is still
-                # present verbatim (case-insensitive). Otherwise keep the
-                # literal substitution — losing a value is worse than a small
-                # grammar slip.
+                # present verbatim (case-insensitive) AND the alignment did
+                # not reintroduce any negative term that wasn't already
+                # present in the substituted text. Losing a value or sneaking
+                # a banned word back in is worse than a small grammar slip.
+                pre_violations = set(_matched_negative_terms(substituted,
+                                                              neg_terms))
+                post_violations = set(_matched_negative_terms(aligned,
+                                                               neg_terms))
+                introduced = post_violations - pre_violations
                 if aligned and all(v.lower() in lower_aligned
-                                   for v in non_empty_values):
+                                   for v in non_empty_values) and not introduced:
                     resolved = aligned
                     align_status = "applied"
+                elif introduced:
+                    align_status = f"rejected (introduced: {sorted(introduced)})"
                 else:
                     align_status = "rejected"
             except Exception as e:
                 align_status = f"error: {e}"
+
+        # Final safety net — even after alignment is rejected, the literal
+        # substitution may contain forbidden words inherited from the
+        # template's drafted skeleton (e.g. "girl holding a phone" when the
+        # negative listed phone). Strip any comma-separated clause that
+        # still contains a forbidden term. Recorded so the report makes the
+        # surgery visible. Skipped when there are no negative terms.
+        dropped_clauses: list[str] = []
+        if neg_terms and resolved:
+            cleaned, dropped_clauses = _strip_negative_clauses(
+                resolved, neg_terms)
+            if cleaned and cleaned != resolved:
+                resolved = cleaned
 
         # Phase 3 — splice trigger words onto the (already aligned) prompt.
         # Done after alignment so LoRA trigger tokens stay verbatim — the
@@ -3058,6 +3424,8 @@ class LLMWildcardResolver:
             "align_raw": align_raw,
             "trigger_words": triggers,
             "trigger_position": trigger_position if triggers else "",
+            "negative_prompt": compiled_negative,
+            "negative_clauses_dropped": dropped_clauses,
         }
         try:
             LAST_RESOLVER_PATH.write_text(
@@ -3067,7 +3435,7 @@ class LLMWildcardResolver:
 
         return {
             "ui": {"resolver_state": [json.dumps(snapshot)]},
-            "result": (resolved, report),
+            "result": (resolved, report, compiled_negative),
         }
 
     @classmethod
