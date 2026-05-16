@@ -749,6 +749,20 @@ ALIGN_SYSTEM_PROMPT = (
     "phrase. Output the corrected sentence only."
 )
 
+REWRITE_EXCLUDING_SYSTEM_PROMPT = (
+    "Rewrite the image-prompt sentence so that NONE of the listed "
+    "forbidden terms (or any near-synonym) remain. Preserve every other "
+    "meaning, subject, setting, lighting, and mood. Keep the sentence "
+    "structure and length similar to the input. Do NOT introduce new "
+    "forbidden terms.\n"
+    "If a forbidden term names an object the subject is holding, "
+    "wearing, or depicting, remove the reference cleanly — do not "
+    "replace it with a synonym, do not invent a substitute prop. The "
+    "sentence may end up slightly shorter; that is fine.\n"
+    "Output the corrected sentence only — no preamble, no quotes, no "
+    "JSON."
+)
+
 LIST_SYSTEM_PROMPT = (
     "Generate distinct values for one image-prompt wildcard slot. Each "
     "value is a concise, specific phrase — not a sentence.\n"
@@ -983,6 +997,53 @@ def _value_violates_negative(value: str, terms: list[str]) -> bool:
             if t in v:
                 return True
     return False
+
+
+def _build_final_negative(
+    static_text: str,
+    scene_bans: list[str] | None = None,
+    axis_bans: list[str] | None = None,
+    raw_negative: str = "",
+) -> str:
+    """Compose the negative prompt string emitted to image generation.
+
+    Layered, in order:
+      1. `static_text` — verbatim user boilerplate (low quality, blurry…),
+         split on commas/newlines so per-term dedup works while spelling
+         is preserved.
+      2. `scene_bans` — structured image-meaningful bans from the brief +
+         llm_parse_negative.
+      3. Any remaining phrases from `_negative_terms(raw_negative)` not
+         already covered (defensive — typically a no-op when scene_bans is
+         already populated).
+      4. `axis_bans` rendered human-form ("body_type" -> "body type") so
+         the downstream image model still sees them as text.
+    Case-insensitive dedup; comma-joined; empty inputs → empty string."""
+    parts: list[str] = []
+    seen: set[str] = set()
+
+    def _add(phrase: str) -> None:
+        s = (phrase or "").strip().strip(",").strip()
+        if not s:
+            return
+        key = s.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        parts.append(s)
+
+    if static_text:
+        for chunk in re.split(r"[,\n]+", static_text):
+            _add(chunk)
+    for s in (scene_bans or []):
+        _add(str(s))
+    if raw_negative:
+        for t in _negative_terms(raw_negative):
+            _add(t)
+    for a in (axis_bans or []):
+        _add(str(a).replace("_", " "))
+
+    return ", ".join(parts)
 
 
 WILDCARD_RE = re.compile(r"__(!)?([A-Za-z0-9_\-]+)__")
@@ -1549,6 +1610,66 @@ def llm_align_prompt(populated: str, server: dict, seed: int = 0
     if len(aligned) >= 2 and aligned[0] in "\"'`" and aligned[-1] == aligned[0]:
         aligned = aligned[1:-1].strip()
     return aligned, raw
+
+
+def llm_rewrite_excluding_terms(
+    sentence: str,
+    forbidden_terms: list[str],
+    server: dict,
+    seed: int = 0,
+    max_passes: int = 2,
+) -> tuple[str, list[str], bool, str]:
+    """Audit `sentence` against `forbidden_terms` using the word-boundary
+    check in `_value_violates_negative`. If any term is present, ask the
+    LLM to rewrite — up to `max_passes` times. Returns
+    `(final_sentence, remaining_terms, clean, raw_log)`. `clean` is True
+    iff `remaining_terms` is empty after the final pass. Never raises —
+    callers decide whether a still-dirty result is fatal."""
+    raw_log_parts: list[str] = []
+    current = sentence or ""
+    bans = [t.strip() for t in (forbidden_terms or []) if t and t.strip()]
+    if not bans or not current.strip():
+        return current, [], True, ""
+
+    def _violations(text: str) -> list[str]:
+        return [t for t in bans if _value_violates_negative(text, [t])]
+
+    remaining = _violations(current)
+    if not remaining:
+        return current, [], True, ""
+
+    for attempt in range(max(1, int(max_passes))):
+        listed = "\n".join(f"- {t}" for t in remaining)
+        user = (
+            f"Image prompt:\n{current}\n\n"
+            f"Forbidden terms (must NOT appear, including obvious "
+            f"synonyms):\n{listed}\n\n"
+            "Output the corrected sentence only."
+        )
+        attempt_seed = seed + attempt * 9941 if seed else 0
+        try:
+            raw = _server_call(
+                server, REWRITE_EXCLUDING_SYSTEM_PROMPT, user,
+                seed=attempt_seed,
+            )
+        except Exception as e:
+            raw_log_parts.append(
+                f"--- rewrite attempt {attempt} (error) ---\n{e}")
+            break
+        raw_log_parts.append(
+            f"--- rewrite attempt {attempt} ---\n{(raw or '').strip()}")
+        new_sentence = (raw or "").strip()
+        if (len(new_sentence) >= 2 and new_sentence[0] in "\"'`"
+                and new_sentence[-1] == new_sentence[0]):
+            new_sentence = new_sentence[1:-1].strip()
+        if not new_sentence:
+            continue
+        current = new_sentence
+        remaining = _violations(current)
+        if not remaining:
+            return current, [], True, "\n\n".join(raw_log_parts)
+
+    return current, remaining, False, "\n\n".join(raw_log_parts)
 
 
 # -----------------------------------------------------------------------------
@@ -2258,6 +2379,9 @@ class LLMWildcardManager:
                         "3) Each wildcard description gets an explicit "
                         "exclusion clause so the resolver can't drift into "
                         "them either.\n"
+                        "4) These bans are also emitted on the "
+                        "`negative_prompt` output socket so they reach the "
+                        "image model's CLIP-negative input.\n"
                         "One item per line or comma-separated."
                     ),
                     "tooltip": (
@@ -2265,7 +2389,29 @@ class LLMWildcardManager:
                         "(e.g. 'no old/middle-aged people' when the idea "
                         "is 'young woman') prevents the Manager from "
                         "creating a wildcard for that aspect AND keeps the "
-                        "resolver's per-slot values from contradicting it."
+                        "resolver's per-slot values from contradicting it. "
+                        "Also flows into the `negative_prompt` output."
+                    ),
+                }),
+                "negative_prompt_static": ("STRING", {
+                    "multiline": True,
+                    "default": "",
+                    "placeholder": (
+                        "Always-included base negative (verbatim).\n"
+                        "Industry quality boilerplate that should appear "
+                        "in EVERY generated image's negative — e.g. "
+                        "'low quality, blurry, deformed, extra fingers, "
+                        "text, watermark'.\n"
+                        "This text is NEVER sent to the LLM and NEVER "
+                        "modified. The final `negative_prompt` output is "
+                        "this text first, then the AI-assembled bans "
+                        "derived from `negative_prompt` + the brief."
+                    ),
+                    "tooltip": (
+                        "Static base negative — prepended verbatim to "
+                        "the final `negative_prompt` output. Never sent "
+                        "to the LLM. Use this for boilerplate quality "
+                        "tags that must appear in every render."
                     ),
                 }),
                 # Hard deny-list of placeholder names. The LLM is told to
@@ -2345,8 +2491,8 @@ class LLMWildcardManager:
             },
         }
 
-    RETURN_TYPES = ("STRING", "WILDCARD_PROMPTS")
-    RETURN_NAMES = ("prompt_template", "prompts")
+    RETURN_TYPES = ("STRING", "WILDCARD_PROMPTS", "STRING")
+    RETURN_NAMES = ("prompt_template", "prompts", "negative_prompt")
     FUNCTION = "manage"
     CATEGORY = "prompt/wildcards"
     OUTPUT_NODE = True
@@ -2356,7 +2502,7 @@ class LLMWildcardManager:
                negative_prompt, forbidden_placeholders,
                min_categories, max_categories,
                system_prompt_override, categories,
-               design_brief=""):
+               design_brief="", negative_prompt_static=""):
         direction = (direction or "").strip() or "none"
         direction_text = resolve_direction(direction)
         tier = (production_tier or "").strip() or "none"
@@ -2365,6 +2511,7 @@ class LLMWildcardManager:
         mood_text = resolve_mood(mood_key)
         anchor_list = _parse_anchors(anchors or "")
         negative = (negative_prompt or "").strip()
+        negative_static = (negative_prompt_static or "").strip()
         forbidden_names = _parse_forbidden_names(forbidden_placeholders or "")
 
         # Parse the user-edited brief (or default {}). Non-empty means the
@@ -2597,6 +2744,30 @@ class LLMWildcardManager:
                 )
                 raw_sections.append(("draft", raw_draft))
 
+                # Step 1b — audit the draft against scene_bans. The LLM
+                # commonly slips a banned scene element back in even when
+                # told not to (the "no phones → girl holding a phone"
+                # bug). Rewrite up to twice; if it still leaks, the
+                # wildcardify audit below catches what's left, and the
+                # Resolver runs a final audit on the resolved prompt.
+                if scene_bans and draft:
+                    draft, remaining_draft, draft_clean, raw_rewrite_draft = (
+                        llm_rewrite_excluding_terms(
+                            draft, scene_bans, server,
+                            seed=effective_seed,
+                        )
+                    )
+                    if raw_rewrite_draft:
+                        raw_sections.append(
+                            ("rewrite_draft", raw_rewrite_draft))
+                    if not draft_clean and remaining_draft:
+                        status_message = (
+                            (status_message + " " if status_message else "")
+                            + "Draft still contains forbidden term(s) "
+                            "after rewrite: "
+                            + ", ".join(remaining_draft)
+                        ).strip()
+
                 # Step 2 — wildcardify with the merged deny-list. Fixed traits
                 # are passed so the LLM is told not to wildcardify any of
                 # them; if it ignores the instruction, the forbidden_axes from
@@ -2609,6 +2780,33 @@ class LLMWildcardManager:
                     fixed_traits=fixed_traits,
                 )
                 raw_sections.append(("wildcardify", raw_wildcardify))
+
+                # Step 2b — audit the wildcardified template. The
+                # wildcardify step can re-introduce words around the
+                # placeholders. Placeholder names are snake_case so
+                # _value_violates_negative's word-boundary check only
+                # flags concrete prose, not the placeholder tokens.
+                if scene_bans and template:
+                    template, remaining_tpl, tpl_clean, raw_rewrite_tpl = (
+                        llm_rewrite_excluding_terms(
+                            template, scene_bans, server,
+                            seed=effective_seed,
+                        )
+                    )
+                    if raw_rewrite_tpl:
+                        raw_sections.append(
+                            ("rewrite_template", raw_rewrite_tpl))
+                    if not tpl_clean and remaining_tpl:
+                        status_message = (
+                            (status_message + " " if status_message else "")
+                            + "Template still contains forbidden term(s) "
+                            "after rewrite: "
+                            + ", ".join(remaining_tpl)
+                        ).strip()
+                    # Re-extract names in case the rewrite (rarely)
+                    # dropped a placeholder; describe() runs next and
+                    # needs the up-to-date list.
+                    used_names = extract_wildcard_names(template) or used_names
 
                 # Step 3 — describe each wildcard.
                 descs, raw_describe = llm_describe_wildcards(
@@ -2693,12 +2891,30 @@ class LLMWildcardManager:
         except Exception as e:
             print(f"[LLMWildcardManager] Could not persist last reply: {e}")
 
+        # Compose the negative_prompt that will be emitted on the new
+        # output socket. Static base is verbatim user text and always
+        # first. AI-assembled bans (scene_bans + bare terms from the raw
+        # negative + axis bans rendered human-form) follow, deduped.
+        # `axis_bans` only exists on the non-locked branch; the ternary's
+        # short-circuit keeps the locked path safe. On the locked path
+        # the brief's forbidden_axes still flow through.
+        final_negative = _build_final_negative(
+            static_text=negative_static,
+            scene_bans=scene_bans,
+            axis_bans=(brief.get("forbidden_axes") or []) + (
+                axis_bans if not lock_template else []
+            ),
+            raw_negative=negative,
+        )
+
         # Build the bundle handed to the Resolver. `scene_bans` is the
         # structured list of forbidden scene elements derived from the raw
         # negative prompt; the Resolver passes it to llm_generate_value_list
         # so per-slot values can't reintroduce them. Falls back to the raw
         # text via _negative_terms when the locked-template path skipped
-        # the parse_negative step.
+        # the parse_negative step. `negative_static` and `negative_final`
+        # let the Resolver emit the same negative string when wired
+        # standalone or when a third-party node consumes the bundle.
         bundle = {
             "system_prompt": "",
             "flair": direction_text,
@@ -2706,6 +2922,8 @@ class LLMWildcardManager:
             "mood": mood_text,
             "anchors": list(anchor_list),
             "negative": negative,
+            "negative_static": negative_static,
+            "negative_final": final_negative,
             "scene_bans": list(scene_bans),
             "fixed_traits": list(fixed_traits),
             "category_overrides": dict(effective),
@@ -2736,7 +2954,7 @@ class LLMWildcardManager:
             "ui": {
                 "manager_state": [json.dumps(snapshot)],
             },
-            "result": (template, bundle),
+            "result": (template, bundle, final_negative),
         }
 
     @classmethod
@@ -2791,8 +3009,8 @@ class LLMWildcardResolver:
             },
         }
 
-    RETURN_TYPES = ("STRING", "STRING")
-    RETURN_NAMES = ("resolved_prompt", "report")
+    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_NAMES = ("resolved_prompt", "report", "negative_prompt")
     FUNCTION = "resolve"
     CATEGORY = "prompt/wildcards"
     OUTPUT_NODE = True
@@ -2811,6 +3029,8 @@ class LLMWildcardResolver:
         tier_text = ""
         mood_text = ""
         negative_text = ""
+        negative_static = ""
+        negative_final = ""
         scene_bans: list[str] = []
         fixed_traits: list[str] = []
         intended_names: list[str] = []
@@ -2819,6 +3039,8 @@ class LLMWildcardResolver:
             tier_text = prompts.get("tier") or ""
             mood_text = prompts.get("mood") or ""
             negative_text = prompts.get("negative") or ""
+            negative_static = prompts.get("negative_static") or ""
+            negative_final = prompts.get("negative_final") or ""
             raw_scene = prompts.get("scene_bans") or []
             if isinstance(raw_scene, list):
                 scene_bans = [str(s) for s in raw_scene if str(s).strip()]
@@ -2838,6 +3060,16 @@ class LLMWildcardResolver:
         # active in value generation either way.
         if not scene_bans and negative_text:
             scene_bans = list(_negative_terms(negative_text))
+
+        # Compute the emitted negative_prompt when the Manager did not
+        # pre-build one — e.g. Resolver wired standalone, or an older
+        # Manager whose bundle predates this field.
+        if not negative_final:
+            negative_final = _build_final_negative(
+                static_text=negative_static,
+                scene_bans=scene_bans,
+                raw_negative=negative_text,
+            )
 
         # If the manager bundled a list of intended wildcard names, repair any
         # template tokens that lost their double underscores (e.g. `_subject_`
@@ -3034,6 +3266,38 @@ class LLMWildcardResolver:
             except Exception as e:
                 align_status = f"error: {e}"
 
+        # Phase 2b — final negative audit. By now every wildcard is filled
+        # and grammar is smoothed; if a ban term still appears anywhere
+        # in `resolved` (LLM-drafted prose around the populated slots),
+        # ask the LLM to rewrite it out. Reuses the same
+        # "values still present" guardrail as the alignment step so a
+        # populated value can't be dropped by the rewrite. This is the
+        # backstop that fixes the "no phones → girl holding a phone"
+        # bug when the Manager-side rewrite missed it.
+        rewrite_status = "skipped"
+        rewrite_raw = ""
+        scene_keys = {s.lower() for s in scene_bans}
+        audit_terms = list(scene_bans) + [
+            t for t in _negative_terms(negative_text)
+            if t and t.lower() not in scene_keys
+        ]
+        if resolved and audit_terms:
+            new_resolved, remaining, clean, rewrite_raw = (
+                llm_rewrite_excluding_terms(
+                    resolved, audit_terms, server,
+                    seed=llm_seed,
+                )
+            )
+            if clean and new_resolved:
+                lower_new = new_resolved.lower()
+                if all(v.lower() in lower_new for v in non_empty_values):
+                    resolved = new_resolved
+                    rewrite_status = "applied"
+                else:
+                    rewrite_status = "rejected_values_lost"
+            elif remaining:
+                rewrite_status = "incomplete: " + ", ".join(remaining)
+
         # Phase 3 — splice trigger words onto the (already aligned) prompt.
         # Done after alignment so LoRA trigger tokens stay verbatim — the
         # alignment LLM might otherwise paraphrase or drop them.
@@ -3056,6 +3320,9 @@ class LLMWildcardResolver:
             "tallies": _tally(records),
             "align_status": align_status,
             "align_raw": align_raw,
+            "rewrite_status": rewrite_status,
+            "rewrite_raw": rewrite_raw,
+            "negative_prompt": negative_final or "",
             "trigger_words": triggers,
             "trigger_position": trigger_position if triggers else "",
         }
@@ -3067,7 +3334,7 @@ class LLMWildcardResolver:
 
         return {
             "ui": {"resolver_state": [json.dumps(snapshot)]},
-            "result": (resolved, report),
+            "result": (resolved, report, negative_final),
         }
 
     @classmethod
