@@ -3107,6 +3107,26 @@ class LLMWildcardResolver:
                     "default": "",
                 }),
                 "trigger_position": (["prefix", "suffix"], {"default": "prefix"}),
+                "negative_prompt": ("STRING", {
+                    "multiline": True,
+                    "default": "",
+                    "placeholder": (
+                        "Traits to AVOID at the resolver stage.\n"
+                        "Standalone (no Manager wired): this IS the negative.\n"
+                        "With a Manager wired: these terms are appended to "
+                        "the Manager's negative — widget can only add "
+                        "bans, never remove them.\n"
+                        "One item per line or comma-separated."
+                    ),
+                    "tooltip": (
+                        "Resolver-stage deny-list. Merges with the Manager's "
+                        "negative_prompt when a bundle is wired; acts as the "
+                        "sole source when the Resolver is used standalone. "
+                        "Terms here filter the on-disk pool, drive value-"
+                        "generation retries, and are re-emitted on the "
+                        "negative_prompt output."
+                    ),
+                }),
             },
             "optional": {
                 "prompts": ("WILDCARD_PROMPTS",),
@@ -3121,7 +3141,8 @@ class LLMWildcardResolver:
 
     def resolve(self, server, template, mode, max_per_category,
                 min_pool_size, values_per_call, seed, fix_seed,
-                trigger_words="", trigger_position="prefix", prompts=None):
+                trigger_words="", trigger_position="prefix",
+                negative_prompt="", prompts=None):
         rng = random.Random(seed if (fix_seed or seed != 0) else None)
 
         # Pool floor cannot exceed the hard cap.
@@ -3163,6 +3184,25 @@ class LLMWildcardResolver:
             raw_intended = prompts.get("intended_names") or []
             if isinstance(raw_intended, list):
                 intended_names = [str(n) for n in raw_intended if str(n).strip()]
+
+        # Resolver-stage negative widget. Appends to whatever the Manager
+        # already supplied (so the widget can only add bans, never remove
+        # Manager-validated ones), and is the sole source when the Resolver
+        # is wired standalone. Force a recompile of compiled_negative when
+        # the widget contributes so the re-emitted output includes the new
+        # terms even if the Manager already produced a compiled string.
+        widget_neg = (negative_prompt or "").strip()
+        if widget_neg:
+            if negative_text.strip():
+                negative_text = (
+                    negative_text.rstrip().rstrip(",").rstrip() + ", " + widget_neg
+                )
+            else:
+                negative_text = widget_neg
+            for term in _negative_terms(widget_neg):
+                if term not in scene_bans:
+                    scene_bans.append(term)
+            compiled_negative = ""
 
         # Fall back to the heuristic split when the manager didn't supply
         # structured scene_bans (locked-template path, or a stand-alone
