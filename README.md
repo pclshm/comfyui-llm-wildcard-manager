@@ -49,10 +49,16 @@ A starter workflow is in [`example_workflows/llm_wildcard_basic.json`](example_w
 ## Recommended wiring
 
 ```
-[LLM Server Config] --server--> [LLM Wildcard Manager] --prompt_template--> [LLM Wildcard Resolver] --resolved_prompt--> [CLIP Text Encode]
+[LLM Server Config] --server--> [LLM Wildcard Manager] --prompt_template--> [LLM Wildcard Resolver] --resolved_prompt--> [CLIP Text Encode (positive)]
                   \--server-----------------------------/                  \--report------> [LLM Wildcard Report]
-                                              \--prompts---------/
+                                              \--prompts---------/         \--negative_prompt-> [CLIP Text Encode (negative)]
+                  \-----------------------------(Manager) --negative_prompt-> [CLIP Text Encode (negative)] (alternative, identical output)
 ```
+
+The `negative_prompt` output is a stable, deterministic comma-separated
+deny-list — it is not LLM-rewritten — so the negative side of your CLIP
+encode pair stays predictable regardless of how the positive prompt
+re-rolls each queue.
 
 The **Server Config** is wired into both Manager and Resolver so endpoint
 settings live in one node. The Manager hands the Resolver both:
@@ -147,12 +153,16 @@ Inputs:
   `fantasy`, `anime`, `dreamlike`, `minimal`, `sfw_strict`) or type your own
   steering text directly.
 - **`negative_prompt`** — traits to avoid, applied at every step:
-  1. The drafted sentence won't include them.
+  1. The drafted sentence won't include them (with a retry + clause-strip
+     backstop when the LLM ignores the instruction — `no phones` now
+     actually keeps "holding a phone" out of the template).
   2. Aspects you pin here won't become wildcards (e.g. `no old or
      middle-aged people` stops `__age__` from being created when your idea
      already says "young woman").
   3. Each wildcard description gets an explicit exclusion clause so the
      resolver's per-slot LLM call can't drift into them either.
+  4. The same list is compiled into a deterministic `negative_prompt`
+     output you wire into CLIP Text Encode (negative).
 - **`min_categories`** — minimum number of `__wildcard__` placeholders the
   Manager will accept. Enforced by retrying the wildcardify step (up to
   twice) with the previous result and an explicit "you produced X, need at
@@ -174,6 +184,11 @@ Outputs:
 - **`prompts`** — `WILDCARD_PROMPTS` bundle. Wire into the Resolver's
   optional `prompts` input. Carries the system prompt, flair, and the merged
   category descriptions.
+- **`negative_prompt`** — deterministic comma-separated string built from
+  your `negative_prompt` widget + the parsed `scene_bans` + axis bans +
+  `forbidden_placeholders`. Not LLM-rewritten — wire it straight into your
+  CLIPTextEncode (negative) so the image model sees the same forbidden list
+  every run. Also passed through to the Resolver in the `prompts` bundle.
 
 UI:
 
@@ -223,8 +238,14 @@ Inputs:
 Outputs:
 
 - **`resolved_prompt`** — the final template with all wildcards replaced.
-  Wire into your CLIP Text Encode positive input.
+  Wire into your CLIP Text Encode positive input. After substitution and the
+  alignment pass, any comma-separated clause that still contains a forbidden
+  term from the negative prompt is stripped — so "girl, holding a phone,
+  on a bench" becomes "girl, on a bench" when `phone` is on the deny-list.
 - **`report`** — full text report. Wire into the Report node.
+- **`negative_prompt`** — the same deterministic deny-list string the
+  Manager produced (or rebuilt from `prompts` if the Manager wasn't wired).
+  Wire into your CLIP Text Encode (negative) input.
 
 ### 🎲 LLM Wildcard Report
 
