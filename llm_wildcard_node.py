@@ -254,11 +254,25 @@ def _call_openai_compatible(endpoint: str, model: str, system: str, user: str,
     return body["choices"][0]["message"]["content"].strip()
 
 
+class LLMDisabledError(RuntimeError):
+    """Raised when an LLM call is attempted while the server config has
+    `enabled=False` (the LLMServerConfig `llm_enabled` switch is OFF).
+
+    Node-level code is expected to check `server.get("enabled", True)` first
+    and take a no-LLM fallback path; this is the backstop that guarantees no
+    HTTP request goes out when the LLM is switched off. Subclasses RuntimeError
+    so the Manager/Resolver `except Exception` handlers degrade gracefully if a
+    call ever slips through."""
+
+
 def _server_call(server: dict, system: str, user: str,
                  temperature_override: float | None = None,
                  request_json: bool = False, seed: int = 0,
                  json_schema: dict | None = None,
                  grammar: str | None = None) -> str:
+    if not server.get("enabled", True):
+        raise LLMDisabledError(
+            "LLM is disabled (llm_enabled is OFF on the LLM Server Config).")
     backend = server.get("backend", "ollama")
     endpoint = server.get("endpoint", "http://localhost:11434")
     model = server.get("model", "")
@@ -347,6 +361,9 @@ def _chat_with_vision(server: dict, system: str, user: str,
       otherwise            → POST {endpoint}/chat/completions  (OpenAI-compat,
                               image_url content array)
     """
+    if not server.get("enabled", True):
+        raise LLMDisabledError(
+            "LLM is disabled (llm_enabled is OFF on the LLM Server Config).")
     backend = server.get("backend", "ollama")
     endpoint = server.get("endpoint", "")
     model = server.get("model", "")
@@ -1786,7 +1803,8 @@ def llm_align_prompt(populated: str, server: dict, seed: int = 0
 # Report formatting + parsing
 # -----------------------------------------------------------------------------
 def format_report(records: list[dict], flair: str = "",
-                  using_custom_prompt: bool = False) -> str:
+                  using_custom_prompt: bool = False,
+                  llm_enabled: bool = True) -> str:
     if not records:
         return "(no wildcards in template)"
     tallies = {"generated_new": 0, "generated_duplicate": 0, "reused": 0,
@@ -1802,6 +1820,9 @@ def format_report(records: list[dict], flair: str = "",
         f"total: {len(records)}"
     )
     meta = []
+    if not llm_enabled:
+        meta.append(
+            "LLM: OFF — reused on-disk values only, no generation/grammar pass")
     meta.append("system_prompt: CUSTOM" if using_custom_prompt else "system_prompt: default")
     if flair:
         meta.append(f"flair: {flair!r}")
@@ -2037,6 +2058,19 @@ class LLMServerConfig:
                 "api_key": ("STRING", {"default": ""}),
                 "temperature": ("FLOAT", {"default": 0.9, "min": 0.0,
                                           "max": 2.0, "step": 0.05}),
+                "llm_enabled": ("BOOLEAN", {
+                    "default": True,
+                    "label_on": "LLM on",
+                    "label_off": "LLM off (use existing)",
+                    "tooltip": (
+                        "Master switch for the LLM. When OFF, no node calls "
+                        "the LLM server: the Manager reuses its last generated "
+                        "template, and the Resolver fills __wildcards__ only "
+                        "from values already on disk (no value generation, no "
+                        "grammar pass) using the current template. Turn off to "
+                        "run the wildcard pipeline with the LLM server stopped."
+                    ),
+                }),
             },
         }
 
@@ -2045,13 +2079,15 @@ class LLMServerConfig:
     FUNCTION = "build"
     CATEGORY = "prompt/wildcards"
 
-    def build(self, backend, endpoint, model, api_key, temperature):
+    def build(self, backend, endpoint, model, api_key, temperature,
+              llm_enabled=True):
         return ({
             "backend": backend,
             "endpoint": endpoint,
             "model": model,
             "api_key": api_key,
             "temperature": float(temperature),
+            "enabled": bool(llm_enabled),
         },)
 
 
@@ -2330,6 +2366,12 @@ class LLMPromptGenerator:
                  image=None, negative_prompt="", format_as_json=False,
                  enable_thinking=False, system_prompt="", timeout_seconds=180):
         is_vision = mode in _PG_VISION_MODES
+
+        # LLM master switch is OFF (llm_enabled on the Server Config) — never
+        # call the server. Pass the input prompt straight through so the graph
+        # keeps running with whatever is already wired in.
+        if not server.get("enabled", True):
+            return (prompt or "", "", (negative_prompt or "").strip())
 
         if not is_vision and not (prompt and prompt.strip()):
             raise RuntimeError(f"Mode '{mode}' requires a non-empty prompt.")
@@ -2676,6 +2718,13 @@ class LLMWildcardManager:
         negative = (negative_prompt or "").strip()
         forbidden_names = _parse_forbidden_names(forbidden_placeholders or "")
 
+        # Master LLM switch (from the Server Config `llm_enabled` widget). When
+        # OFF we take the same no-LLM path as lock_template: reuse the last
+        # generated template + cached brief instead of calling the server.
+        llm_enabled = bool(server.get("enabled", True))
+        lock_due_to_disabled = (not llm_enabled) and not lock_template
+        effective_lock = lock_template or not llm_enabled
+
         # Parse the user-edited brief (or default {}). Non-empty means the
         # user has reviewed/edited the brief and the LLM brief step is skipped;
         # empty means we run the LLM to generate one. The brief is the single
@@ -2753,11 +2802,13 @@ class LLMWildcardManager:
         status_message = ""
         raw_sections: list[tuple[str, str]] = []
 
-        if lock_template:
+        if effective_lock:
             # Skip the LLM entirely. Reuse the last persisted template +
             # whatever category descriptions are already on disk. The Resolver
             # will still re-roll wildcard fills each queue (when fix_seed is
             # off), so the user gets a stable prompt with fresh randoms.
+            # Reached either via lock_template, or because the master LLM
+            # switch (llm_enabled) is OFF.
             cached = ""
             if LAST_TEMPLATE_PATH.exists():
                 try:
@@ -2767,24 +2818,40 @@ class LLMWildcardManager:
             if cached:
                 template = cached
                 used_names = extract_wildcard_names(template)
-                status = "locked"
-                status_message = (
-                    "Lock is ON — reusing the last generated template "
-                    "(LLM not called). Toggle off to regenerate."
-                )
+                if lock_due_to_disabled:
+                    status = "llm_disabled"
+                    status_message = (
+                        "LLM is OFF on the Server Config — reusing the last "
+                        "generated template (LLM not called). Turn the LLM "
+                        "back on to regenerate."
+                    )
+                else:
+                    status = "locked"
+                    status_message = (
+                        "Lock is ON — reusing the last generated template "
+                        "(LLM not called). Toggle off to regenerate."
+                    )
                 raw_sections.append((
                     "locked",
                     "(LLM calls skipped — template loaded from cache)",
                 ))
             else:
-                status = "no_locked_template"
-                status_message = (
-                    "Lock is ON but no cached template exists yet. "
-                    "Toggle Lock off and queue once to generate one."
-                )
+                if lock_due_to_disabled:
+                    status = "no_template_llm_disabled"
+                    status_message = (
+                        "LLM is OFF and no cached template exists yet. Turn the "
+                        "LLM on and queue once to generate one, or wire a "
+                        "template straight into the Resolver."
+                    )
+                else:
+                    status = "no_locked_template"
+                    status_message = (
+                        "Lock is ON but no cached template exists yet. "
+                        "Toggle Lock off and queue once to generate one."
+                    )
                 raw_sections.append((
                     "locked",
-                    "(no cached template — toggle Lock off to generate)",
+                    "(no cached template — turn the LLM on / unlock to generate)",
                 ))
             # Pull the cached brief so the Resolver still gets fixed_traits /
             # scene_bans even on the locked path.
@@ -3199,6 +3266,12 @@ class LLMWildcardResolver:
         effective_min = max(1, min(int(min_pool_size), int(max_per_category)))
         per_call = max(1, int(values_per_call))
 
+        # Master LLM switch (from the Server Config `llm_enabled` widget). When
+        # OFF, the Resolver never calls the LLM: it fills each __wildcard__ from
+        # the values already on disk and skips the grammar-alignment pass,
+        # resolving whatever template is currently wired in.
+        llm_enabled = bool(server.get("enabled", True))
+
         categories = load_category_config()
         flair_text = ""
         tier_text = ""
@@ -3318,6 +3391,21 @@ class LLMWildcardResolver:
             rec: dict = {"name": name, "pool_size": len(existing)}
             if blocked_existing:
                 rec["blocked_by_negative"] = blocked_existing
+
+            # Master LLM switch is OFF: never generate. Reuse a value from the
+            # on-disk pool; if there is nothing safe to reuse, leave the raw
+            # __token__ in the template (don't fabricate, don't call the LLM).
+            if not llm_enabled:
+                if safe_existing:
+                    value = rng.choice(safe_existing)
+                    rec.update({"status": "reused", "value": value})
+                    picks[name] = value
+                else:
+                    # Leave `name` out of `picks` so the substitution below
+                    # keeps the original __name__ token verbatim.
+                    rec.update({"status": "llm_disabled_no_pool", "value": ""})
+                records.append(rec)
+                continue
 
             force_new = mode == "force_new"
 
@@ -3448,9 +3536,9 @@ class LLMWildcardResolver:
         # produced nothing useful or every value is empty.
         resolved = substituted
         align_raw = ""
-        align_status = "skipped"
+        align_status = "skipped (LLM off)" if not llm_enabled else "skipped"
         non_empty_values = [v for v in picks.values() if v]
-        if substituted and non_empty_values:
+        if llm_enabled and substituted and non_empty_values:
             try:
                 aligned, align_raw = llm_align_prompt(
                     substituted, server, seed=llm_seed,
@@ -3501,7 +3589,8 @@ class LLMWildcardResolver:
                 resolved = f"{triggers}, {resolved}" if resolved else triggers
 
         report = format_report(records, flair=flair_text,
-                               using_custom_prompt=False)
+                               using_custom_prompt=False,
+                               llm_enabled=llm_enabled)
         write_last_report(report, records, flair=flair_text,
                           using_custom_prompt=False)
 
@@ -3510,6 +3599,7 @@ class LLMWildcardResolver:
             "resolved": resolved or "",
             "records": records,
             "tallies": _tally(records),
+            "llm_enabled": llm_enabled,
             "align_status": align_status,
             "align_raw": align_raw,
             "trigger_words": triggers,
