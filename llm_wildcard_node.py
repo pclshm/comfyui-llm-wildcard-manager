@@ -712,6 +712,15 @@ WILDCARDIFY_SYSTEM_PROMPT = (
     "__era_markers__, __materials__, __props__, __style__, "
     "__aesthetic__ — those don't map to specific words and produce "
     "abstract slop at sampling time.\n"
+    " 6. KEEP THE SUBJECT NOUN. The thing the sentence is about (woman, "
+    "girl, man, dog, car, ...) stays as a concrete word — never replace it "
+    "with a placeholder and never let a placeholder swallow it. Put "
+    "placeholders on the subject's ATTRIBUTES instead: rewrite 'a young "
+    "girl' as 'a __age__ girl', NOT as '__young_girl__' or '__subject__'. A "
+    "placeholder marks a varying attribute, not the thing being described. "
+    "A placeholder name like '__young_girl__' (a noun phrase that is the "
+    "subject) is always wrong — its value would have to repeat the subject "
+    "on every sample.\n"
     "\n"
     "Fixed traits (provided in the user message) must remain verbatim "
     "concrete words. You must NOT turn any fixed trait — or any "
@@ -750,22 +759,35 @@ ALIGN_SYSTEM_PROMPT = (
 )
 
 LIST_SYSTEM_PROMPT = (
-    "Generate distinct values for one image-prompt wildcard slot. Each "
-    "value is a concise, specific phrase — not a sentence.\n"
-    "Every value must fit the surrounding image prompt and respect its "
-    "direction, production tier, and mood (when those sections are "
-    "present). A 'homemade' tier means amateur/everyday-grade values, NOT "
-    "professional-grade. A mood section biases the value space toward "
-    "phrases that read with that emotional tone. Use the description to "
-    "identify the dimensions of the "
+    "Generate distinct values for one image-prompt wildcard slot. The slot is "
+    "a __placeholder__ in the template shown in the user message, and your "
+    "value is substituted IN PLACE OF that placeholder. The placeholder text "
+    "itself does NOT survive — only your value does — so each value must be a "
+    "COMPLETE drop-in replacement, not an add-on.\n"
+    "Read the template with your value in the slot: it must be grammatical and "
+    "must still describe everything the placeholder stood for. If the "
+    "placeholder stands in for the subject and no subject noun sits next to it "
+    "in the template, your value MUST name that subject — a slot described as "
+    "'a youthful female subject' is filled with 'a young girl in a slip dress', "
+    "NEVER a bare fragment like 'in a slip dress'. If a noun is already printed "
+    "right beside the placeholder (e.g. '__age__ woman'), supply only the "
+    "missing modifier ('young'), do not repeat the noun.\n"
+    "Keep each value as short as it can be while still reading correctly in "
+    "place — a concise phrase, not a paragraph.\n"
+    "Every value must respect the prompt's direction, production tier, and "
+    "mood (when those sections are present). A 'homemade' tier means "
+    "amateur/everyday-grade values, NOT professional-grade. A mood section "
+    "biases the value space toward phrases that read with that emotional tone. "
+    "Use the description to identify the dimensions of the "
     "value (e.g. hair = color + length + texture + style); spread entries "
     "across different dimensional combinations, do not return synonyms or "
     "near-paraphrases.\n"
     "Existing values are forbidden and signal which combinations are "
     "already covered — your new values must explore combinations the pool "
     "has not.\n"
-    "If a list of fixed traits is provided, no value may contradict, "
-    "replace, or restate any of them.\n"
+    "If a list of fixed traits is provided, no value may contradict any of "
+    "them, and do not restate one that already appears elsewhere in the "
+    "template.\n"
     "If a list of forbidden scene elements is provided, no value may "
     "contain or imply any of them.\n"
     'Output JSON: {"values": ["...", "...", ...]}'
@@ -1253,6 +1275,25 @@ def ensure_wildcard_format(template: str, known_names) -> str:
     return out
 
 
+def _mark_slot_in_template(template: str, name: str) -> str:
+    """Show the value-gen LLM exactly where its value lands: return `template`
+    with the target wildcard's token wrapped in [[ ]] so the model can read the
+    sentence around the slot it is filling and judge whether the subject noun is
+    already present. Untargeted placeholders stay as plain __tokens__. Returns
+    "" for an empty template."""
+    t = (template or "").strip()
+    if not t:
+        return ""
+    target = _to_snake_case(name)
+
+    def repl(m: "re.Match") -> str:
+        if _to_snake_case(m.group(2)) == target:
+            return f"[[{m.group(0)}]]"
+        return m.group(0)
+
+    return WILDCARD_RE.sub(repl, t)
+
+
 # -----------------------------------------------------------------------------
 # LLM operations — small, sequential steps. Failures raise; nothing is
 # silently substituted with canned content.
@@ -1673,17 +1714,23 @@ def llm_generate_value_list(category: str, description: str,
     without restating that anywhere in the template. Returns
     (values, raw_reply)."""
     parts = [
-        f"Category: {category}",
+        f"Wildcard slot: __{category}__",
         f"Description: {description}",
     ]
     if template and template.strip():
-        parts.append(f"Image prompt template:\n{template.strip()}")
+        marked = _mark_slot_in_template(template, category)
+        parts.append(
+            "Image prompt template — your value is substituted in place of the "
+            f"marked [[__{category}__]] token (that token is removed; only your "
+            f"value remains, so it must read correctly there):\n{marked}"
+        )
     parts.extend(_format_intent_block(direction_text, tier_text, mood_text))
     fixed = _format_fixed_traits(fixed_traits or [])
     if fixed:
         parts.append(
-            "Fixed traits (no value may contradict, replace, or restate "
-            f"any of these):\n{fixed}"
+            "Fixed traits (no value may contradict any of these; and do not "
+            "restate one that already appears elsewhere in the template):\n"
+            f"{fixed}"
         )
     bans = _format_scene_bans(scene_bans or [])
     if bans:
@@ -1691,7 +1738,10 @@ def llm_generate_value_list(category: str, description: str,
     forbidden = ("\n".join(f"- {e}" for e in existing)
                  if existing else "(none yet)")
     parts.append(f"Already used (do not repeat):\n{forbidden}")
-    parts.append(f"Produce {count} distinct new values. Output the JSON object now.")
+    parts.append(
+        f"Produce {count} distinct new values. Each must read correctly when "
+        f"substituted for [[__{category}__]]. Output the JSON object now."
+    )
     user = "\n\n".join(parts)
     raw = _server_call(server, LIST_SYSTEM_PROMPT, user,
                        request_json=True, seed=seed,
