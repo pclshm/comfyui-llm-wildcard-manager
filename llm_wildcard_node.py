@@ -856,6 +856,51 @@ LIST_JSON_SCHEMA: dict = {
 }
 
 
+# Used when a Template Builder is wired into the Manager. The user fixes the
+# SHAPE (how many wildcard slots, where, with an abstract role hint); the LLM
+# INVENTS the actual dimension each slot varies — so the structure guides
+# generation instead of being stamped in 1:1.
+STRUCTURE_NAMES_SYSTEM_PROMPT = (
+    "You name the wildcard placeholders for an image-prompt template whose "
+    "SHAPE is already fixed. The user message gives the scene (sentences "
+    "already written) and an ordered list of wildcard GROUPS; each group asks "
+    "for an exact number of placeholder NAMES — the dimensions that should "
+    "VARY across many generated images of this same scene.\n"
+    "\n"
+    "Rules:\n"
+    " 1. Output EXACTLY the requested count of names for each group, in the "
+    "given order. Every name must be unique across the whole template.\n"
+    " 2. Each name is a bare snake_case dimension — no surrounding "
+    "underscores, no values, no numbers tacked on.\n"
+    " 3. Pick concrete VISUAL dimensions tied to THIS scene (the colour, "
+    "material, length or style of a thing; the lighting; the time of day; an "
+    "expression; a garment detail). Avoid catch-all buckets like mood, "
+    "atmosphere, composition, style, vibe, aesthetic — they produce abstract "
+    "slop at sampling time.\n"
+    " 4. A group with a ROLE: invent distinct names that capture different "
+    "varying aspects of that role as it appears in the scene — NEVER the role "
+    "word with a number (role 'character' → e.g. 'hairstyle', 'build', "
+    "'attire'; not 'character_1').\n"
+    " 5. An UNDEFINED group: choose the most impactful dimensions that fit the "
+    "scene.\n"
+    " 6. Never name a slot after the subject noun itself, and never create a "
+    "name for a fixed trait or forbidden item listed in the user message.\n"
+    'Output JSON: {"groups": [["name_a", "name_b", ...], ["name_c", ...], ...]} '
+    "— one inner array per group, in order."
+)
+
+STRUCTURE_NAMES_JSON_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "groups": {
+            "type": "array",
+            "items": {"type": "array", "items": {"type": "string"}},
+        },
+    },
+    "required": ["groups"],
+}
+
+
 # -----------------------------------------------------------------------------
 # JSON / value extraction helpers
 # -----------------------------------------------------------------------------
@@ -1712,6 +1757,71 @@ def llm_describe_wildcards(names: list[str], server: dict,
     return descs, raw
 
 
+def llm_name_structure_slots(idea: str, direction_text: str,
+                             scene_context: str, groups: list[dict],
+                             server: dict, seed: int = 0,
+                             tier_text: str = "", mood_text: str = "",
+                             scene_bans: list[str] | None = None,
+                             fixed_traits: list[str] | None = None,
+                             forbidden_names: list[str] | None = None,
+                             ) -> tuple[list, str]:
+    """Invent the placeholder dimension names for a Builder-defined structure.
+
+    `groups` is the ordered list of wildcard groups ({role, count}). The LLM
+    returns one name list per group, in order, so an 'undefined' group becomes
+    real scene-fitting dimensions instead of literal `slot_N` tokens and a
+    role'd group becomes distinct facets instead of `role_N`. Returns
+    (groups_of_names, raw_reply). Empty groups short-circuit."""
+    if not groups:
+        return [], ""
+    parts: list[str] = []
+    if idea and idea.strip():
+        parts.append(f"Scene idea:\n{idea.strip()}")
+    parts.extend(_format_intent_block(direction_text, tier_text, mood_text))
+    if scene_context and scene_context.strip():
+        parts.append(f"Sentences already written for this scene:\n{scene_context.strip()}")
+    fixed = _format_fixed_traits(fixed_traits or [])
+    if fixed:
+        parts.append(
+            "Fixed traits (do NOT create a placeholder for these or any "
+            f"near-synonym):\n{fixed}")
+    bans = _format_scene_bans(scene_bans or [])
+    if bans:
+        parts.append(
+            "Forbidden scene elements (no placeholder may invite them):\n"
+            f"{bans}")
+    if forbidden_names:
+        listed = ", ".join(sorted({str(n) for n in forbidden_names if n}))
+        if listed:
+            parts.append(f"Forbidden placeholder names (never use these):\n{listed}")
+    lines: list[str] = []
+    for i, g in enumerate(groups):
+        role = (g.get("role") or "").strip()
+        cnt = int(g.get("count", 1))
+        if role:
+            lines.append(
+                f"- group {i + 1}: exactly {cnt} name(s), varying aspects of "
+                f"'{role.replace('_', ' ')}' in this scene")
+        else:
+            lines.append(
+                f"- group {i + 1}: exactly {cnt} name(s), undefined — pick the "
+                "most impactful dimensions that fit this scene")
+    parts.append("Wildcard groups (output one name array per group, in order):\n"
+                 + "\n".join(lines))
+    parts.append("Output the JSON object now.")
+    user = "\n\n".join(parts)
+    raw = _server_call(server, STRUCTURE_NAMES_SYSTEM_PROMPT, user,
+                       request_json=True, seed=seed,
+                       json_schema=STRUCTURE_NAMES_JSON_SCHEMA)
+    parsed = _extract_json_object(raw)
+    if not isinstance(parsed, dict):
+        raise ManagerStepError("structure_names", raw)
+    grp = parsed.get("groups")
+    if not isinstance(grp, list):
+        raise ManagerStepError("structure_names", raw, "missing 'groups' array")
+    return grp, raw
+
+
 def llm_generate_value_list(category: str, description: str,
                             existing: list[str], server: dict,
                             count: int = 10, seed: int = 0,
@@ -2562,19 +2672,87 @@ def _generate_freeform_template(idea, direction_text, server, seed, negative,
     return template, used_names, raw_sections
 
 
+def _finalize_group_names(groups_spec: list[dict],
+                          raw_groups: list) -> list[list[str]]:
+    """Clean the LLM-proposed names per group into exactly `count` valid,
+    globally-unique snake_case names. Drops invalid / forbidden / duplicate
+    proposals and pads any shortfall (or a failed LLM call) with role-based
+    fallback names so the requested shape is still honoured."""
+    used: set[str] = set()
+    out: list[list[str]] = []
+    for gi, spec in enumerate(groups_spec):
+        count = max(1, int(spec.get("count", 1)))
+        forbidden = {_to_snake_case(n) for n in (spec.get("forbidden") or [])}
+        proposed = (raw_groups[gi]
+                    if gi < len(raw_groups) and isinstance(raw_groups[gi], list)
+                    else [])
+        names: list[str] = []
+        for nm in proposed:
+            n = _to_snake_case(nm if isinstance(nm, str) else "")
+            if (n and _KEY_RE.match(n) and n not in used and n not in forbidden):
+                used.add(n)
+                names.append(n)
+            if len(names) >= count:
+                break
+        # Pad a shortfall (LLM returned too few, or the call failed) with a
+        # role-derived fallback so the slot count the user asked for survives.
+        base = _to_snake_case(spec.get("role") or "") or "detail"
+        k = 1
+        while len(names) < count:
+            cand = base if (base not in used and base not in forbidden) else f"{base}_{k}"
+            k += 1
+            if cand in used or cand in forbidden:
+                continue
+            used.add(cand)
+            names.append(cand)
+        out.append(names)
+    return out
+
+
+def _assemble_structure_with_names(blocks, sentence_texts, group_names):
+    """Walk the blocks in order, dropping in resolved sentence text and the
+    LLM-chosen names for each wildcard group (as `__name__` / `__!name__`).
+    Returns (template, used_names)."""
+    fragments: list[str] = []
+    used_names: list[str] = []
+    gi = 0
+    for i, blk in enumerate(blocks):
+        if not blk.get("enabled", True):
+            continue
+        if blk["kind"] == "sentence":
+            txt = (sentence_texts.get(i) or "").strip()
+            if txt:
+                fragments.append(txt)
+        elif blk["kind"] == "wildcards":
+            names = group_names[gi] if gi < len(group_names) else []
+            gi += 1
+            force_new = bool(blk.get("force_new"))
+            tokens: list[str] = []
+            for n in names:
+                used_names.append(n)
+                tokens.append(f"__!{n}__" if force_new else f"__{n}__")
+            if tokens:
+                fragments.append(", ".join(tokens))
+    return _join_builder_fragments(fragments), used_names
+
+
 def _generate_structure_template(blocks, idea, direction_text, server, seed,
-                                 scene_bans, fixed_traits, tier_text, mood_text):
+                                 scene_bans, fixed_traits, tier_text, mood_text,
+                                 forbidden_names=None):
     """Structure-driven counterpart to draft+wildcardify, used when a
     Template Builder is wired into the Manager's `structure` input.
 
-    Drafts each sentence block (literal `text` is used verbatim; an empty one
-    is written by the LLM, biased to the block's abstract role) and emits the
-    EXACT wildcard counts deterministically — the requested shape can't be
-    miscounted. The negative prompt still steers each drafted sentence via
-    `scene_bans`. Returns (template, used_names, raw_sections)."""
+    The Builder fixes the SHAPE; the LLM fills it in. Each sentence block is
+    used verbatim (literal `text`) or drafted by the LLM. The wildcard slots are
+    NOT stamped in 1:1 — the LLM invents each slot's varying dimension from the
+    scene (so an 'undefined' group becomes real dimensions, not `slot_N`, and a
+    role'd group becomes distinct facets, not `role_N`), honouring the exact
+    counts the user set. Returns (template, used_names, raw_sections)."""
     raw_sections: list[tuple[str, str]] = []
     sentence_texts: dict[int, str] = {}
     base_idea = (idea or "").strip()
+
+    # 1. Sentence blocks: literal text verbatim, else LLM-drafted.
     for i, blk in enumerate(blocks):
         if not blk.get("enabled", True) or blk["kind"] != "sentence":
             continue
@@ -2599,8 +2777,35 @@ def _generate_structure_template(blocks, idea, direction_text, server, seed,
         except ManagerStepError as e:
             raw_sections.append((f"sentence[{i}] (failed)", e.raw))
             sentence_texts[i] = base_idea or role.replace("_", " ")
-    template, slot_specs = _assemble_builder_template(blocks, sentence_texts)
-    return template, [s["name"] for s in slot_specs], raw_sections
+
+    # 2. Wildcard groups, in order. Ask the LLM to NAME each slot from the
+    # scene context (generated anew, not the role stamped in 1:1).
+    groups_spec = [
+        {"role": b.get("role", ""), "count": int(b.get("count", 1)),
+         "forbidden": forbidden_names or []}
+        for b in blocks if b.get("enabled", True) and b["kind"] == "wildcards"
+    ]
+    raw_groups: list = []
+    if groups_spec:
+        scene_context = " ".join(
+            t for t in sentence_texts.values() if t).strip()
+        try:
+            raw_groups, raw_names = llm_name_structure_slots(
+                base_idea, direction_text, scene_context, groups_spec, server,
+                seed=seed, tier_text=tier_text, mood_text=mood_text,
+                scene_bans=scene_bans, fixed_traits=fixed_traits,
+                forbidden_names=forbidden_names,
+            )
+            raw_sections.append(("structure_names", raw_names))
+        except ManagerStepError as e:
+            raw_sections.append(("structure_names (failed)", e.raw))
+            raw_groups = []
+
+    # 3. Finalize names (exact counts, unique, valid) and assemble.
+    group_names = _finalize_group_names(groups_spec, raw_groups)
+    template, used_names = _assemble_structure_with_names(
+        blocks, sentence_texts, group_names)
+    return template, used_names, raw_sections
 
 
 # =============================================================================
@@ -3084,6 +3289,7 @@ class LLMWildcardManager:
                         structure_blocks, idea_for_draft, direction_text,
                         server, effective_seed, scene_bans, fixed_traits,
                         tier_text, mood_text,
+                        forbidden_names=effective_forbidden_names,
                     )
                 else:
                     template, used_names, gen_raw = _generate_freeform_template(
@@ -3361,41 +3567,6 @@ def _join_builder_fragments(fragments: list[str]) -> str:
     joined = re.sub(r"\s+,", ",", joined)
     joined = re.sub(r"^[\s,]+|[\s,]+$", "", joined)
     return joined.strip()
-
-
-def _assemble_builder_template(blocks: list[dict],
-                               sentence_texts: dict[int, str],
-                               ) -> tuple[str, list[dict]]:
-    """Deterministically build the template + the ordered slot spec list.
-
-    `sentence_texts` maps a sentence block's index to its resolved text.
-    Wildcard groups emit `count` uniquely-numbered placeholders named after
-    the (snake_cased) role — `character_1`, `character_2`, … — so the Resolver
-    fills each with a *different* value. An undefined role becomes `slot_N`.
-    Returns (template, [{name, role, force_new}, ...])."""
-    base_counts: dict[str, int] = {}
-    slot_specs: list[dict] = []
-    fragments: list[str] = []
-    for i, blk in enumerate(blocks):
-        if not blk.get("enabled", True):
-            continue
-        if blk["kind"] == "sentence":
-            txt = (sentence_texts.get(i) or "").strip()
-            if txt:
-                fragments.append(txt)
-        elif blk["kind"] == "wildcards":
-            base = _to_snake_case(blk.get("role") or "") or "slot"
-            force_new = bool(blk.get("force_new"))
-            tokens: list[str] = []
-            for _ in range(int(blk.get("count", 1))):
-                base_counts[base] = base_counts.get(base, 0) + 1
-                name = f"{base}_{base_counts[base]}"
-                slot_specs.append({"name": name, "role": base,
-                                   "force_new": force_new})
-                tokens.append(f"__!{name}__" if force_new else f"__{name}__")
-            if tokens:
-                fragments.append(", ".join(tokens))
-    return _join_builder_fragments(fragments), slot_specs
 
 
 def _builder_skeleton(blocks: list[dict]) -> str:
