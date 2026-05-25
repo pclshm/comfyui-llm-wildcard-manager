@@ -11,15 +11,17 @@ on-disk wildcard files.
 |-------------------------------|---------|
 | 🎲 LLM Server Config          | Single place to configure the LLM backend (endpoint, model, key, temperature). Wired into both Manager and Resolver. |
 | 🎲 LLM Wildcard Manager       | Designs the prompt template. Asks the LLM to rewrite your idea as a template with `__wildcard__` placeholders, plus a description for each placeholder. |
-| 🎲 LLM Wildcard Template Builder | *Structure-first alternative to the Manager.* You hand-author the prompt's **shape** in a block editor (sentences + wildcard groups with count sliders); the LLM only writes the sentence text and per-slot descriptions. Same outputs as the Manager. |
+| 🎲 LLM Wildcard Template Builder | *Optional add-on for the Manager.* A pure structure configurator: you hand-author the prompt's **shape** in a block editor (sentences + wildcard groups with count sliders) and it outputs a `WILDCARD_STRUCTURE`. Wire it into the Manager's `structure` input to steer how the Manager builds the template. Holds no idea/negative/LLM of its own. |
 | 🎲 LLM Wildcard Resolver      | Fills `__wildcard__` slots: reuses values from disk or asks the LLM for a fresh, anti-repetition value (one slot at a time). |
 | 🎲 LLM Wildcard Report        | Renders the resolver's per-slot results as a structured collapsible view + raw text panel. Outputs counters for routing. |
 
-> **Manager vs. Template Builder:** the Manager turns a free-text *idea* into a
-> template and decides the structure for you. The Template Builder flips that —
-> *you* decide the structure (a sentence, then 3 character wildcards, an action
-> sentence, 2 pose wildcards, …) and the LLM fills in the prose + descriptions.
-> Use one or the other into the Resolver; they share the same output sockets.
+> **Manager + Template Builder:** by default the Manager turns a free-text
+> *idea* into a template and decides the structure for you. Wire a Template
+> Builder into the Manager's optional `structure` input and *you* decide the
+> structure instead (a sentence, then 3 character wildcards, an action
+> sentence, 2 pose wildcards, …) — the Manager still supplies the idea,
+> negative prompt and steering, and drafts the prose + descriptions along your
+> shape.
 
 ## Why this exists
 
@@ -62,13 +64,12 @@ A starter workflow is in [`example_workflows/llm_wildcard_basic.json`](example_w
                   \-----------------------------(Manager) --negative_prompt-> [CLIP Text Encode (negative)] (alternative, identical output)
 ```
 
-Prefer to design the prompt's **structure** yourself? Swap the Manager for the
-**Template Builder** — it has the same three output sockets:
+Prefer to design the prompt's **structure** yourself? Add a **Template Builder**
+and wire it into the Manager's optional `structure` input:
 
 ```
-[LLM Server Config] --server--> [LLM Wildcard Template Builder] --prompt_template--> [LLM Wildcard Resolver]
-                              \--server-----------------------/  \--prompts--------/
-                                                                 \--negative_prompt-> [CLIP Text Encode (negative)]
+[LLM Wildcard Template Builder] --structure--> [LLM Wildcard Manager] --prompt_template--> [LLM Wildcard Resolver]
+[LLM Server Config] --server------------------/                      \--prompts/negative_prompt-->
 ```
 
 The `negative_prompt` output is a stable, deterministic comma-separated
@@ -193,6 +194,12 @@ Inputs:
 - **`categories`** — JSON object of `{name: description}`. **User overrides
   only.** Edited via the table UI on the node. User overrides win over
   LLM-suggested descriptions.
+- **`structure`** *(optional input)* — wire from a 🎲 LLM Wildcard Template
+  Builder to hand-author the prompt's shape. When connected, the Manager drafts
+  each sentence block and emits the exact wildcard counts you defined instead of
+  letting the LLM invent the structure (`min_categories` / `max_categories` no
+  longer apply — the counts come from your sliders). The idea, negative prompt
+  and steering still come from this node.
 
 Outputs:
 
@@ -221,18 +228,20 @@ UI:
 
 ### 🎲 LLM Wildcard Template Builder
 
-A structure-first sibling of the Manager. Instead of letting the LLM decide the
-prompt's shape, you compose it from an ordered list of **blocks** in the node's
-editor, and the LLM is called only to (a) draft any sentence you leave blank and
-(b) describe each wildcard slot. Counts and placement are resolved
-deterministically in Python, so the requested shape is exact — the LLM can't
-miscount your "3 character / 2 pose" structure.
+A pure structure configurator that plugs into the Manager. Instead of letting
+the LLM decide the prompt's shape, you compose it from an ordered list of
+**blocks** and wire the result into the Manager's optional `structure` input.
+The node itself holds **no idea, negative prompt, server or LLM** — it only
+emits the shape. When a structure is wired, the Manager drafts each sentence
+block and emits the **exact** wildcard counts you defined (resolved
+deterministically in Python, so the LLM can't miscount your "3 character /
+2 pose" structure), using its own idea + negative + steering.
 
 Block types:
 
 - **Sentence block** — a literal sentence (no wildcards). Type the text to use
-  it verbatim, or leave it empty and the LLM writes one biased to the block's
-  abstract **role** (scene / action / setting / …).
+  it verbatim, or leave it empty and the Manager's LLM writes one biased to the
+  block's abstract **role** (scene / action / setting / …).
 - **Wildcard group** — a **count slider** (1–12), an abstract **role** (pick
   from a predefined list, or leave *undefined* for pure structure), and a
   **new** checkbox (emits `__!name__` to force a fresh value every run). A group
@@ -240,39 +249,22 @@ Block types:
   `__character_2__`, …) so the Resolver fills each with a **different** value.
 
 Roles are structural labels only — they name the *dimension* a slot covers,
-never its content. The content comes from your `example_prompt` idea + the LLM.
+never its content. The content comes from the **Manager's** `example_prompt`.
 
-Inputs:
+Input:
 
-- **`server`** — wire from the Server Config.
-- **`example_prompt`** — your idea. Supplies the **content**; the structure
-  editor controls the **shape**.
-- **`lock_template`** — when **on**, skip the LLM and reuse the last built
-  template (re-queue for fresh Resolver fills without rebuilding).
-- **`seed`** — `0` re-rolls every queue; non-zero is reproducible.
-- **`direction`** / **`production_tier`** / **`mood`** — same steering presets
-  as the Manager; shape the AI-written sentences and per-slot descriptions.
-- **`negative_prompt`** — traits to avoid; shapes the drafted sentences and is
-  compiled into the `negative_prompt` output.
 - **`structure`** — hidden JSON widget holding the block list. Edited via the
   block editor on the node; it's also the source of truth for headless/API runs.
 
-Outputs (identical to the Manager — drop-in for the Resolver):
+Output:
 
-- **`prompt_template`** — the assembled template. Wire into the Resolver's
-  `template`.
-- **`prompts`** — `WILDCARD_PROMPTS` bundle (flair + per-slot descriptions +
-  scene bans). Wire into the Resolver's `prompts`.
-- **`negative_prompt`** — deterministic deny-list string for CLIP Text Encode
-  (negative).
+- **`structure`** — a `WILDCARD_STRUCTURE` payload. Wire into the Manager's
+  optional `structure` input.
 
-UI:
-
-- **Generated prompt template** panel showing the last built template.
-- **Structure** editor: a live skeleton preview, one row per block with its
-  controls, `+ Sentence` / `+ Wildcard group` buttons, and ↑/↓/✕ to reorder or
-  remove. After a queue, a slot summary shows each placeholder's description and
-  on-disk entry count.
+UI: a live skeleton preview (e.g. `Sentence(scene) · __character__ ×3 · …`), one
+row per block with its controls, `+ Sentence` / `+ Wildcard group` buttons, and
+↑/↓/✕ to reorder or remove. Everything is edited live — the node performs no LLM
+work itself.
 
 ### 🎲 LLM Wildcard Resolver
 

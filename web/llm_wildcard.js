@@ -1323,9 +1323,6 @@ app.registerExtension({
                 if (!structWidget) return;
                 hideWidget(node, structWidget);
 
-                shrinkMultilineWidget(node, "example_prompt", 64);
-                shrinkMultilineWidget(node, "negative_prompt", 56);
-
                 let blocks = readStructureBlocks(structWidget);
 
                 const root = document.createElement("div");
@@ -1333,27 +1330,11 @@ app.registerExtension({
 
                 let updateBuilderSize = () => {};
 
-                // ---- generated template panel ----
-                const promptLabel = document.createElement("div");
-                promptLabel.className = "lwm-section-label lwm-fixed";
-                promptLabel.textContent = "Generated prompt template";
-                const promptPanel = document.createElement("div");
-                promptPanel.className = "lwm-prompt-panel lwm-empty lwm-fixed";
-                promptPanel.textContent =
-                    "(no template yet — queue the workflow to build)";
-                root.appendChild(promptLabel);
-                root.appendChild(promptPanel);
-
-                // ---- status banner ----
-                const statusBanner = document.createElement("div");
-                statusBanner.className = "lwm-status-banner lwm-fixed";
-                statusBanner.style.display = "none";
-                root.appendChild(statusBanner);
-
                 // ---- structure editor ----
                 const structLabel = document.createElement("div");
                 structLabel.className = "lwm-section-label lwm-fixed";
-                structLabel.textContent = "Structure — build the prompt shape";
+                structLabel.textContent =
+                    "Structure — build the prompt shape, then wire into the Manager";
                 root.appendChild(structLabel);
 
                 const skeleton = document.createElement("div");
@@ -1379,34 +1360,6 @@ app.registerExtension({
                 tbSpacer.className = "lwm-spacer";
                 toolbar.appendChild(tbSpacer);
                 root.appendChild(toolbar);
-
-                // ---- slots summary (filled after a queue) ----
-                const slotsPanel = document.createElement("div");
-                slotsPanel.className = "lwm-list lwm-fixed";
-                root.appendChild(slotsPanel);
-
-                // ---- raw LLM reply (collapsible) ----
-                const rawHeader = document.createElement("div");
-                rawHeader.className = "lwm-section-label lwm-fixed lwm-raw-header";
-                rawHeader.style.display = "none";
-                rawHeader.innerHTML =
-                    `<span class="lwm-raw-toggle">▸</span>` +
-                    `<span>Last LLM raw reply</span>`;
-                root.appendChild(rawHeader);
-                const rawPanel = document.createElement("pre");
-                rawPanel.className = "lwm-raw-reply lwm-fixed";
-                rawPanel.style.display = "none";
-                root.appendChild(rawPanel);
-                rawHeader.addEventListener("click", () => {
-                    const open = rawHeader.classList.toggle("lwm-open");
-                    rawPanel.style.display = open ? "block" : "none";
-                    updateBuilderSize();
-                });
-
-                // ---- wildcards dir path ----
-                const pathLine = document.createElement("div");
-                pathLine.className = "lwm-pathline lwm-fixed";
-                root.appendChild(pathLine);
 
                 // ---------- editor logic ----------
                 function commit() {
@@ -1568,84 +1521,6 @@ app.registerExtension({
                     commit(); render();
                 });
 
-                // ---------- snapshot rendering (after a queue) ----------
-                function renderStatus(status, message) {
-                    if (!status || status === "ok") {
-                        statusBanner.style.display = "none";
-                        return;
-                    }
-                    statusBanner.className =
-                        "lwm-status-banner lwm-fixed lwm-status-" + status;
-                    statusBanner.textContent = message || status;
-                    statusBanner.style.display = "block";
-                }
-
-                function renderSlots(slots) {
-                    slotsPanel.innerHTML = "";
-                    if (!Array.isArray(slots) || !slots.length) return;
-                    for (const s of slots) {
-                        const row = document.createElement("div");
-                        row.className = "lwm-row";
-                        const head = document.createElement("div");
-                        head.className = "lwm-row-head";
-                        const name = document.createElement("span");
-                        name.className = "lwm-blk-kind lwm-blk-wild";
-                        name.textContent = s.name;
-                        const desc = document.createElement("span");
-                        desc.className = "lwm-desc";
-                        desc.style.fontSize = "11px";
-                        desc.style.color = "#cfd3d8";
-                        desc.style.overflow = "hidden";
-                        desc.style.textOverflow = "ellipsis";
-                        desc.style.whiteSpace = "nowrap";
-                        desc.textContent = s.description || "(no description)";
-                        const badge = document.createElement("span");
-                        const c = s.count || 0;
-                        badge.className = "lwm-badge " +
-                            (c === 0 ? "" : c < 10 ? "lwm-badge-low"
-                                : c < 50 ? "lwm-badge-mid" : "lwm-badge-high");
-                        badge.textContent = String(c);
-                        badge.title = c + " values on disk";
-                        head.appendChild(name);
-                        head.appendChild(desc);
-                        head.appendChild(badge);
-                        row.appendChild(head);
-                        slotsPanel.appendChild(row);
-                    }
-                }
-
-                function renderRawReply(raw, status) {
-                    const txt = (raw || "").trim();
-                    if (!txt || txt === "(no LLM output captured)") {
-                        rawHeader.style.display = "none";
-                        rawPanel.style.display = "none";
-                        return;
-                    }
-                    rawHeader.style.display = "flex";
-                    rawPanel.textContent = txt;
-                    rawPanel.classList.toggle("lwm-error-border",
-                        status === "llm_error");
-                }
-
-                function applySnapshot(snap) {
-                    const tpl = (snap.generated_prompt || "").trim();
-                    if (tpl) {
-                        promptPanel.classList.remove("lwm-empty");
-                        promptPanel.innerHTML = renderTemplateHTML(tpl);
-                    } else {
-                        promptPanel.classList.add("lwm-empty");
-                        promptPanel.textContent =
-                            "(no template yet — queue the workflow to build)";
-                    }
-                    renderStatus(snap.status, snap.status_message);
-                    renderSlots(snap.slots);
-                    renderRawReply(snap.raw_reply, snap.status);
-                    if (snap.wildcards_dir) {
-                        pathLine.textContent = "wildcards: " + snap.wildcards_dir;
-                    }
-                    updateBuilderSize();
-                }
-
                 render();
 
                 const builderWidget = node.addDOMWidget(
@@ -1678,18 +1553,6 @@ app.registerExtension({
                         blocks = readStructureBlocks(structWidget);
                         render();
                     }, 0);
-                };
-
-                const onExecuted = nodeType.prototype.onExecuted;
-                nodeType.prototype.onExecuted = function (message) {
-                    onExecuted?.apply(this, arguments);
-                    const raw = (message?.builder_state || [])[0];
-                    if (!raw) return;
-                    try {
-                        applySnapshot(JSON.parse(raw));
-                    } catch (e) {
-                        console.warn("[LLMWildcardTemplateBuilder] bad snapshot:", e);
-                    }
                 };
             };
         }

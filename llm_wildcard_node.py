@@ -42,7 +42,6 @@ LAST_TEMPLATE_PATH = WILDCARDS_DIR / ".last_template.txt"
 LAST_REPLY_PATH = WILDCARDS_DIR / ".last_reply.json"
 LAST_RESOLVER_PATH = WILDCARDS_DIR / ".last_resolver.json"
 LAST_BRIEF_PATH = WILDCARDS_DIR / ".last_brief.json"
-LAST_BUILDER_TEMPLATE_PATH = WILDCARDS_DIR / ".last_builder_template.txt"
 
 
 # -----------------------------------------------------------------------------
@@ -2503,6 +2502,107 @@ class LLMPromptGenerator:
         return (content, thinking, neg_input)
 
 
+def _generate_freeform_template(idea, direction_text, server, seed, negative,
+                                scene_bans, fixed_traits, tier_text, mood_text,
+                                min_cats, max_cats, forbidden_names):
+    """The Manager's default (no-structure) generation: draft one sentence,
+    apply the negative backstop, then wildcardify. Extracted so `manage()` can
+    dispatch between this and the structure-driven path on one line. Returns
+    (template, used_names, raw_sections)."""
+    raw_sections: list[tuple[str, str]] = []
+    draft, raw_draft = llm_draft_prompt(
+        idea, direction_text, server, seed=seed,
+        scene_bans=scene_bans, fixed_traits=fixed_traits,
+        tier_text=tier_text, mood_text=mood_text,
+    )
+    raw_sections.append(("draft", raw_draft))
+
+    # Backstop: the draft step is instructed to avoid scene_bans, but LLMs
+    # ignore that often enough to matter ("no phones" → "a girl holding a
+    # phone"). Combine the raw negative + parsed scene_bans into match terms,
+    # and if the draft still contains a violation, retry once with the
+    # violations spelled out, then strip violating clauses as a last resort.
+    neg_match_terms = _negative_terms(negative)
+    for s in scene_bans:
+        for extra in _negative_terms(s):
+            if extra not in neg_match_terms:
+                neg_match_terms.append(extra)
+    neg_match_terms.sort(key=len, reverse=True)
+    hits = _matched_negative_terms(draft, neg_match_terms)
+    if hits:
+        forced_bans = list(scene_bans)
+        for hit in hits:
+            if hit not in {s.lower() for s in forced_bans}:
+                forced_bans.append(hit)
+        try:
+            retry_draft, retry_raw = llm_draft_prompt(
+                idea, direction_text, server, seed=seed + 1,
+                scene_bans=forced_bans, fixed_traits=fixed_traits,
+                tier_text=tier_text, mood_text=mood_text,
+            )
+            raw_sections.append(("draft (retry, negative)", retry_raw))
+            if not _matched_negative_terms(retry_draft, neg_match_terms):
+                draft = retry_draft
+            else:
+                draft, _dropped = _strip_negative_clauses(
+                    retry_draft, neg_match_terms)
+                if not draft.strip():
+                    draft, _dropped = _strip_negative_clauses(
+                        retry_draft if retry_draft else draft, neg_match_terms)
+        except ManagerStepError as e:
+            raw_sections.append(("draft (retry, failed)", e.raw or ""))
+            draft, _dropped = _strip_negative_clauses(draft, neg_match_terms)
+
+    template, used_names, raw_wildcardify = llm_wildcardify_prompt(
+        draft, server, seed=seed,
+        min_categories=min_cats, max_categories=max_cats,
+        forbidden_names=forbidden_names, fixed_traits=fixed_traits,
+    )
+    raw_sections.append(("wildcardify", raw_wildcardify))
+    return template, used_names, raw_sections
+
+
+def _generate_structure_template(blocks, idea, direction_text, server, seed,
+                                 scene_bans, fixed_traits, tier_text, mood_text):
+    """Structure-driven counterpart to draft+wildcardify, used when a
+    Template Builder is wired into the Manager's `structure` input.
+
+    Drafts each sentence block (literal `text` is used verbatim; an empty one
+    is written by the LLM, biased to the block's abstract role) and emits the
+    EXACT wildcard counts deterministically — the requested shape can't be
+    miscounted. The negative prompt still steers each drafted sentence via
+    `scene_bans`. Returns (template, used_names, raw_sections)."""
+    raw_sections: list[tuple[str, str]] = []
+    sentence_texts: dict[int, str] = {}
+    base_idea = (idea or "").strip()
+    for i, blk in enumerate(blocks):
+        if not blk.get("enabled", True) or blk["kind"] != "sentence":
+            continue
+        txt = (blk.get("text") or "").strip()
+        if txt:
+            sentence_texts[i] = txt
+            continue
+        role = (blk.get("role") or "").strip()
+        focus_idea = base_idea or "(no idea provided)"
+        if role:
+            focus_idea = (
+                f"{focus_idea}\n\nThis sentence should focus on the "
+                f"{role.replace('_', ' ')} of the scene.")
+        try:
+            sent, raw = llm_draft_prompt(
+                focus_idea, direction_text, server, seed=seed + i + 1,
+                scene_bans=scene_bans, fixed_traits=fixed_traits,
+                tier_text=tier_text, mood_text=mood_text,
+            )
+            raw_sections.append((f"sentence[{i}] {role or 'general'}", raw))
+            sentence_texts[i] = sent
+        except ManagerStepError as e:
+            raw_sections.append((f"sentence[{i}] (failed)", e.raw))
+            sentence_texts[i] = base_idea or role.replace("_", " ")
+    template, slot_specs = _assemble_builder_template(blocks, sentence_texts)
+    return template, [s["name"] for s in slot_specs], raw_sections
+
+
 # =============================================================================
 # Node 2: LLMWildcardManager — designs the prompt template + suggests categories.
 # =============================================================================
@@ -2695,6 +2795,14 @@ class LLMWildcardManager:
                     "placeholder": "Design brief — edited via the brief panel on the node.",
                 }),
             },
+            "optional": {
+                # Wire a 🎲 LLM Wildcard Template Builder here to hand-author the
+                # prompt's SHAPE. When present, the Manager drafts each sentence
+                # block and emits the exact wildcard counts you defined instead
+                # of letting the LLM invent the structure. The idea, direction,
+                # negative prompt and steering all still come from this node.
+                "structure": ("WILDCARD_STRUCTURE",),
+            },
         }
 
     RETURN_TYPES = ("STRING", "WILDCARD_PROMPTS", "STRING")
@@ -2708,7 +2816,10 @@ class LLMWildcardManager:
                negative_prompt, forbidden_placeholders,
                min_categories, max_categories,
                system_prompt_override, categories,
-               design_brief=""):
+               design_brief="", structure=None):
+        # A wired Template Builder hands the prompt's shape in here. Empty /
+        # unwired → the LLM decides the structure as before.
+        structure_blocks = _normalize_builder_blocks(structure) if structure else []
         direction = (direction or "").strip() or "none"
         direction_text = resolve_direction(direction)
         tier = (production_tier or "").strip() or "none"
@@ -2963,75 +3074,24 @@ class LLMWildcardManager:
                 idea_for_draft = (brief.get("refined_idea") or "").strip() \
                     or (example_prompt or "")
 
-                # Step 1 — draft the prompt sentence from idea + direction.
-                draft, raw_draft = llm_draft_prompt(
-                    idea_for_draft, direction_text, server,
-                    seed=effective_seed,
-                    scene_bans=scene_bans,
-                    fixed_traits=fixed_traits,
-                    tier_text=tier_text,
-                    mood_text=mood_text,
-                )
-                raw_sections.append(("draft", raw_draft))
-
-                # Backstop: the draft step is instructed to avoid scene_bans,
-                # but LLMs ignore that instruction often enough to matter
-                # ("no phones" → "a girl holding a phone"). Combine the raw
-                # negative + parsed scene_bans into match terms, and if the
-                # draft still contains a violation, retry once with the
-                # violations spelled out, then strip violating clauses as a
-                # last resort. This is the fix for forbidden traits leaking
-                # all the way through to the final image prompt.
-                neg_match_terms = _negative_terms(negative)
-                for s in scene_bans:
-                    for extra in _negative_terms(s):
-                        if extra not in neg_match_terms:
-                            neg_match_terms.append(extra)
-                neg_match_terms.sort(key=len, reverse=True)
-                hits = _matched_negative_terms(draft, neg_match_terms)
-                if hits:
-                    forced_bans = list(scene_bans)
-                    for hit in hits:
-                        if hit not in {s.lower() for s in forced_bans}:
-                            forced_bans.append(hit)
-                    try:
-                        retry_draft, retry_raw = llm_draft_prompt(
-                            idea_for_draft, direction_text, server,
-                            seed=effective_seed + 1,
-                            scene_bans=forced_bans,
-                            fixed_traits=fixed_traits,
-                            tier_text=tier_text,
-                            mood_text=mood_text,
-                        )
-                        raw_sections.append(("draft (retry, negative)", retry_raw))
-                        if not _matched_negative_terms(retry_draft,
-                                                      neg_match_terms):
-                            draft = retry_draft
-                        else:
-                            draft, _dropped = _strip_negative_clauses(
-                                retry_draft, neg_match_terms)
-                            if not draft.strip():
-                                draft, _dropped = _strip_negative_clauses(
-                                    retry_draft if retry_draft else draft,
-                                    neg_match_terms)
-                    except ManagerStepError as e:
-                        raw_sections.append(
-                            ("draft (retry, failed)", e.raw or ""))
-                        draft, _dropped = _strip_negative_clauses(
-                            draft, neg_match_terms)
-
-                # Step 2 — wildcardify with the merged deny-list. Fixed traits
-                # are passed so the LLM is told not to wildcardify any of
-                # them; if it ignores the instruction, the forbidden_axes from
-                # the brief still strip the offending placeholders post-hoc.
-                template, used_names, raw_wildcardify = llm_wildcardify_prompt(
-                    draft, server, seed=effective_seed,
-                    min_categories=min_cats,
-                    max_categories=max_cats,
-                    forbidden_names=effective_forbidden_names,
-                    fixed_traits=fixed_traits,
-                )
-                raw_sections.append(("wildcardify", raw_wildcardify))
+                # Steps 1+2 — produce the template + its placeholder names.
+                # With a Template Builder wired into `structure`, follow the
+                # user-authored shape (draft each sentence block, emit the exact
+                # wildcard counts). Otherwise let the LLM draft + wildcardify
+                # freely. Both honour fixed_traits, scene_bans and the negative.
+                if structure_blocks:
+                    template, used_names, gen_raw = _generate_structure_template(
+                        structure_blocks, idea_for_draft, direction_text,
+                        server, effective_seed, scene_bans, fixed_traits,
+                        tier_text, mood_text,
+                    )
+                else:
+                    template, used_names, gen_raw = _generate_freeform_template(
+                        idea_for_draft, direction_text, server, effective_seed,
+                        negative, scene_bans, fixed_traits, tier_text, mood_text,
+                        min_cats, max_cats, effective_forbidden_names,
+                    )
+                raw_sections.extend(gen_raw)
 
                 # Step 3 — describe each wildcard.
                 descs, raw_describe = llm_describe_wildcards(
@@ -3191,12 +3251,13 @@ class LLMWildcardManager:
 
 
 # =============================================================================
-# Node 2b: LLMWildcardTemplateBuilder — compose a prompt template's STRUCTURE
-# by hand (ordered sentence + wildcard-group blocks) and let the LLM fill in
-# the sentence text and per-slot descriptions. Structure-driven sibling of the
-# Manager: the user controls the skeleton (how many wildcards, where), the LLM
-# only writes the prose and describes each slot. Counts/placement are
-# deterministic in Python so the requested shape is exact.
+# Node 2b: LLMWildcardTemplateBuilder — hand-author a prompt template's
+# STRUCTURE (ordered sentence + wildcard-group blocks) and feed it to the
+# Manager's `structure` input. The Manager then generates along this shape:
+# it drafts each sentence block and emits the exact wildcard counts, using its
+# own idea + negative + steering. This node holds no idea/negative/server —
+# it is a pure structure configurator. The helpers below are shared with the
+# Manager's structure-driven generation path.
 # =============================================================================
 
 # Abstract structural role labels offered in the editor. They name the
@@ -3337,67 +3398,38 @@ def _assemble_builder_template(blocks: list[dict],
     return _join_builder_fragments(fragments), slot_specs
 
 
+def _builder_skeleton(blocks: list[dict]) -> str:
+    """Human-readable shape summary, e.g.
+    'Sentence(scene)  ·  __character__ ×3  ·  __pose__ ×2'. Mirrors the JS
+    editor's preview so headless runs log the same thing."""
+    segs: list[str] = []
+    for b in blocks:
+        if not b.get("enabled", True):
+            continue
+        if b["kind"] == "sentence":
+            segs.append(f"Sentence({b.get('role') or 'any'})")
+        else:
+            base = _to_snake_case(b.get("role") or "") or "slot"
+            segs.append(f"__{base}__ ×{b.get('count', 1)}")
+    return "  ·  ".join(segs) or "(empty — add a block)"
+
+
 class LLMWildcardTemplateBuilder:
-    """ComfyUI node: hand-author a template's STRUCTURE; the LLM fills the
-    prose + slot descriptions.
+    """ComfyUI node: hand-author a prompt template's STRUCTURE and feed it to
+    the Manager.
 
-    The editor stacks ordered blocks — literal/AI-written sentence blocks and
-    wildcard groups with a count slider + abstract role. Counts and placement
-    are resolved in Python (exact by construction); the LLM is called only to
-    (a) draft any sentence left blank and (b) describe each slot. Outputs match
-    the Manager (prompt_template + prompts bundle + negative_prompt) so it
-    drops straight into the Resolver.
-
-    Seed semantics mirror the Manager: lock_template OR seed!=0 → reproducible;
-    seed=0 → fresh roll every queue."""
+    This node holds NO idea, negative prompt, server or steering — it is a pure
+    structure configurator. The editor stacks ordered blocks (literal/AI-written
+    sentence blocks and wildcard groups with a count slider + abstract role) and
+    emits a `WILDCARD_STRUCTURE` payload. Wire it into the Manager's optional
+    `structure` input; the Manager then generates along this shape (drafting
+    each sentence block and emitting the exact wildcard counts) using its own
+    idea + negative + steering."""
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "server": ("LLM_SERVER",),
-                "example_prompt": ("STRING", {
-                    "multiline": True,
-                    "default": (
-                        "A portrait of a woman doing an outdoor activity, "
-                        "photorealistic, masterpiece."
-                    ),
-                    "placeholder": (
-                        "Your idea — supplies the CONTENT. The structure editor "
-                        "below controls the SHAPE (sentences + wildcard groups)."
-                    ),
-                }),
-                "lock_template": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": (
-                        "When ON, skip the LLM and reuse the last built "
-                        "template. Re-queue to get fresh random wildcards from "
-                        "the Resolver without rebuilding."
-                    ),
-                }),
-                "seed": ("INT", {"default": 0, "min": 0,
-                                 "max": 0xFFFFFFFFFFFFFFFF}),
-                "direction": ("STRING", {
-                    "default": "none",
-                    "placeholder": "preset key (e.g. 'cinematic') or custom steering text",
-                }),
-                "production_tier": ("STRING", {
-                    "default": "none",
-                    "placeholder": "preset key (e.g. 'homemade', 'editorial') or custom",
-                }),
-                "mood": ("STRING", {
-                    "default": "none",
-                    "placeholder": "preset key (e.g. 'intimate', 'playful') or custom",
-                }),
-                "negative_prompt": ("STRING", {
-                    "multiline": True,
-                    "default": "",
-                    "placeholder": (
-                        "Traits to AVOID. Shapes the AI-written sentences and "
-                        "is compiled into the negative_prompt output.\n"
-                        "One item per line or comma-separated."
-                    ),
-                }),
                 # Hidden JSON widget holding the ordered block list. The custom
                 # editor on the node reads/writes it; Python reads it here.
                 "structure": ("STRING", {
@@ -3408,241 +3440,21 @@ class LLMWildcardTemplateBuilder:
             },
         }
 
-    RETURN_TYPES = ("STRING", "WILDCARD_PROMPTS", "STRING")
-    RETURN_NAMES = ("prompt_template", "prompts", "negative_prompt")
+    RETURN_TYPES = ("WILDCARD_STRUCTURE",)
+    RETURN_NAMES = ("structure",)
     FUNCTION = "build"
     CATEGORY = "prompt/wildcards"
-    OUTPUT_NODE = True
 
-    def build(self, server, example_prompt, lock_template, seed,
-              direction, production_tier, mood, negative_prompt,
-              structure=""):
-        direction = (direction or "").strip() or "none"
-        direction_text = resolve_direction(direction)
-        tier = (production_tier or "").strip() or "none"
-        tier_text = resolve_tier(tier)
-        mood_key = (mood or "").strip() or "none"
-        mood_text = resolve_mood(mood_key)
-        negative = (negative_prompt or "").strip()
-        idea = (example_prompt or "").strip()
-
-        llm_enabled = bool(server.get("enabled", True))
-        effective_lock = bool(lock_template) or not llm_enabled
-        lock_due_to_disabled = (not llm_enabled) and not lock_template
-
+    def build(self, structure=""):
+        # Pure passthrough: normalise the edited block list and hand it to the
+        # Manager. No LLM, no idea, no negative — those live on the Manager.
         blocks = _parse_builder_structure(structure)
-
-        try:
-            seed_int = int(seed)
-        except Exception:
-            seed_int = 0
-        effective_seed = (random.SystemRandom().randrange(1, 2**31)
-                          if seed_int == 0 else seed_int)
-
-        status = "ok"
-        status_message = ""
-        raw_sections: list[tuple[str, str]] = []
-        suggested_cats: dict[str, str] = {}
-        axis_bans: list[str] = []
-        scene_bans: list[str] = list(_negative_terms(negative))
-        template = ""
-        names: list[str] = []
-
-        if effective_lock:
-            cached = ""
-            if LAST_BUILDER_TEMPLATE_PATH.exists():
-                try:
-                    cached = LAST_BUILDER_TEMPLATE_PATH.read_text(
-                        encoding="utf-8").strip()
-                except Exception as e:
-                    print(f"[LLMWildcardTemplateBuilder] Could not read cache: {e}")
-            if cached:
-                template = cached
-                names = extract_wildcard_names(template)
-                if lock_due_to_disabled:
-                    status = "llm_disabled"
-                    status_message = (
-                        "LLM is OFF on the Server Config — reusing the last "
-                        "built template (LLM not called). Turn the LLM back on "
-                        "to rebuild.")
-                else:
-                    status = "locked"
-                    status_message = (
-                        "Lock is ON — reusing the last built template (LLM not "
-                        "called). Toggle off to rebuild.")
-                raw_sections.append(
-                    ("locked", "(LLM calls skipped — template loaded from cache)"))
-            else:
-                status = ("no_template_llm_disabled" if lock_due_to_disabled
-                          else "no_locked_template")
-                status_message = (
-                    "No cached template yet. Turn the LLM on / toggle Lock off "
-                    "and queue once to build one.")
-                raw_sections.append(
-                    ("locked", "(no cached template — turn the LLM on / unlock to build)"))
-        else:
-            # Split the negative prompt into structured bans (axis + scene) so
-            # the AI-written sentences avoid them and the compiled negative is
-            # accurate. Falls back to the heuristic term split on any failure.
-            if negative:
-                try:
-                    axis_bans, parsed_scene, raw_pn = llm_parse_negative(
-                        negative, server, seed=effective_seed)
-                    raw_sections.append(("parse_negative", raw_pn))
-                    if parsed_scene:
-                        scene_bans = parsed_scene
-                except Exception as e:
-                    print(f"[LLMWildcardTemplateBuilder] parse_negative failed: {e}")
-
-            try:
-                # Step 1 — resolve every sentence block. Literal text is used
-                # verbatim; an empty sentence is drafted by the LLM, biased to
-                # the block's role. A per-block draft failure degrades to a
-                # neutral fallback rather than aborting the whole build.
-                sentence_texts: dict[int, str] = {}
-                for i, blk in enumerate(blocks):
-                    if not blk.get("enabled", True) or blk["kind"] != "sentence":
-                        continue
-                    txt = (blk.get("text") or "").strip()
-                    if txt:
-                        sentence_texts[i] = txt
-                        continue
-                    role = (blk.get("role") or "").strip()
-                    focus_idea = idea or "(no idea provided)"
-                    if role:
-                        focus_idea = (
-                            f"{focus_idea}\n\nThis sentence should focus on the "
-                            f"{role.replace('_', ' ')} of the scene.")
-                    try:
-                        sent, raw = llm_draft_prompt(
-                            focus_idea, direction_text, server,
-                            seed=effective_seed + i + 1,
-                            scene_bans=scene_bans,
-                            tier_text=tier_text, mood_text=mood_text)
-                        raw_sections.append(
-                            (f"sentence[{i}] {role or 'general'}", raw))
-                        sentence_texts[i] = sent
-                    except ManagerStepError as e:
-                        raw_sections.append((f"sentence[{i}] (failed)", e.raw))
-                        sentence_texts[i] = idea or role.replace("_", " ")
-
-                # Step 2 — deterministic assembly. Counts/placement are exact.
-                template, slot_specs = _assemble_builder_template(
-                    blocks, sentence_texts)
-                names = [s["name"] for s in slot_specs]
-
-                if not template.strip():
-                    status = "empty_structure"
-                    status_message = (
-                        "The structure produced no template. Enable at least "
-                        "one sentence or wildcard block.")
-
-                # Step 3 — describe each slot, anchored to the assembled
-                # template + idea. A describe failure keeps the template
-                # (slots fall back to generic descriptions in the Resolver).
-                if names:
-                    try:
-                        descs, raw_desc = llm_describe_wildcards(
-                            names, server, seed=effective_seed,
-                            idea=idea, direction_text=direction_text,
-                            template=template, scene_bans=scene_bans,
-                            tier_text=tier_text, mood_text=mood_text)
-                        raw_sections.append(("describe", raw_desc))
-                        suggested_cats = descs
-                    except ManagerStepError as e:
-                        raw_sections.append(("describe (failed)", e.raw))
-            except Exception as e:
-                print(f"[LLMWildcardTemplateBuilder] build failed: {e}")
-                template = ""
-                names = []
-                status = "llm_error"
-                status_message = str(e)
-                raw_sections.append(("error", f"(exception during build: {e})"))
-
-        # Effective descriptions: defaults < disk < LLM-suggested. No user
-        # override table on this node (the Resolver's category config still
-        # applies downstream).
-        merged_disk = load_category_config()
-        effective: dict[str, str] = dict(DEFAULT_CATEGORIES)
-        effective.update(merged_disk)
-        effective.update(suggested_cats)
-
-        # Deliberately do NOT persist suggested_cats to wildcard_categories.json:
-        # the slot names are template-specific numbered tokens (character_1, …)
-        # that would accumulate as clutter, and the descriptions already reach
-        # the Resolver via the bundle's `category_overrides` below. Only the
-        # built template is cached (the lock path reloads it).
-        if template and status == "ok":
-            try:
-                LAST_BUILDER_TEMPLATE_PATH.write_text(template, encoding="utf-8")
-            except Exception as e:
-                print(f"[LLMWildcardTemplateBuilder] Could not persist template: {e}")
-
-        compiled_negative = compile_negative_prompt(
-            user_negative=negative,
-            scene_bans=scene_bans,
-            axis_bans=axis_bans,
-            forbidden_placeholders=[],
-        )
-
-        raw_reply = "\n\n".join(
-            f"--- step: {step} ---\n{(body or '').strip()}"
-            for step, body in raw_sections
-        ) or "(no LLM output captured)"
-
-        bundle = {
-            "system_prompt": "",
-            "flair": direction_text,
-            "tier": tier_text,
-            "mood": mood_text,
-            "anchors": [],
-            "negative": negative,
-            "scene_bans": list(scene_bans),
-            "fixed_traits": [],
-            "forbidden_axes": list(axis_bans),
-            "forbidden_placeholders": [],
-            "compiled_negative": compiled_negative,
-            "category_overrides": dict(effective),
-            "intended_names": list(names),
-        }
-
-        disk = list_disk_categories()
-        slot_rows = [{
-            "name": n,
-            "description": effective.get(n, ""),
-            "count": len(disk.get(n, [])),
-        } for n in names]
-
-        snapshot = {
-            "wildcards_dir": str(WILDCARDS_DIR),
-            "generated_prompt": template,
-            "status": status,
-            "status_message": status_message,
-            "raw_reply": raw_reply,
-            "direction": direction,
-            "direction_presets": DIRECTION_PRESETS,
-            "production_tier": tier,
-            "tier_presets": TIER_PRESETS,
-            "mood": mood_key,
-            "mood_presets": MOOD_PRESETS,
-            "negative_prompt": negative,
-            "slots": slot_rows,
-        }
-
+        skeleton = _builder_skeleton(blocks)
+        snapshot = {"blocks": blocks, "skeleton": skeleton}
         return {
             "ui": {"builder_state": [json.dumps(snapshot)]},
-            "result": (template, bundle, compiled_negative),
+            "result": ({"blocks": blocks},),
         }
-
-    @classmethod
-    def IS_CHANGED(cls, **kwargs):
-        # Same contract as the Manager: lock_template OR seed!=0 → reproducible
-        # (the downstream Resolver still re-rolls each queue when fix_seed is
-        # off); lock_template=False AND seed=0 → fresh roll every queue.
-        if bool(kwargs.get("lock_template")):
-            return _seeded_is_changed(True, kwargs)
-        locked = int(kwargs.get("seed", 0) or 0) != 0
-        return _seeded_is_changed(locked, kwargs)
 
 
 # =============================================================================
