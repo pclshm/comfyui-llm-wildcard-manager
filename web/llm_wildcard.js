@@ -552,6 +552,7 @@ function injectStyles() {
             border:1px solid #2e3338; border-radius:4px; padding:3px 6px;
             font-size:11px; outline:none; max-width:140px; min-width:0; }
         .lwm-select:focus { border-color:#4d8cd0; }
+        .lwm-preset-select { flex:0 0 auto; max-width:160px; }
         .lwm-range { flex:0 1 110px; min-width:60px; accent-color:#4d8cd0;
             cursor:pointer; }
         .lwm-count { flex:0 0 auto; font-size:11px; color:#9ec5ff;
@@ -685,6 +686,184 @@ function structureSkeleton(blocks) {
     }
     return segs.join("  ·  ") || "(empty — add a block)";
 }
+
+// ---------------------------------------------------------------------------
+// Starter presets — ready-made structures the user can load into the editor.
+// Each preset is a pure *shape*: empty-text sentence blocks (the AI writes the
+// prose) plus role-tagged wildcard groups. The content is intentionally
+// generic, so any idea can be poured into the same composition. Loading a
+// preset REPLACES the current blocks. Roles are drawn from
+// BUILDER_SENTENCE_ROLES / BUILDER_WILDCARD_ROLES.
+// ---------------------------------------------------------------------------
+function _ps(role) {                          // sentence block (AI-written)
+    return { kind: "sentence", enabled: true, role: role || "", text: "" };
+}
+function _pw(role, count, forceNew) {         // wildcard group
+    return { kind: "wildcards", enabled: true, role: role || "",
+             count: count || 1, force_new: !!forceNew };
+}
+
+const BUILDER_PRESETS = [
+    { group: "Portraits & Characters", items: [
+        { name: "Simple Character Portrait",
+          blocks: [ _ps("subject"), _pw("character", 3), _pw("appearance", 2), _ps("style") ] },
+        { name: "Detailed Character Sheet",
+          blocks: [ _ps("subject"), _pw("character", 2), _pw("appearance", 3),
+                    _pw("outfit", 2), _pw("accessory", 2), _ps("style") ] },
+        { name: "Fashion / Outfit Showcase",
+          blocks: [ _ps("subject"), _pw("outfit", 4), _pw("accessory", 3),
+                    _pw("pose", 1), _ps("style") ] },
+        { name: "Close-up Headshot",
+          blocks: [ _ps("subject"), _pw("appearance", 3), _pw("expression", 2),
+                    _pw("lighting", 2), _ps("closing") ] },
+        { name: "Full-Body Character",
+          blocks: [ _ps("scene"), _pw("character", 2), _pw("outfit", 3),
+                    _pw("pose", 2), _pw("setting", 1), _ps("closing") ] },
+        { name: "Character Duo",
+          blocks: [ _ps("scene"), _pw("character", 2), _pw("pose", 2),
+                    _pw("expression", 2), _ps("action"), _ps("style") ] },
+        { name: "Group Scene",
+          blocks: [ _ps("scene"), _pw("character", 3), _pw("activity", 2),
+                    _pw("setting", 2), _ps("atmosphere") ] },
+        { name: "Emotion Study",
+          blocks: [ _ps("subject"), _pw("expression", 3), _pw("mood", 2),
+                    _pw("lighting", 2), _ps("closing") ] },
+        { name: "Action Pose",
+          blocks: [ _ps("action"), _pw("character", 2), _pw("pose", 3),
+                    _pw("action", 2), _ps("atmosphere"), _ps("style") ] },
+        { name: "Costume Focus",
+          blocks: [ _ps("subject"), _pw("outfit", 4), _pw("material", 2),
+                    _pw("detail", 2), _ps("style") ] },
+    ]},
+    { group: "Scenes & Environments", items: [
+        { name: "Landscape Vista",
+          blocks: [ _ps("scene"), _pw("location", 2), _pw("weather", 2),
+                    _pw("lighting", 2), _ps("atmosphere"), _ps("style") ] },
+        { name: "Cityscape / Urban",
+          blocks: [ _ps("scene"), _pw("location", 2), _pw("time", 1),
+                    _pw("lighting", 2), _pw("detail", 2), _ps("atmosphere") ] },
+        { name: "Interior Room",
+          blocks: [ _ps("setting"), _pw("location", 1), _pw("material", 2),
+                    _pw("lighting", 2), _pw("detail", 3), _ps("atmosphere") ] },
+        { name: "Nature Wilderness",
+          blocks: [ _ps("scene"), _pw("location", 2), _pw("weather", 1),
+                    _pw("time", 1), _pw("detail", 3), _ps("style") ] },
+        { name: "Fantasy Environment",
+          blocks: [ _ps("scene"), _pw("setting", 2), _pw("detail", 3),
+                    _pw("lighting", 2), _pw("color", 2), _ps("atmosphere") ] },
+        { name: "Sci-Fi Setting",
+          blocks: [ _ps("scene"), _pw("setting", 2), _pw("material", 2),
+                    _pw("lighting", 2), _pw("detail", 2), _ps("style") ] },
+        { name: "Seasonal Scene",
+          blocks: [ _ps("scene"), _pw("location", 1), _pw("weather", 2),
+                    _pw("time", 1), _pw("color", 2), _ps("atmosphere") ] },
+        { name: "Weather & Mood",
+          blocks: [ _ps("scene"), _pw("weather", 3), _pw("lighting", 2),
+                    _pw("mood", 2), _ps("atmosphere") ] },
+        { name: "Architectural Study",
+          blocks: [ _ps("subject"), _pw("setting", 2), _pw("material", 3),
+                    _pw("composition", 2), _pw("lighting", 1), _ps("style") ] },
+        { name: "Establishing Shot",
+          blocks: [ _ps("scene"), _pw("location", 2), _pw("composition", 2),
+                    _pw("lighting", 2), _pw("time", 1), _ps("closing") ] },
+    ]},
+    { group: "Cinematic & Photography", items: [
+        { name: "Cinematic Wide Shot",
+          blocks: [ _ps("scene"), _pw("subject", 1), _pw("setting", 2),
+                    _pw("lighting", 2), _pw("camera", 2), _pw("mood", 1), _ps("style") ] },
+        { name: "Film Still",
+          blocks: [ _ps("scene"), _pw("character", 1), _pw("action", 1),
+                    _pw("lighting", 2), _pw("camera", 2), _pw("color", 1), _ps("atmosphere") ] },
+        { name: "Golden Hour Portrait",
+          blocks: [ _ps("subject"), _pw("character", 2), _pw("lighting", 3),
+                    _pw("time", 1), _pw("mood", 1), _ps("style") ] },
+        { name: "Studio Product Shot",
+          blocks: [ _ps("subject"), _pw("material", 2), _pw("lighting", 3),
+                    _pw("composition", 2), _pw("detail", 2), _ps("closing") ] },
+        { name: "Street Photography",
+          blocks: [ _ps("scene"), _pw("subject", 1), _pw("location", 1),
+                    _pw("action", 1), _pw("time", 1), _pw("camera", 1), _ps("atmosphere") ] },
+        { name: "Macro Detail",
+          blocks: [ _ps("subject"), _pw("texture", 3), _pw("detail", 3),
+                    _pw("lighting", 2), _ps("style") ] },
+        { name: "Dramatic Lighting",
+          blocks: [ _ps("scene"), _pw("subject", 1), _pw("lighting", 4),
+                    _pw("mood", 2), _pw("color", 1), _ps("closing") ] },
+        { name: "Documentary Candid",
+          blocks: [ _ps("scene"), _pw("subject", 1), _pw("action", 1),
+                    _pw("setting", 1), _pw("camera", 1), _ps("atmosphere") ] },
+        { name: "Editorial Fashion",
+          blocks: [ _ps("subject"), _pw("character", 1), _pw("outfit", 3),
+                    _pw("pose", 2), _pw("lighting", 2), _pw("camera", 1), _ps("style") ] },
+        { name: "Noir / Moody",
+          blocks: [ _ps("scene"), _pw("subject", 1), _pw("lighting", 2),
+                    _pw("mood", 2), _pw("color", 2), _pw("camera", 1), _ps("atmosphere") ] },
+    ]},
+    { group: "Stylized & Artistic", items: [
+        { name: "Anime / Manga Style",
+          blocks: [ _ps("subject"), _pw("character", 2), _pw("expression", 2),
+                    _pw("outfit", 2), _pw("style", 2), _ps("closing") ] },
+        { name: "Oil Painting",
+          blocks: [ _ps("scene"), _pw("subject", 1), _pw("color", 2),
+                    _pw("texture", 2), _pw("style", 3), _ps("atmosphere") ] },
+        { name: "Watercolor Soft",
+          blocks: [ _ps("scene"), _pw("subject", 1), _pw("color", 3),
+                    _pw("texture", 2), _pw("style", 2), _ps("atmosphere") ] },
+        { name: "Concept Art Splash",
+          blocks: [ _ps("scene"), _pw("subject", 1), _pw("setting", 2),
+                    _pw("color", 2), _pw("detail", 2), _pw("style", 2), _ps("closing") ] },
+        { name: "Flat Vector / Minimal",
+          blocks: [ _ps("subject"), _pw("composition", 2), _pw("color", 3),
+                    _pw("style", 2), _ps("closing") ] },
+        { name: "Surreal Dreamscape",
+          blocks: [ _ps("scene"), _pw("subject", 2), _pw("setting", 2),
+                    _pw("color", 2), _pw("mood", 2), _pw("style", 1), _ps("atmosphere") ] },
+        { name: "Cyberpunk Neon",
+          blocks: [ _ps("scene"), _pw("setting", 2), _pw("lighting", 2),
+                    _pw("color", 3), _pw("detail", 2), _pw("style", 1), _ps("atmosphere") ] },
+        { name: "Steampunk",
+          blocks: [ _ps("scene"), _pw("subject", 1), _pw("material", 3),
+                    _pw("detail", 3), _pw("color", 1), _pw("style", 1), _ps("closing") ] },
+        { name: "Vintage / Retro",
+          blocks: [ _ps("scene"), _pw("subject", 1), _pw("color", 2),
+                    _pw("texture", 2), _pw("style", 2), _ps("atmosphere") ] },
+        { name: "Pop Art Bold",
+          blocks: [ _ps("subject"), _pw("color", 4), _pw("composition", 2),
+                    _pw("style", 2), _ps("closing") ] },
+    ]},
+    { group: "Subjects & Themes", items: [
+        { name: "Animal / Creature",
+          blocks: [ _ps("subject"), _pw("subject", 2), _pw("appearance", 2),
+                    _pw("setting", 1), _pw("detail", 2), _ps("style") ] },
+        { name: "Food / Culinary",
+          blocks: [ _ps("subject"), _pw("subject", 2), _pw("material", 2),
+                    _pw("color", 2), _pw("lighting", 2), _pw("composition", 1), _ps("style") ] },
+        { name: "Vehicle / Machine",
+          blocks: [ _ps("subject"), _pw("subject", 2), _pw("material", 2),
+                    _pw("detail", 3), _pw("setting", 1), _pw("lighting", 1), _ps("style") ] },
+        { name: "Still Life Arrangement",
+          blocks: [ _ps("scene"), _pw("subject", 3), _pw("material", 2),
+                    _pw("lighting", 2), _pw("composition", 2), _ps("style") ] },
+        { name: "Abstract Composition",
+          blocks: [ _ps("scene"), _pw("color", 3), _pw("texture", 2),
+                    _pw("composition", 3), _pw("style", 1), _ps("closing") ] },
+        { name: "Botanical / Floral",
+          blocks: [ _ps("subject"), _pw("subject", 2), _pw("color", 3),
+                    _pw("texture", 2), _pw("detail", 2), _ps("style") ] },
+        { name: "Mythical Creature",
+          blocks: [ _ps("scene"), _pw("subject", 2), _pw("appearance", 3),
+                    _pw("setting", 1), _pw("detail", 2), _pw("style", 1), _ps("atmosphere") ] },
+        { name: "Mecha / Robot",
+          blocks: [ _ps("subject"), _pw("subject", 1), _pw("material", 3),
+                    _pw("detail", 3), _pw("pose", 1), _pw("lighting", 1), _ps("style") ] },
+        { name: "Underwater Scene",
+          blocks: [ _ps("scene"), _pw("setting", 2), _pw("color", 2),
+                    _pw("lighting", 2), _pw("detail", 2), _ps("atmosphere") ] },
+        { name: "Cosmic / Space",
+          blocks: [ _ps("scene"), _pw("setting", 2), _pw("color", 3),
+                    _pw("lighting", 2), _pw("detail", 2), _ps("atmosphere"), _ps("style") ] },
+    ]},
+];
 
 // ---------------------------------------------------------------------------
 // Extension
@@ -1359,6 +1538,41 @@ app.registerExtension({
                 const tbSpacer = document.createElement("div");
                 tbSpacer.className = "lwm-spacer";
                 toolbar.appendChild(tbSpacer);
+
+                // ---- starter-preset loader ----
+                const presetSelect = document.createElement("select");
+                presetSelect.className = "lwm-select lwm-preset-select";
+                presetSelect.title =
+                    "Load a ready-made structure (replaces the current blocks)";
+                const presetPlaceholder = document.createElement("option");
+                presetPlaceholder.value = "";
+                presetPlaceholder.textContent = "Load preset…";
+                presetSelect.appendChild(presetPlaceholder);
+                const flatPresets = [];
+                for (const grp of BUILDER_PRESETS) {
+                    const og = document.createElement("optgroup");
+                    og.label = grp.group;
+                    for (const it of grp.items) {
+                        const o = document.createElement("option");
+                        o.value = String(flatPresets.length);
+                        o.textContent = it.name;
+                        og.appendChild(o);
+                        flatPresets.push(it);
+                    }
+                    presetSelect.appendChild(og);
+                }
+                presetSelect.addEventListener("change", () => {
+                    const it = flatPresets[parseInt(presetSelect.value, 10)];
+                    presetSelect.value = "";          // snap back to placeholder
+                    if (!it) return;
+                    // normalizeBlocks deep-copies + validates, so the shared
+                    // preset definition is never mutated by later edits.
+                    blocks = normalizeBlocks({ blocks: it.blocks });
+                    commit();
+                    render();
+                });
+                toolbar.appendChild(presetSelect);
+
                 root.appendChild(toolbar);
 
                 // ---------- editor logic ----------
