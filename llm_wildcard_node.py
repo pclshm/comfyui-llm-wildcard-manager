@@ -303,6 +303,35 @@ def _server_call(server: dict, system: str, user: str,
 
 
 # -----------------------------------------------------------------------------
+# Per-step temperature policy. The Manager's structural + prose steps run
+# COOLER than value generation so the template stays anchored to the user's
+# idea instead of wandering at the server's (often high, default 0.9) temp.
+# Only the Resolver's per-slot value-list call uses the server temperature,
+# where diversity across values is the whole point.
+#
+# Each ceiling is capped at the server temperature and never raised above it,
+# so a user who deliberately sets a low server temp keeps everything cool.
+# -----------------------------------------------------------------------------
+TEMP_BRIEF = 0.5
+TEMP_PARSE_NEGATIVE = 0.3
+TEMP_DRAFT = 0.65
+TEMP_WILDCARDIFY = 0.4
+TEMP_SLOT_NAMES = 0.6
+TEMP_DESCRIBE = 0.5
+TEMP_ALIGN = 0.2
+
+
+def _design_temp(server: dict, ceiling: float) -> float:
+    """Temperature for a Manager design/prose step: `ceiling`, but never hotter
+    than the server's own temperature."""
+    try:
+        base = float(server.get("temperature", 0.9))
+    except Exception:
+        base = 0.9
+    return min(base, ceiling)
+
+
+# -----------------------------------------------------------------------------
 # Vision-aware chat helper for the LLMPromptGenerator node.
 #
 # Talks directly to whatever endpoint the user already configured in their
@@ -679,26 +708,16 @@ PARSE_NEGATIVE_SYSTEM_PROMPT = (
 
 DRAFT_SYSTEM_PROMPT = (
     "Write ONE image-prompt sentence that realises the scenario in the user "
-    "message. Concrete, visual, present tense. No preamble, no quotes — the "
-    "sentence only.\n"
-    "Hard length budget: 25-45 words, ONE sentence, at most three "
-    "comma-joined clauses. This is a tight blueprint, not a paragraph — "
-    "wildcardification happens in the next step, so leave room. Do NOT "
-    "stack decorative wrap-up subclauses about the moment, the feeling, or "
-    "the timelessness of the scene. Do NOT restate the same element twice "
-    "with different adjectives.\n"
-    "Name the SUBJECT, what they are DOING, the SETTING, and the LIGHTING. "
-    "Stop there. Mood adjectives and meta-commentary are forbidden.\n"
-    "If a list of fixed traits is provided, every phrase in that list MUST "
-    "appear verbatim (or as a near-identical substring) in the sentence. "
-    "Do not paraphrase or substitute them.\n"
-    "If a list of forbidden scene elements is provided, the sentence MUST "
-    "NOT depict or imply any of them.\n"
-    "If a 'Production tier' section is provided, the depicted scene MUST be "
-    "consistent with that tier (e.g. 'homemade' → phone snapshot in an "
-    "ordinary space; 'studio' → controlled lighting and styled set). "
-    "If a 'Mood' section is provided, the action and posing MUST match that "
-    "mood, without adding flowery mood adjectives to the sentence."
+    "message. Concrete, visual, present tense. Output the sentence only — no "
+    "preamble, no quotes.\n"
+    "Budget: 25-45 words, ONE sentence, at most three comma-joined clauses. "
+    "Name the subject, what they are doing, the setting, and the lighting — "
+    "then stop. Do not add wrap-up clauses about the mood or feeling of the "
+    "moment, and do not restate the same element with different adjectives.\n"
+    "Every fixed trait provided must appear verbatim (or as a near-identical "
+    "substring). No forbidden scene element may appear. If a production tier "
+    "or mood is given, the action, setting and posing must fit it — convey "
+    "mood through what the subject does, not through adjectives."
 )
 
 WILDCARDIFY_SYSTEM_PROMPT = (
@@ -776,37 +795,24 @@ ALIGN_SYSTEM_PROMPT = (
 )
 
 LIST_SYSTEM_PROMPT = (
-    "Generate distinct values for one image-prompt wildcard slot. The slot is "
-    "a __placeholder__ in the template shown in the user message, and your "
-    "value is substituted IN PLACE OF that placeholder. The placeholder text "
-    "itself does NOT survive — only your value does — so each value must be a "
-    "COMPLETE drop-in replacement, not an add-on.\n"
-    "Read the template with your value in the slot: it must be grammatical and "
-    "must still describe everything the placeholder stood for. If the "
-    "placeholder stands in for the subject and no subject noun sits next to it "
-    "in the template, your value MUST name that subject — a slot described as "
-    "'a youthful female subject' is filled with 'a young girl in a slip dress', "
-    "NEVER a bare fragment like 'in a slip dress'. If a noun is already printed "
-    "right beside the placeholder (e.g. '__age__ woman'), supply only the "
-    "missing modifier ('young'), do not repeat the noun.\n"
-    "Keep each value as short as it can be while still reading correctly in "
-    "place — a concise phrase, not a paragraph.\n"
-    "Every value must respect the prompt's direction, production tier, and "
-    "mood (when those sections are present). A 'homemade' tier means "
-    "amateur/everyday-grade values, NOT professional-grade. A mood section "
-    "biases the value space toward phrases that read with that emotional tone. "
-    "Use the description to identify the dimensions of the "
-    "value (e.g. hair = color + length + texture + style); spread entries "
-    "across different dimensional combinations, do not return synonyms or "
-    "near-paraphrases.\n"
-    "Existing values are forbidden and signal which combinations are "
-    "already covered — your new values must explore combinations the pool "
-    "has not.\n"
-    "If a list of fixed traits is provided, no value may contradict any of "
-    "them, and do not restate one that already appears elsewhere in the "
-    "template.\n"
-    "If a list of forbidden scene elements is provided, no value may "
-    "contain or imply any of them.\n"
+    "Generate distinct values for ONE image-prompt wildcard slot. Your value "
+    "is substituted IN PLACE OF the __placeholder__ shown in the template — "
+    "the placeholder text is removed, only your value remains — so each value "
+    "must be a COMPLETE drop-in that reads correctly and grammatically there "
+    "and still covers everything the placeholder stood for.\n"
+    "If no subject noun sits beside the placeholder, your value must name the "
+    "subject (a slot for 'a youthful female subject' → 'a young girl in a slip "
+    "dress', never a bare 'in a slip dress'); if a noun is already printed "
+    "next to it ('__age__ woman'), supply only the missing modifier ('young').\n"
+    "Keep each value as short as it reads correctly — a concise phrase, not a "
+    "sentence. Use the description to find the value's dimensions (e.g. hair = "
+    "colour + length + texture + style) and spread entries across different "
+    "combinations; no synonyms or near-paraphrases. Existing values are "
+    "forbidden and mark combinations already covered — explore new ones.\n"
+    "Respect the prompt's direction, production tier and mood when those "
+    "sections are present (a 'homemade' tier means everyday-grade values, not "
+    "professional). No value may contradict a fixed trait, restate one already "
+    "in the template, or contain a forbidden scene element.\n"
     'Output JSON: {"values": ["...", "...", ...]}'
 )
 
@@ -898,6 +904,47 @@ STRUCTURE_NAMES_JSON_SCHEMA: dict = {
         },
     },
     "required": ["groups"],
+}
+
+
+# Used when a Template Builder is wired in: write the prose for the empty
+# sentence blocks in ONE call so they compose into a single coherent scene
+# (instead of each sentence being drafted independently as its own full
+# scene, which produced repetitive, conflicting templates).
+STRUCTURE_PROSE_SYSTEM_PROMPT = (
+    "You write the prose for an image-prompt template whose SHAPE is already "
+    "fixed. The user message gives the scene idea and an ordered list of "
+    "SLOTS. Some slots are sentence fragments you must write; others are "
+    "wildcard groups (filled elsewhere) shown only so you know where the "
+    "varying details go. Your fragments plus those wildcard slots together "
+    "form ONE coherent image prompt of a SINGLE scene — never several "
+    "separate scenes.\n"
+    "Rules:\n"
+    " 1. Write a fragment only for each slot under 'Write these sentence "
+    "slots', keyed by its slot number.\n"
+    " 2. Each fragment is short — a clause or short sentence covering ONLY "
+    "its role's contribution. Do not restate the whole scene in every "
+    "fragment, and do not repeat what another fragment or a wildcard slot "
+    "already covers.\n"
+    " 3. Leave varying details to the wildcard slots: when a nearby wildcard "
+    "group covers an aspect (appearance, pose, lighting, …), name the thing "
+    "but do not pin that aspect in your prose.\n"
+    " 4. Concrete, visual, present tense. No mood adjectives, no "
+    "meta-commentary — convey any given mood through action and setting.\n"
+    " 5. Every fixed trait listed must appear verbatim in some fragment; no "
+    "forbidden scene element may appear.\n"
+    'Output JSON: {"fragments": {"<slot number>": "<fragment>", ...}}'
+)
+
+STRUCTURE_PROSE_JSON_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "fragments": {
+            "type": "object",
+            "additionalProperties": {"type": "string"},
+        },
+    },
+    "required": ["fragments"],
 }
 
 
@@ -1457,7 +1504,8 @@ def llm_design_brief(idea: str, direction_text: str, server: dict,
     user = "\n\n".join(parts)
     raw = _server_call(server, BRIEF_SYSTEM_PROMPT, user,
                        request_json=True, seed=seed,
-                       json_schema=BRIEF_JSON_SCHEMA)
+                       json_schema=BRIEF_JSON_SCHEMA,
+                       temperature_override=_design_temp(server, TEMP_BRIEF))
     parsed = _extract_json_object(raw)
     return normalize_brief(parsed), raw
 
@@ -1480,7 +1528,9 @@ def llm_parse_negative(negative_prompt: str, server: dict, seed: int = 0,
     )
     raw = _server_call(server, PARSE_NEGATIVE_SYSTEM_PROMPT, user,
                        request_json=True, seed=seed,
-                       json_schema=PARSE_NEGATIVE_JSON_SCHEMA)
+                       json_schema=PARSE_NEGATIVE_JSON_SCHEMA,
+                       temperature_override=_design_temp(
+                           server, TEMP_PARSE_NEGATIVE))
     parsed = _extract_json_object(raw)
     if not isinstance(parsed, dict):
         # Fall back to treating everything as scene bans rather than failing
@@ -1540,7 +1590,8 @@ def llm_draft_prompt(idea: str, direction_text: str, server: dict,
         parts.append(f"Variation token: {seed}")
     parts.append("Write the image-prompt sentence now.")
     user = "\n\n".join(parts)
-    raw = _server_call(server, DRAFT_SYSTEM_PROMPT, user, seed=seed)
+    raw = _server_call(server, DRAFT_SYSTEM_PROMPT, user, seed=seed,
+                       temperature_override=_design_temp(server, TEMP_DRAFT))
     sentence = (raw or "").strip()
     if len(sentence) >= 2 and sentence[0] in "\"'`" and sentence[-1] == sentence[0]:
         sentence = sentence[1:-1].strip()
@@ -1656,7 +1707,9 @@ def llm_wildcardify_prompt(draft_prompt: str, server: dict,
         attempt_seed = seed + attempt * 9973 if seed else 0
         raw = _server_call(server, WILDCARDIFY_SYSTEM_PROMPT, user,
                            request_json=True, seed=attempt_seed,
-                           json_schema=WILDCARDIFY_JSON_SCHEMA)
+                           json_schema=WILDCARDIFY_JSON_SCHEMA,
+                           temperature_override=_design_temp(
+                               server, TEMP_WILDCARDIFY))
         template, names, in_template = _parse_wildcardify_reply(raw)
         if forbidden_set and any(n in forbidden_set for n in names):
             keep = [n for n in names if n not in forbidden_set]
@@ -1728,7 +1781,9 @@ def llm_describe_wildcards(names: list[str], server: dict,
     parts: list[str] = []
     if idea and idea.strip():
         parts.append(f"User idea:\n{idea.strip()}")
-    parts.extend(_format_intent_block(direction_text, tier_text, mood_text))
+    # Direction shapes value aesthetics; tier/mood describe the moment, not the
+    # SHAPE of a slot's values, so they're intentionally omitted here.
+    parts.extend(_format_intent_block(direction_text, "", ""))
     if template and template.strip():
         parts.append(f"Prompt template:\n{template.strip()}")
     fixed = _format_fixed_traits(fixed_traits or [])
@@ -1745,7 +1800,8 @@ def llm_describe_wildcards(names: list[str], server: dict,
     user = "\n\n".join(parts)
     raw = _server_call(server, DESCRIBE_SYSTEM_PROMPT, user,
                        request_json=True, seed=seed,
-                       json_schema=DESCRIBE_JSON_SCHEMA)
+                       json_schema=DESCRIBE_JSON_SCHEMA,
+                       temperature_override=_design_temp(server, TEMP_DESCRIBE))
     parsed = _extract_json_object(raw)
     if not isinstance(parsed, dict):
         raise ManagerStepError("describe", raw)
@@ -1777,7 +1833,9 @@ def llm_name_structure_slots(idea: str, direction_text: str,
     parts: list[str] = []
     if idea and idea.strip():
         parts.append(f"Scene idea:\n{idea.strip()}")
-    parts.extend(_format_intent_block(direction_text, tier_text, mood_text))
+    # Direction can shape which dimensions matter; tier/mood describe the
+    # moment, not the slot's varying axis, so they're omitted here.
+    parts.extend(_format_intent_block(direction_text, "", ""))
     if scene_context and scene_context.strip():
         parts.append(f"Sentences already written for this scene:\n{scene_context.strip()}")
     fixed = _format_fixed_traits(fixed_traits or [])
@@ -1812,7 +1870,8 @@ def llm_name_structure_slots(idea: str, direction_text: str,
     user = "\n\n".join(parts)
     raw = _server_call(server, STRUCTURE_NAMES_SYSTEM_PROMPT, user,
                        request_json=True, seed=seed,
-                       json_schema=STRUCTURE_NAMES_JSON_SCHEMA)
+                       json_schema=STRUCTURE_NAMES_JSON_SCHEMA,
+                       temperature_override=_design_temp(server, TEMP_SLOT_NAMES))
     parsed = _extract_json_object(raw)
     if not isinstance(parsed, dict):
         raise ManagerStepError("structure_names", raw)
@@ -1820,6 +1879,54 @@ def llm_name_structure_slots(idea: str, direction_text: str,
     if not isinstance(grp, list):
         raise ManagerStepError("structure_names", raw, "missing 'groups' array")
     return grp, raw
+
+
+def llm_write_structure_prose(idea: str, direction_text: str,
+                              slot_lines: list[str], write_ids: list[int],
+                              server: dict, seed: int = 0,
+                              scene_bans: list[str] | None = None,
+                              fixed_traits: list[str] | None = None,
+                              tier_text: str = "", mood_text: str = "",
+                              ) -> tuple[dict[str, str], str]:
+    """Structure-mode prose: ONE call that writes a short fragment for every
+    empty sentence slot so they compose into a single coherent scene (instead
+    of each sentence being drafted independently as its own full scene).
+
+    `slot_lines` is the ordered, human-readable slot list (sentences and
+    wildcard groups, so the model knows where the varying details sit);
+    `write_ids` are the slot numbers that still need a fragment. Returns
+    (fragments_by_id, raw_reply)."""
+    parts = [f"Scene idea:\n{(idea or '').strip() or '(no idea provided)'}"]
+    parts.extend(_format_intent_block(direction_text, tier_text, mood_text))
+    fixed = _format_fixed_traits(fixed_traits or [])
+    if fixed:
+        parts.append(
+            "Fixed traits (must appear verbatim in some fragment):\n" + fixed)
+    bans = _format_scene_bans(scene_bans or [])
+    if bans:
+        parts.append(
+            "Forbidden scene elements (must not appear):\n" + bans)
+    parts.append("Template slots in order:\n" + "\n".join(slot_lines))
+    parts.append("Write these sentence slots: "
+                 + ", ".join(str(s) for s in write_ids))
+    parts.append("Output the JSON object now.")
+    user = "\n\n".join(parts)
+    raw = _server_call(server, STRUCTURE_PROSE_SYSTEM_PROMPT, user,
+                       request_json=True, seed=seed,
+                       json_schema=STRUCTURE_PROSE_JSON_SCHEMA,
+                       temperature_override=_design_temp(server, TEMP_DRAFT))
+    parsed = _extract_json_object(raw)
+    if not isinstance(parsed, dict):
+        raise ManagerStepError("structure_prose", raw)
+    frags = parsed.get("fragments")
+    if not isinstance(frags, dict):
+        raise ManagerStepError("structure_prose", raw,
+                               "missing 'fragments' object")
+    out: dict[str, str] = {}
+    for k, v in frags.items():
+        if isinstance(v, str) and v.strip():
+            out[str(k).strip()] = v.strip()
+    return out, raw
 
 
 def llm_generate_value_list(category: str, description: str,
@@ -1902,7 +2009,8 @@ def llm_align_prompt(populated: str, server: dict, seed: int = 0
         f"Image prompt:\n{populated}\n\n"
         "Output the corrected sentence only."
     )
-    raw = _server_call(server, ALIGN_SYSTEM_PROMPT, user, seed=seed)
+    raw = _server_call(server, ALIGN_SYSTEM_PROMPT, user, seed=seed,
+                       temperature_override=_design_temp(server, TEMP_ALIGN))
     aligned = (raw or "").strip()
     if len(aligned) >= 2 and aligned[0] in "\"'`" and aligned[-1] == aligned[0]:
         aligned = aligned[1:-1].strip()
@@ -2752,31 +2860,60 @@ def _generate_structure_template(blocks, idea, direction_text, server, seed,
     sentence_texts: dict[int, str] = {}
     base_idea = (idea or "").strip()
 
-    # 1. Sentence blocks: literal text verbatim, else LLM-drafted.
+    # 1. Sentence blocks. Literal text goes in verbatim; every empty sentence
+    #    is written by ONE prose call below, so the fragments compose into a
+    #    single coherent scene instead of each being drafted as its own full
+    #    scene. The wildcard groups are listed too (by role) so the prose knows
+    #    where the varying details sit and doesn't pin them.
+    slot_lines: list[str] = []
+    to_write: list[tuple[int, int, str]] = []   # (slot_no, block_index, role)
+    slot_no = 0
     for i, blk in enumerate(blocks):
-        if not blk.get("enabled", True) or blk["kind"] != "sentence":
+        if not blk.get("enabled", True):
             continue
-        txt = (blk.get("text") or "").strip()
-        if txt:
-            sentence_texts[i] = txt
-            continue
+        slot_no += 1
         role = (blk.get("role") or "").strip()
-        focus_idea = base_idea or "(no idea provided)"
-        if role:
-            focus_idea = (
-                f"{focus_idea}\n\nThis sentence should focus on the "
-                f"{role.replace('_', ' ')} of the scene.")
+        if blk["kind"] == "sentence":
+            role_disp = role.replace("_", " ") if role else "general"
+            txt = (blk.get("text") or "").strip()
+            if txt:
+                sentence_texts[i] = txt
+                slot_lines.append(
+                    f'{slot_no}. sentence ({role_disp}) — already written: "{txt}"')
+            else:
+                to_write.append((slot_no, i, role))
+                slot_lines.append(
+                    f"{slot_no}. sentence ({role_disp}) — WRITE THIS")
+        else:
+            role_disp = role.replace("_", " ") if role else "undefined"
+            cnt = int(blk.get("count", 1))
+            slot_lines.append(
+                f"{slot_no}. wildcard group ×{cnt} ({role_disp}) — "
+                "varying detail slots, do not write prose here")
+
+    if to_write:
         try:
-            sent, raw = llm_draft_prompt(
-                focus_idea, direction_text, server, seed=seed + i + 1,
+            frags, raw_prose = llm_write_structure_prose(
+                base_idea, direction_text, slot_lines,
+                [s for s, _, _ in to_write], server, seed=seed,
                 scene_bans=scene_bans, fixed_traits=fixed_traits,
                 tier_text=tier_text, mood_text=mood_text,
             )
-            raw_sections.append((f"sentence[{i}] {role or 'general'}", raw))
-            sentence_texts[i] = sent
+            raw_sections.append(("structure_prose", raw_prose))
+            for n, (sno, bi, _role) in enumerate(to_write):
+                txt = (frags.get(str(sno)) or "").strip()
+                # Degrade gracefully: anchor only the first missing fragment to
+                # the idea; leave the rest empty (skipped) rather than repeating
+                # the whole idea in every empty slot.
+                if not txt:
+                    txt = base_idea if n == 0 else ""
+                if txt:
+                    sentence_texts[bi] = txt
         except ManagerStepError as e:
-            raw_sections.append((f"sentence[{i}] (failed)", e.raw))
-            sentence_texts[i] = base_idea or role.replace("_", " ")
+            raw_sections.append(("structure_prose (failed)", e.raw))
+            for n, (sno, bi, _role) in enumerate(to_write):
+                if n == 0 and base_idea:
+                    sentence_texts[bi] = base_idea
 
     # 2. Wildcard groups, in order. Ask the LLM to NAME each slot from the
     # scene context (generated anew, not the role stamped in 1:1).
@@ -3271,13 +3408,21 @@ class LLMWildcardManager:
                         seen_forbidden.add(n)
                         effective_forbidden_names.append(n)
 
-                # Use the refined idea (when present) as the input for the
-                # drafting step — it keeps the LLM tighter to what the user
-                # actually asked for, while the raw idea remains available as
-                # extra context. Falls back to the raw idea when the brief
-                # produced nothing.
-                idea_for_draft = (brief.get("refined_idea") or "").strip() \
-                    or (example_prompt or "")
+                # Keep the user's ORIGINAL idea authoritative and offer the
+                # brief's refined idea only as expansion. Drafting purely from
+                # the paraphrase is what let the template drift off-idea, so the
+                # original leads and the refined version fills in missing detail.
+                original_idea = (example_prompt or "").strip()
+                refined_idea = (brief.get("refined_idea") or "").strip()
+                if original_idea and refined_idea \
+                        and refined_idea.lower() != original_idea.lower():
+                    idea_for_draft = (
+                        f"{original_idea}\n\nExpanded interpretation (use this "
+                        "for missing detail, but the line above is "
+                        f"authoritative):\n{refined_idea}"
+                    )
+                else:
+                    idea_for_draft = original_idea or refined_idea
 
                 # Steps 1+2 — produce the template + its placeholder names.
                 # With a Template Builder wired into `structure`, follow the
