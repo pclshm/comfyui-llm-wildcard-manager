@@ -539,6 +539,36 @@ function injectStyles() {
             color:#5a606a; pointer-events:none;
         }
         .lwm-brief-empty { color:#6c7480; font-size:11px; font-style:italic; }
+        /* Template Builder */
+        .lwm-blk.lwm-blk-off { opacity:.5; }
+        .lwm-blk-kind { flex:0 0 auto; font-size:9px; letter-spacing:.06em;
+            text-transform:uppercase; border-radius:3px; padding:2px 6px;
+            white-space:nowrap; }
+        .lwm-blk-kind.lwm-blk-sentence { color:#9be8a4; background:#15281d;
+            border:1px solid #2c5b3a; }
+        .lwm-blk-kind.lwm-blk-wild { color:#7ec9ff; background:#142235;
+            border:1px solid #2c4467; }
+        .lwm-select { background:#16181b; color:#e6e6e6;
+            border:1px solid #2e3338; border-radius:4px; padding:3px 6px;
+            font-size:11px; outline:none; max-width:140px; min-width:0; }
+        .lwm-select:focus { border-color:#4d8cd0; }
+        .lwm-range { flex:0 1 110px; min-width:60px; accent-color:#4d8cd0;
+            cursor:pointer; }
+        .lwm-count { flex:0 0 auto; font-size:11px; color:#9ec5ff;
+            font-family: ui-monospace, Menlo, Consolas, monospace;
+            min-width:26px; text-align:center; }
+        .lwm-fnlabel { display:inline-flex; align-items:center; gap:3px;
+            font-size:10px; color:#7d8693; cursor:pointer; white-space:nowrap; }
+        .lwm-chk { cursor:pointer; accent-color:#4d8cd0; margin:0; }
+        /* Two-class selector so it out-specifies .lwm-input[contenteditable]'s
+           nowrap/ellipsis rule and the sentence editor wraps multi-clause text. */
+        .lwm-input.lwm-blk-text { white-space:pre-wrap; overflow:visible;
+            text-overflow:clip; height:auto; min-height:30px; margin-top:6px;
+            line-height:1.4; }
+        .lwm-skeleton { font-size:11px; color:#9ec5ff; line-height:1.5;
+            font-family: ui-monospace, Menlo, Consolas, monospace;
+            background:#0f1114; border:1px solid #262a31; border-radius:4px;
+            padding:6px 8px; word-break:break-word; }
         .lwm-entries::-webkit-scrollbar, .lwm-textarea::-webkit-scrollbar,
         .lwm-prompt-panel::-webkit-scrollbar, .lwm-slot-detail::-webkit-scrollbar {
             width:8px; height:8px; }
@@ -574,6 +604,86 @@ function renderTemplateHTML(template) {
         /__(!?[A-Za-z0-9_-]+)__/g,
         (_, name) => `<span class="lwm-tok">__${escapeHTML(name)}__</span>`
     );
+}
+
+// ---------------------------------------------------------------------------
+// Template Builder helpers — keep parity with the Python normaliser.
+// A block is one of:
+//   { kind:"sentence",  enabled, role, text }
+//   { kind:"wildcards", enabled, role, count, force_new }
+// `role` is an abstract structural label (or "" = undefined). The hidden
+// `structure` STRING widget stores { blocks: [...] } and is the source of
+// truth for headless / API runs.
+// ---------------------------------------------------------------------------
+const BUILDER_WILDCARD_ROLES = [
+    "subject", "character", "appearance", "age", "outfit", "accessory",
+    "pose", "expression", "action", "activity", "setting", "location",
+    "background", "time", "weather", "lighting", "mood", "color",
+    "material", "texture", "style", "camera", "composition", "detail",
+];
+const BUILDER_SENTENCE_ROLES = [
+    "scene", "subject", "action", "setting", "atmosphere", "style", "closing",
+];
+const BUILDER_MAX_COUNT = 12;
+
+function defaultStructureBlocks() {
+    return [
+        { kind: "sentence",  enabled: true, role: "scene",     text: "" },
+        { kind: "wildcards", enabled: true, role: "character", count: 3, force_new: false },
+        { kind: "sentence",  enabled: true, role: "action",    text: "" },
+        { kind: "wildcards", enabled: true, role: "pose",      count: 2, force_new: false },
+    ];
+}
+
+function normalizeBlocks(raw) {
+    let arr = raw;
+    if (raw && typeof raw === "object" && !Array.isArray(raw)) arr = raw.blocks;
+    if (!Array.isArray(arr)) return [];
+    const out = [];
+    for (const e of arr) {
+        if (!e || typeof e !== "object") continue;
+        const kind = String(e.kind || "").toLowerCase();
+        const enabled = e.enabled !== false;
+        const role = String(e.role ?? "").trim();
+        if (kind === "sentence") {
+            out.push({ kind: "sentence", enabled, role, text: String(e.text ?? "") });
+        } else if (kind === "wildcards") {
+            let count = parseInt(e.count, 10);
+            if (!Number.isFinite(count)) count = 1;
+            count = Math.max(1, Math.min(count, BUILDER_MAX_COUNT));
+            out.push({ kind: "wildcards", enabled, role, count,
+                       force_new: !!e.force_new });
+        }
+    }
+    return out;
+}
+
+function readStructureBlocks(widget) {
+    try {
+        const blocks = normalizeBlocks(JSON.parse(widget.value || "{}"));
+        return blocks.length ? blocks : defaultStructureBlocks();
+    } catch {
+        return defaultStructureBlocks();
+    }
+}
+
+function writeStructureBlocks(widget, blocks) {
+    widget.value = JSON.stringify({ blocks }, null, 2);
+}
+
+// Compact "shape" preview, e.g. "Sentence(scene)  ·  __character__ ×3".
+function structureSkeleton(blocks) {
+    const segs = [];
+    for (const b of blocks) {
+        if (!b.enabled) continue;
+        if (b.kind === "sentence") {
+            segs.push(`Sentence(${b.role || "any"})`);
+        } else {
+            const base = toSnakeCase(b.role) || "slot";
+            segs.push(`__${base}__ ×${b.count}`);
+        }
+    }
+    return segs.join("  ·  ") || "(empty — add a block)";
 }
 
 // ---------------------------------------------------------------------------
@@ -1193,6 +1303,392 @@ app.registerExtension({
                         rebuildFromSnapshot(snap);
                     } catch (e) {
                         console.warn("[LLMWildcardManager] bad snapshot:", e);
+                    }
+                };
+            };
+        }
+
+        // -------------------------------------------------------------------
+        // LLMWildcardTemplateBuilder — hand-authored structure editor
+        // -------------------------------------------------------------------
+        if (nodeData.name === "LLMWildcardTemplateBuilder") {
+            const onNodeCreated = nodeType.prototype.onNodeCreated;
+            nodeType.prototype.onNodeCreated = function () {
+                onNodeCreated?.apply(this, arguments);
+                injectStyles();
+                const node = this;
+
+                const structWidget =
+                    node.widgets.find(w => w.name === "structure");
+                if (!structWidget) return;
+                hideWidget(node, structWidget);
+
+                shrinkMultilineWidget(node, "example_prompt", 64);
+                shrinkMultilineWidget(node, "negative_prompt", 56);
+
+                let blocks = readStructureBlocks(structWidget);
+
+                const root = document.createElement("div");
+                root.className = "lwm-root lwm-root-fit";
+
+                let updateBuilderSize = () => {};
+
+                // ---- generated template panel ----
+                const promptLabel = document.createElement("div");
+                promptLabel.className = "lwm-section-label lwm-fixed";
+                promptLabel.textContent = "Generated prompt template";
+                const promptPanel = document.createElement("div");
+                promptPanel.className = "lwm-prompt-panel lwm-empty lwm-fixed";
+                promptPanel.textContent =
+                    "(no template yet — queue the workflow to build)";
+                root.appendChild(promptLabel);
+                root.appendChild(promptPanel);
+
+                // ---- status banner ----
+                const statusBanner = document.createElement("div");
+                statusBanner.className = "lwm-status-banner lwm-fixed";
+                statusBanner.style.display = "none";
+                root.appendChild(statusBanner);
+
+                // ---- structure editor ----
+                const structLabel = document.createElement("div");
+                structLabel.className = "lwm-section-label lwm-fixed";
+                structLabel.textContent = "Structure — build the prompt shape";
+                root.appendChild(structLabel);
+
+                const skeleton = document.createElement("div");
+                skeleton.className = "lwm-skeleton lwm-fixed";
+                root.appendChild(skeleton);
+
+                const list = document.createElement("div");
+                list.className = "lwm-list";
+                root.appendChild(list);
+
+                // ---- add-block toolbar ----
+                const toolbar = document.createElement("div");
+                toolbar.className = "lwm-toolbar lwm-fixed";
+                const addSentenceBtn = document.createElement("button");
+                addSentenceBtn.className = "lwm-btn lwm-btn-ghost";
+                addSentenceBtn.textContent = "+ Sentence";
+                const addWildBtn = document.createElement("button");
+                addWildBtn.className = "lwm-btn lwm-btn-ghost";
+                addWildBtn.textContent = "+ Wildcard group";
+                toolbar.appendChild(addSentenceBtn);
+                toolbar.appendChild(addWildBtn);
+                const tbSpacer = document.createElement("div");
+                tbSpacer.className = "lwm-spacer";
+                toolbar.appendChild(tbSpacer);
+                root.appendChild(toolbar);
+
+                // ---- slots summary (filled after a queue) ----
+                const slotsPanel = document.createElement("div");
+                slotsPanel.className = "lwm-list lwm-fixed";
+                root.appendChild(slotsPanel);
+
+                // ---- raw LLM reply (collapsible) ----
+                const rawHeader = document.createElement("div");
+                rawHeader.className = "lwm-section-label lwm-fixed lwm-raw-header";
+                rawHeader.style.display = "none";
+                rawHeader.innerHTML =
+                    `<span class="lwm-raw-toggle">▸</span>` +
+                    `<span>Last LLM raw reply</span>`;
+                root.appendChild(rawHeader);
+                const rawPanel = document.createElement("pre");
+                rawPanel.className = "lwm-raw-reply lwm-fixed";
+                rawPanel.style.display = "none";
+                root.appendChild(rawPanel);
+                rawHeader.addEventListener("click", () => {
+                    const open = rawHeader.classList.toggle("lwm-open");
+                    rawPanel.style.display = open ? "block" : "none";
+                    updateBuilderSize();
+                });
+
+                // ---- wildcards dir path ----
+                const pathLine = document.createElement("div");
+                pathLine.className = "lwm-pathline lwm-fixed";
+                root.appendChild(pathLine);
+
+                // ---------- editor logic ----------
+                function commit() {
+                    writeStructureBlocks(structWidget, blocks);
+                    skeleton.textContent = structureSkeleton(blocks);
+                    node.setDirtyCanvas(true, true);
+                    updateBuilderSize();
+                }
+
+                function move(idx, dir) {
+                    const j = idx + dir;
+                    if (j < 0 || j >= blocks.length) return;
+                    const t = blocks[idx]; blocks[idx] = blocks[j]; blocks[j] = t;
+                    commit();
+                    render();
+                }
+
+                function iconBtn(label, title, onClick, extra = "") {
+                    const b = document.createElement("button");
+                    b.className = "lwm-btn lwm-btn-ghost lwm-btn-icon " + extra;
+                    b.textContent = label;
+                    b.title = title;
+                    b.addEventListener("click", onClick);
+                    return b;
+                }
+
+                function buildRoleSelect(kind, value, onChange) {
+                    const sel = document.createElement("select");
+                    sel.className = "lwm-select";
+                    sel.title = "Abstract role — structure only, not content";
+                    const roles = kind === "sentence"
+                        ? BUILDER_SENTENCE_ROLES : BUILDER_WILDCARD_ROLES;
+                    const undef = document.createElement("option");
+                    undef.value = "";
+                    undef.textContent =
+                        kind === "sentence" ? "(any)" : "(undefined)";
+                    sel.appendChild(undef);
+                    for (const r of roles) {
+                        const o = document.createElement("option");
+                        o.value = r; o.textContent = r;
+                        sel.appendChild(o);
+                    }
+                    if (value && !roles.includes(value)) {
+                        const o = document.createElement("option");
+                        o.value = value; o.textContent = value + " (custom)";
+                        sel.appendChild(o);
+                    }
+                    sel.value = value || "";
+                    sel.addEventListener("change", () => onChange(sel.value));
+                    return sel;
+                }
+
+                function buildBlockRow(idx) {
+                    const blk = blocks[idx];
+                    const row = document.createElement("div");
+                    row.className = "lwm-row lwm-blk" + (blk.enabled ? "" : " lwm-blk-off");
+
+                    const head = document.createElement("div");
+                    head.className = "lwm-row-head";
+
+                    const en = document.createElement("input");
+                    en.type = "checkbox"; en.className = "lwm-chk";
+                    en.checked = blk.enabled;
+                    en.title = "Enable / disable this block";
+                    en.addEventListener("change", () => {
+                        blk.enabled = en.checked;
+                        row.classList.toggle("lwm-blk-off", !en.checked);
+                        commit();
+                    });
+
+                    const kind = document.createElement("span");
+                    kind.className = "lwm-blk-kind " +
+                        (blk.kind === "sentence" ? "lwm-blk-sentence" : "lwm-blk-wild");
+                    kind.textContent =
+                        blk.kind === "sentence" ? "Sentence" : "Wildcards";
+
+                    const role = buildRoleSelect(blk.kind, blk.role, (v) => {
+                        blk.role = v; commit();
+                    });
+
+                    head.appendChild(en);
+                    head.appendChild(kind);
+                    head.appendChild(role);
+
+                    if (blk.kind === "wildcards") {
+                        const range = document.createElement("input");
+                        range.type = "range"; range.min = "1";
+                        range.max = String(BUILDER_MAX_COUNT);
+                        range.value = String(blk.count);
+                        range.className = "lwm-range";
+                        range.title = "How many wildcard slots this group emits";
+                        const num = document.createElement("span");
+                        num.className = "lwm-count";
+                        num.textContent = "×" + blk.count;
+                        range.addEventListener("input", () => {
+                            blk.count = parseInt(range.value, 10) || 1;
+                            num.textContent = "×" + blk.count;
+                            commit();
+                        });
+
+                        const fnWrap = document.createElement("label");
+                        fnWrap.className = "lwm-fnlabel";
+                        fnWrap.title =
+                            "Force a fresh value every run (emits __!name__)";
+                        const fn = document.createElement("input");
+                        fn.type = "checkbox"; fn.className = "lwm-chk";
+                        fn.checked = !!blk.force_new;
+                        fn.addEventListener("change", () => {
+                            blk.force_new = fn.checked; commit();
+                        });
+                        fnWrap.appendChild(fn);
+                        fnWrap.appendChild(document.createTextNode("new"));
+
+                        head.appendChild(range);
+                        head.appendChild(num);
+                        head.appendChild(fnWrap);
+                    }
+
+                    const spacer = document.createElement("div");
+                    spacer.className = "lwm-spacer";
+                    head.appendChild(spacer);
+
+                    head.appendChild(iconBtn("↑", "Move up", () => move(idx, -1)));
+                    head.appendChild(iconBtn("↓", "Move down", () => move(idx, 1)));
+                    head.appendChild(iconBtn("✕", "Remove block", () => {
+                        blocks.splice(idx, 1); commit(); render();
+                    }, "lwm-btn-danger"));
+
+                    row.appendChild(head);
+
+                    if (blk.kind === "sentence") {
+                        const body = makeEditable(
+                            "leave empty → AI writes this sentence",
+                            blk.text || "");
+                        body.className = "lwm-input lwm-blk-text";
+                        body.addEventListener("blur", () => {
+                            blk.text = (body.textContent || "").trim();
+                            commit();
+                        });
+                        row.appendChild(body);
+                    }
+                    return row;
+                }
+
+                function render() {
+                    list.innerHTML = "";
+                    blocks.forEach((_, i) => list.appendChild(buildBlockRow(i)));
+                    skeleton.textContent = structureSkeleton(blocks);
+                    updateBuilderSize();
+                }
+
+                addSentenceBtn.addEventListener("click", () => {
+                    blocks.push({ kind: "sentence", enabled: true, role: "", text: "" });
+                    commit(); render();
+                });
+                addWildBtn.addEventListener("click", () => {
+                    blocks.push({ kind: "wildcards", enabled: true, role: "",
+                                  count: 1, force_new: false });
+                    commit(); render();
+                });
+
+                // ---------- snapshot rendering (after a queue) ----------
+                function renderStatus(status, message) {
+                    if (!status || status === "ok") {
+                        statusBanner.style.display = "none";
+                        return;
+                    }
+                    statusBanner.className =
+                        "lwm-status-banner lwm-fixed lwm-status-" + status;
+                    statusBanner.textContent = message || status;
+                    statusBanner.style.display = "block";
+                }
+
+                function renderSlots(slots) {
+                    slotsPanel.innerHTML = "";
+                    if (!Array.isArray(slots) || !slots.length) return;
+                    for (const s of slots) {
+                        const row = document.createElement("div");
+                        row.className = "lwm-row";
+                        const head = document.createElement("div");
+                        head.className = "lwm-row-head";
+                        const name = document.createElement("span");
+                        name.className = "lwm-blk-kind lwm-blk-wild";
+                        name.textContent = s.name;
+                        const desc = document.createElement("span");
+                        desc.className = "lwm-desc";
+                        desc.style.fontSize = "11px";
+                        desc.style.color = "#cfd3d8";
+                        desc.style.overflow = "hidden";
+                        desc.style.textOverflow = "ellipsis";
+                        desc.style.whiteSpace = "nowrap";
+                        desc.textContent = s.description || "(no description)";
+                        const badge = document.createElement("span");
+                        const c = s.count || 0;
+                        badge.className = "lwm-badge " +
+                            (c === 0 ? "" : c < 10 ? "lwm-badge-low"
+                                : c < 50 ? "lwm-badge-mid" : "lwm-badge-high");
+                        badge.textContent = String(c);
+                        badge.title = c + " values on disk";
+                        head.appendChild(name);
+                        head.appendChild(desc);
+                        head.appendChild(badge);
+                        row.appendChild(head);
+                        slotsPanel.appendChild(row);
+                    }
+                }
+
+                function renderRawReply(raw, status) {
+                    const txt = (raw || "").trim();
+                    if (!txt || txt === "(no LLM output captured)") {
+                        rawHeader.style.display = "none";
+                        rawPanel.style.display = "none";
+                        return;
+                    }
+                    rawHeader.style.display = "flex";
+                    rawPanel.textContent = txt;
+                    rawPanel.classList.toggle("lwm-error-border",
+                        status === "llm_error");
+                }
+
+                function applySnapshot(snap) {
+                    const tpl = (snap.generated_prompt || "").trim();
+                    if (tpl) {
+                        promptPanel.classList.remove("lwm-empty");
+                        promptPanel.innerHTML = renderTemplateHTML(tpl);
+                    } else {
+                        promptPanel.classList.add("lwm-empty");
+                        promptPanel.textContent =
+                            "(no template yet — queue the workflow to build)";
+                    }
+                    renderStatus(snap.status, snap.status_message);
+                    renderSlots(snap.slots);
+                    renderRawReply(snap.raw_reply, snap.status);
+                    if (snap.wildcards_dir) {
+                        pathLine.textContent = "wildcards: " + snap.wildcards_dir;
+                    }
+                    updateBuilderSize();
+                }
+
+                render();
+
+                const builderWidget = node.addDOMWidget(
+                    "builder_view", "div", root, { serialize: false });
+                node.size = [Math.max(node.size[0], 560), node.size[1]];
+
+                let _sizingPending = false;
+                updateBuilderSize = function () {
+                    if (_sizingPending) return;
+                    _sizingPending = true;
+                    requestAnimationFrame(() => {
+                        _sizingPending = false;
+                        const h = Math.ceil(root.scrollHeight) + 8;
+                        const prev = builderWidget.computedHeight || 0;
+                        if (Math.abs(prev - h) < 2) return;
+                        builderWidget.computeSize = (width) => [width, h];
+                        builderWidget.computedHeight = h;
+                        const min = node.computeSize();
+                        const w = Math.max(node.size[0], min[0], 560);
+                        node.setSize([w, min[1]]);
+                        node.setDirtyCanvas(true, true);
+                    });
+                };
+                updateBuilderSize();
+
+                const onConfigure = node.onConfigure;
+                node.onConfigure = function (info) {
+                    onConfigure?.apply(this, arguments);
+                    setTimeout(() => {
+                        blocks = readStructureBlocks(structWidget);
+                        render();
+                    }, 0);
+                };
+
+                const onExecuted = nodeType.prototype.onExecuted;
+                nodeType.prototype.onExecuted = function (message) {
+                    onExecuted?.apply(this, arguments);
+                    const raw = (message?.builder_state || [])[0];
+                    if (!raw) return;
+                    try {
+                        applySnapshot(JSON.parse(raw));
+                    } catch (e) {
+                        console.warn("[LLMWildcardTemplateBuilder] bad snapshot:", e);
                     }
                 };
             };

@@ -42,6 +42,7 @@ LAST_TEMPLATE_PATH = WILDCARDS_DIR / ".last_template.txt"
 LAST_REPLY_PATH = WILDCARDS_DIR / ".last_reply.json"
 LAST_RESOLVER_PATH = WILDCARDS_DIR / ".last_resolver.json"
 LAST_BRIEF_PATH = WILDCARDS_DIR / ".last_brief.json"
+LAST_BUILDER_TEMPLATE_PATH = WILDCARDS_DIR / ".last_builder_template.txt"
 
 
 # -----------------------------------------------------------------------------
@@ -3190,6 +3191,461 @@ class LLMWildcardManager:
 
 
 # =============================================================================
+# Node 2b: LLMWildcardTemplateBuilder — compose a prompt template's STRUCTURE
+# by hand (ordered sentence + wildcard-group blocks) and let the LLM fill in
+# the sentence text and per-slot descriptions. Structure-driven sibling of the
+# Manager: the user controls the skeleton (how many wildcards, where), the LLM
+# only writes the prose and describes each slot. Counts/placement are
+# deterministic in Python so the requested shape is exact.
+# =============================================================================
+
+# Abstract structural role labels offered in the editor. They name the
+# *dimension* a slot/sentence covers, never its content — the content comes
+# from the user's idea + the LLM. The empty string ("") means "undefined":
+# pure structure, the describe/resolve steps infer the dimension from context.
+BUILDER_WILDCARD_ROLES: list[str] = [
+    "subject", "character", "appearance", "age", "outfit", "accessory",
+    "pose", "expression", "action", "activity", "setting", "location",
+    "background", "time", "weather", "lighting", "mood", "color",
+    "material", "texture", "style", "camera", "composition", "detail",
+]
+BUILDER_SENTENCE_ROLES: list[str] = [
+    "scene", "subject", "action", "setting", "atmosphere", "style", "closing",
+]
+
+# Shipped default so a fresh node demonstrates the concept: a scene-setting
+# sentence, three character wildcards, an action sentence, two pose wildcards.
+DEFAULT_BUILDER_STRUCTURE: dict = {
+    "blocks": [
+        {"kind": "sentence", "enabled": True, "role": "scene", "text": ""},
+        {"kind": "wildcards", "enabled": True, "role": "character",
+         "count": 3, "force_new": False},
+        {"kind": "sentence", "enabled": True, "role": "action", "text": ""},
+        {"kind": "wildcards", "enabled": True, "role": "pose",
+         "count": 2, "force_new": False},
+    ]
+}
+
+BUILDER_MAX_COUNT = 12
+
+
+def _normalize_builder_blocks(raw) -> list[dict]:
+    """Coerce a parsed `structure` payload into a clean ordered list of blocks.
+
+    Accepts either {"blocks": [...]} or a bare list. Each block is normalised
+    to one of two shapes:
+      sentence  -> {kind, enabled, role, text}
+      wildcards -> {kind, enabled, role, count, force_new}
+    Unknown kinds / malformed entries are dropped."""
+    if isinstance(raw, dict):
+        raw = raw.get("blocks")
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        kind = str(entry.get("kind") or "").strip().lower()
+        enabled = bool(entry.get("enabled", True))
+        role = str(entry.get("role") or "").strip()
+        if kind == "sentence":
+            out.append({
+                "kind": "sentence",
+                "enabled": enabled,
+                "role": role,
+                "text": str(entry.get("text") or "").strip(),
+            })
+        elif kind == "wildcards":
+            try:
+                count = int(entry.get("count", 1))
+            except Exception:
+                count = 1
+            count = max(1, min(count, BUILDER_MAX_COUNT))
+            out.append({
+                "kind": "wildcards",
+                "enabled": enabled,
+                "role": role,
+                "count": count,
+                "force_new": bool(entry.get("force_new", False)),
+            })
+    return out
+
+
+def _parse_builder_structure(text: str) -> list[dict]:
+    """Parse the `structure` JSON widget. Empty / unparseable falls back to the
+    shipped default so the node always has something to build."""
+    s = (text or "").strip()
+    if not s:
+        return _normalize_builder_blocks(DEFAULT_BUILDER_STRUCTURE)
+    try:
+        blocks = _normalize_builder_blocks(json.loads(s))
+    except Exception as e:
+        print(f"[LLMWildcardTemplateBuilder] Bad structure JSON: {e}")
+        return _normalize_builder_blocks(DEFAULT_BUILDER_STRUCTURE)
+    return blocks
+
+
+def _join_builder_fragments(fragments: list[str]) -> str:
+    """Comma-join block fragments into one template string, then tidy the
+    seams (period-then-comma, doubled commas, stray leading/trailing
+    punctuation). The Resolver's grammar-alignment pass smooths the rest when
+    the LLM is on; this keeps the LLM-off output readable too."""
+    parts = [f.strip() for f in fragments if f and f.strip()]
+    if not parts:
+        return ""
+    joined = ", ".join(parts)
+    joined = re.sub(r"\s+", " ", joined)
+    joined = re.sub(r"\.\s*,\s*", ". ", joined)   # "a scene., __x__" → "a scene. __x__"
+    joined = re.sub(r",\s*,+", ", ", joined)
+    joined = re.sub(r"\s+,", ",", joined)
+    joined = re.sub(r"^[\s,]+|[\s,]+$", "", joined)
+    return joined.strip()
+
+
+def _assemble_builder_template(blocks: list[dict],
+                               sentence_texts: dict[int, str],
+                               ) -> tuple[str, list[dict]]:
+    """Deterministically build the template + the ordered slot spec list.
+
+    `sentence_texts` maps a sentence block's index to its resolved text.
+    Wildcard groups emit `count` uniquely-numbered placeholders named after
+    the (snake_cased) role — `character_1`, `character_2`, … — so the Resolver
+    fills each with a *different* value. An undefined role becomes `slot_N`.
+    Returns (template, [{name, role, force_new}, ...])."""
+    base_counts: dict[str, int] = {}
+    slot_specs: list[dict] = []
+    fragments: list[str] = []
+    for i, blk in enumerate(blocks):
+        if not blk.get("enabled", True):
+            continue
+        if blk["kind"] == "sentence":
+            txt = (sentence_texts.get(i) or "").strip()
+            if txt:
+                fragments.append(txt)
+        elif blk["kind"] == "wildcards":
+            base = _to_snake_case(blk.get("role") or "") or "slot"
+            force_new = bool(blk.get("force_new"))
+            tokens: list[str] = []
+            for _ in range(int(blk.get("count", 1))):
+                base_counts[base] = base_counts.get(base, 0) + 1
+                name = f"{base}_{base_counts[base]}"
+                slot_specs.append({"name": name, "role": base,
+                                   "force_new": force_new})
+                tokens.append(f"__!{name}__" if force_new else f"__{name}__")
+            if tokens:
+                fragments.append(", ".join(tokens))
+    return _join_builder_fragments(fragments), slot_specs
+
+
+class LLMWildcardTemplateBuilder:
+    """ComfyUI node: hand-author a template's STRUCTURE; the LLM fills the
+    prose + slot descriptions.
+
+    The editor stacks ordered blocks — literal/AI-written sentence blocks and
+    wildcard groups with a count slider + abstract role. Counts and placement
+    are resolved in Python (exact by construction); the LLM is called only to
+    (a) draft any sentence left blank and (b) describe each slot. Outputs match
+    the Manager (prompt_template + prompts bundle + negative_prompt) so it
+    drops straight into the Resolver.
+
+    Seed semantics mirror the Manager: lock_template OR seed!=0 → reproducible;
+    seed=0 → fresh roll every queue."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "server": ("LLM_SERVER",),
+                "example_prompt": ("STRING", {
+                    "multiline": True,
+                    "default": (
+                        "A portrait of a woman doing an outdoor activity, "
+                        "photorealistic, masterpiece."
+                    ),
+                    "placeholder": (
+                        "Your idea — supplies the CONTENT. The structure editor "
+                        "below controls the SHAPE (sentences + wildcard groups)."
+                    ),
+                }),
+                "lock_template": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": (
+                        "When ON, skip the LLM and reuse the last built "
+                        "template. Re-queue to get fresh random wildcards from "
+                        "the Resolver without rebuilding."
+                    ),
+                }),
+                "seed": ("INT", {"default": 0, "min": 0,
+                                 "max": 0xFFFFFFFFFFFFFFFF}),
+                "direction": ("STRING", {
+                    "default": "none",
+                    "placeholder": "preset key (e.g. 'cinematic') or custom steering text",
+                }),
+                "production_tier": ("STRING", {
+                    "default": "none",
+                    "placeholder": "preset key (e.g. 'homemade', 'editorial') or custom",
+                }),
+                "mood": ("STRING", {
+                    "default": "none",
+                    "placeholder": "preset key (e.g. 'intimate', 'playful') or custom",
+                }),
+                "negative_prompt": ("STRING", {
+                    "multiline": True,
+                    "default": "",
+                    "placeholder": (
+                        "Traits to AVOID. Shapes the AI-written sentences and "
+                        "is compiled into the negative_prompt output.\n"
+                        "One item per line or comma-separated."
+                    ),
+                }),
+                # Hidden JSON widget holding the ordered block list. The custom
+                # editor on the node reads/writes it; Python reads it here.
+                "structure": ("STRING", {
+                    "multiline": True,
+                    "default": json.dumps(DEFAULT_BUILDER_STRUCTURE, indent=2),
+                    "placeholder": "Structure — edited via the block editor on the node.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "WILDCARD_PROMPTS", "STRING")
+    RETURN_NAMES = ("prompt_template", "prompts", "negative_prompt")
+    FUNCTION = "build"
+    CATEGORY = "prompt/wildcards"
+    OUTPUT_NODE = True
+
+    def build(self, server, example_prompt, lock_template, seed,
+              direction, production_tier, mood, negative_prompt,
+              structure=""):
+        direction = (direction or "").strip() or "none"
+        direction_text = resolve_direction(direction)
+        tier = (production_tier or "").strip() or "none"
+        tier_text = resolve_tier(tier)
+        mood_key = (mood or "").strip() or "none"
+        mood_text = resolve_mood(mood_key)
+        negative = (negative_prompt or "").strip()
+        idea = (example_prompt or "").strip()
+
+        llm_enabled = bool(server.get("enabled", True))
+        effective_lock = bool(lock_template) or not llm_enabled
+        lock_due_to_disabled = (not llm_enabled) and not lock_template
+
+        blocks = _parse_builder_structure(structure)
+
+        try:
+            seed_int = int(seed)
+        except Exception:
+            seed_int = 0
+        effective_seed = (random.SystemRandom().randrange(1, 2**31)
+                          if seed_int == 0 else seed_int)
+
+        status = "ok"
+        status_message = ""
+        raw_sections: list[tuple[str, str]] = []
+        suggested_cats: dict[str, str] = {}
+        axis_bans: list[str] = []
+        scene_bans: list[str] = list(_negative_terms(negative))
+        template = ""
+        names: list[str] = []
+
+        if effective_lock:
+            cached = ""
+            if LAST_BUILDER_TEMPLATE_PATH.exists():
+                try:
+                    cached = LAST_BUILDER_TEMPLATE_PATH.read_text(
+                        encoding="utf-8").strip()
+                except Exception as e:
+                    print(f"[LLMWildcardTemplateBuilder] Could not read cache: {e}")
+            if cached:
+                template = cached
+                names = extract_wildcard_names(template)
+                if lock_due_to_disabled:
+                    status = "llm_disabled"
+                    status_message = (
+                        "LLM is OFF on the Server Config — reusing the last "
+                        "built template (LLM not called). Turn the LLM back on "
+                        "to rebuild.")
+                else:
+                    status = "locked"
+                    status_message = (
+                        "Lock is ON — reusing the last built template (LLM not "
+                        "called). Toggle off to rebuild.")
+                raw_sections.append(
+                    ("locked", "(LLM calls skipped — template loaded from cache)"))
+            else:
+                status = ("no_template_llm_disabled" if lock_due_to_disabled
+                          else "no_locked_template")
+                status_message = (
+                    "No cached template yet. Turn the LLM on / toggle Lock off "
+                    "and queue once to build one.")
+                raw_sections.append(
+                    ("locked", "(no cached template — turn the LLM on / unlock to build)"))
+        else:
+            # Split the negative prompt into structured bans (axis + scene) so
+            # the AI-written sentences avoid them and the compiled negative is
+            # accurate. Falls back to the heuristic term split on any failure.
+            if negative:
+                try:
+                    axis_bans, parsed_scene, raw_pn = llm_parse_negative(
+                        negative, server, seed=effective_seed)
+                    raw_sections.append(("parse_negative", raw_pn))
+                    if parsed_scene:
+                        scene_bans = parsed_scene
+                except Exception as e:
+                    print(f"[LLMWildcardTemplateBuilder] parse_negative failed: {e}")
+
+            try:
+                # Step 1 — resolve every sentence block. Literal text is used
+                # verbatim; an empty sentence is drafted by the LLM, biased to
+                # the block's role. A per-block draft failure degrades to a
+                # neutral fallback rather than aborting the whole build.
+                sentence_texts: dict[int, str] = {}
+                for i, blk in enumerate(blocks):
+                    if not blk.get("enabled", True) or blk["kind"] != "sentence":
+                        continue
+                    txt = (blk.get("text") or "").strip()
+                    if txt:
+                        sentence_texts[i] = txt
+                        continue
+                    role = (blk.get("role") or "").strip()
+                    focus_idea = idea or "(no idea provided)"
+                    if role:
+                        focus_idea = (
+                            f"{focus_idea}\n\nThis sentence should focus on the "
+                            f"{role.replace('_', ' ')} of the scene.")
+                    try:
+                        sent, raw = llm_draft_prompt(
+                            focus_idea, direction_text, server,
+                            seed=effective_seed + i + 1,
+                            scene_bans=scene_bans,
+                            tier_text=tier_text, mood_text=mood_text)
+                        raw_sections.append(
+                            (f"sentence[{i}] {role or 'general'}", raw))
+                        sentence_texts[i] = sent
+                    except ManagerStepError as e:
+                        raw_sections.append((f"sentence[{i}] (failed)", e.raw))
+                        sentence_texts[i] = idea or role.replace("_", " ")
+
+                # Step 2 — deterministic assembly. Counts/placement are exact.
+                template, slot_specs = _assemble_builder_template(
+                    blocks, sentence_texts)
+                names = [s["name"] for s in slot_specs]
+
+                if not template.strip():
+                    status = "empty_structure"
+                    status_message = (
+                        "The structure produced no template. Enable at least "
+                        "one sentence or wildcard block.")
+
+                # Step 3 — describe each slot, anchored to the assembled
+                # template + idea. A describe failure keeps the template
+                # (slots fall back to generic descriptions in the Resolver).
+                if names:
+                    try:
+                        descs, raw_desc = llm_describe_wildcards(
+                            names, server, seed=effective_seed,
+                            idea=idea, direction_text=direction_text,
+                            template=template, scene_bans=scene_bans,
+                            tier_text=tier_text, mood_text=mood_text)
+                        raw_sections.append(("describe", raw_desc))
+                        suggested_cats = descs
+                    except ManagerStepError as e:
+                        raw_sections.append(("describe (failed)", e.raw))
+            except Exception as e:
+                print(f"[LLMWildcardTemplateBuilder] build failed: {e}")
+                template = ""
+                names = []
+                status = "llm_error"
+                status_message = str(e)
+                raw_sections.append(("error", f"(exception during build: {e})"))
+
+        # Effective descriptions: defaults < disk < LLM-suggested. No user
+        # override table on this node (the Resolver's category config still
+        # applies downstream).
+        merged_disk = load_category_config()
+        effective: dict[str, str] = dict(DEFAULT_CATEGORIES)
+        effective.update(merged_disk)
+        effective.update(suggested_cats)
+
+        # Deliberately do NOT persist suggested_cats to wildcard_categories.json:
+        # the slot names are template-specific numbered tokens (character_1, …)
+        # that would accumulate as clutter, and the descriptions already reach
+        # the Resolver via the bundle's `category_overrides` below. Only the
+        # built template is cached (the lock path reloads it).
+        if template and status == "ok":
+            try:
+                LAST_BUILDER_TEMPLATE_PATH.write_text(template, encoding="utf-8")
+            except Exception as e:
+                print(f"[LLMWildcardTemplateBuilder] Could not persist template: {e}")
+
+        compiled_negative = compile_negative_prompt(
+            user_negative=negative,
+            scene_bans=scene_bans,
+            axis_bans=axis_bans,
+            forbidden_placeholders=[],
+        )
+
+        raw_reply = "\n\n".join(
+            f"--- step: {step} ---\n{(body or '').strip()}"
+            for step, body in raw_sections
+        ) or "(no LLM output captured)"
+
+        bundle = {
+            "system_prompt": "",
+            "flair": direction_text,
+            "tier": tier_text,
+            "mood": mood_text,
+            "anchors": [],
+            "negative": negative,
+            "scene_bans": list(scene_bans),
+            "fixed_traits": [],
+            "forbidden_axes": list(axis_bans),
+            "forbidden_placeholders": [],
+            "compiled_negative": compiled_negative,
+            "category_overrides": dict(effective),
+            "intended_names": list(names),
+        }
+
+        disk = list_disk_categories()
+        slot_rows = [{
+            "name": n,
+            "description": effective.get(n, ""),
+            "count": len(disk.get(n, [])),
+        } for n in names]
+
+        snapshot = {
+            "wildcards_dir": str(WILDCARDS_DIR),
+            "generated_prompt": template,
+            "status": status,
+            "status_message": status_message,
+            "raw_reply": raw_reply,
+            "direction": direction,
+            "direction_presets": DIRECTION_PRESETS,
+            "production_tier": tier,
+            "tier_presets": TIER_PRESETS,
+            "mood": mood_key,
+            "mood_presets": MOOD_PRESETS,
+            "negative_prompt": negative,
+            "slots": slot_rows,
+        }
+
+        return {
+            "ui": {"builder_state": [json.dumps(snapshot)]},
+            "result": (template, bundle, compiled_negative),
+        }
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        # Same contract as the Manager: lock_template OR seed!=0 → reproducible
+        # (the downstream Resolver still re-rolls each queue when fix_seed is
+        # off); lock_template=False AND seed=0 → fresh roll every queue.
+        if bool(kwargs.get("lock_template")):
+            return _seeded_is_changed(True, kwargs)
+        locked = int(kwargs.get("seed", 0) or 0) != 0
+        return _seeded_is_changed(locked, kwargs)
+
+
+# =============================================================================
 # Node 3: LLMWildcardResolver — fills __wildcard__ slots in a template.
 # =============================================================================
 class LLMWildcardResolver:
@@ -3700,6 +4156,7 @@ NODE_CLASS_MAPPINGS = {
     "LLMSamplingOptions": LLMSamplingOptions,
     "LLMPromptGenerator": LLMPromptGenerator,
     "LLMWildcardManager": LLMWildcardManager,
+    "LLMWildcardTemplateBuilder": LLMWildcardTemplateBuilder,
     "LLMWildcardResolver": LLMWildcardResolver,
     "LLMWildcardReport": LLMWildcardReport,
 }
@@ -3708,6 +4165,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LLMSamplingOptions": "🎲 LLM Sampling Options",
     "LLMPromptGenerator": "🎲 LLM Prompt Generator",
     "LLMWildcardManager": "🎲 LLM Wildcard Manager",
+    "LLMWildcardTemplateBuilder": "🎲 LLM Wildcard Template Builder",
     "LLMWildcardResolver": "🎲 LLM Wildcard Resolver",
     "LLMWildcardReport": "🎲 LLM Wildcard Report",
 }
