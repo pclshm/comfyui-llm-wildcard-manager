@@ -1494,6 +1494,31 @@ app.registerExtension({
                 };
                 updateManagerSize();
 
+                // Re-fit whenever the DOM content itself changes height (text
+                // wrapping, chips added, panels expanded) — without this the
+                // node only resized on the handful of events that called the
+                // updater explicitly, and grown content overlapped below the
+                // frame.
+                if (typeof ResizeObserver !== "undefined") {
+                    const ro = new ResizeObserver(() => updateManagerSize());
+                    ro.observe(root);
+                }
+
+                // When the user drags the corner, LiteGraph lets the frame
+                // shrink past the content. Clamp to the computed minimum so
+                // the body always fits inside the node.
+                const onResize = node.onResize;
+                node.onResize = function (size) {
+                    onResize?.apply(this, arguments);
+                    const min = node.computeSize();
+                    if (size) {
+                        if (size[0] < Math.max(min[0], 580)) {
+                            size[0] = Math.max(min[0], 580);
+                        }
+                        if (size[1] < min[1]) size[1] = min[1];
+                    }
+                };
+
                 const onConfigure = node.onConfigure;
                 node.onConfigure = function (info) {
                     onConfigure?.apply(this, arguments);
@@ -1791,6 +1816,30 @@ app.registerExtension({
                     });
                 };
                 updateBuilderSize();
+
+                // Auto-refit on any DOM size change (blocks added/removed,
+                // text wrapping, expanded panels). Without this, only the
+                // explicit `updateBuilderSize()` callsites resized the node
+                // and content could overlap below.
+                if (typeof ResizeObserver !== "undefined") {
+                    const ro = new ResizeObserver(() => updateBuilderSize());
+                    ro.observe(root);
+                }
+
+                // Prevent the user from dragging the frame below the content's
+                // natural size — LiteGraph otherwise lets them shrink past it,
+                // leaving the DOM body overflowing the visible node.
+                const onResize = node.onResize;
+                node.onResize = function (size) {
+                    onResize?.apply(this, arguments);
+                    const min = node.computeSize();
+                    if (size) {
+                        if (size[0] < Math.max(min[0], 560)) {
+                            size[0] = Math.max(min[0], 560);
+                        }
+                        if (size[1] < min[1]) size[1] = min[1];
+                    }
+                };
 
                 const onConfigure = node.onConfigure;
                 node.onConfigure = function (info) {
