@@ -894,6 +894,12 @@ app.registerExtension({
                     node.widgets.find(w => w.name === "design_brief");
                 if (briefWidget) hideWidget(node, briefWidget);
 
+                // The brief lock is rendered as a toggle button inside the
+                // brief panel header, so hide the bare BOOLEAN widget.
+                const lockBriefWidget =
+                    node.widgets.find(w => w.name === "lock_brief");
+                if (lockBriefWidget) hideWidget(node, lockBriefWidget);
+
                 // Shrink the oversized multiline STRING widgets so the node
                 // header doesn't eat all the space before the DOM table.
                 shrinkMultilineWidget(node, "example_prompt", 64);
@@ -963,6 +969,31 @@ app.registerExtension({
                 briefLabelText.style.flex = "1 1 auto";
                 briefLabelText.textContent =
                     "Design brief — locks the LLM to the user's idea";
+                const briefLockBtn = document.createElement("button");
+                briefLockBtn.className = "lwm-btn lwm-btn-ghost";
+                briefLockBtn.style.fontSize = "10px";
+                briefLockBtn.style.padding = "3px 8px";
+                briefLockBtn.style.letterSpacing = "0";
+                briefLockBtn.style.textTransform = "none";
+                function syncBriefLockBtn() {
+                    const locked = !!(lockBriefWidget && lockBriefWidget.value);
+                    briefLockBtn.textContent =
+                        locked ? "🔒 Locked" : "🔓 Unlocked";
+                    briefLockBtn.title = locked
+                        ? "Brief is locked — the edited brief below is reused " +
+                          "every queue. Click to unlock and regenerate from " +
+                          "the LLM each queue."
+                        : "Brief is unlocked — the LLM regenerates it from " +
+                          "your idea every queue (edits below are " +
+                          "overwritten). Click to lock.";
+                }
+                briefLockBtn.addEventListener("click", () => {
+                    if (!lockBriefWidget) return;
+                    lockBriefWidget.value = !lockBriefWidget.value;
+                    syncBriefLockBtn();
+                    node.setDirtyCanvas(true, true);
+                });
+                syncBriefLockBtn();
                 const briefRegenBtn = document.createElement("button");
                 briefRegenBtn.textContent = "↻ Regenerate brief";
                 briefRegenBtn.title =
@@ -974,6 +1005,7 @@ app.registerExtension({
                 briefRegenBtn.style.letterSpacing = "0";
                 briefRegenBtn.style.textTransform = "none";
                 briefLabel.appendChild(briefLabelText);
+                briefLabel.appendChild(briefLockBtn);
                 briefLabel.appendChild(briefRegenBtn);
                 root.appendChild(briefLabel);
 
