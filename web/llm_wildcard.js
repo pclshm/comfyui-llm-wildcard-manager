@@ -894,6 +894,12 @@ app.registerExtension({
                     node.widgets.find(w => w.name === "design_brief");
                 if (briefWidget) hideWidget(node, briefWidget);
 
+                // The brief lock is rendered as a toggle button inside the
+                // brief panel header, so hide the bare BOOLEAN widget.
+                const lockBriefWidget =
+                    node.widgets.find(w => w.name === "lock_brief");
+                if (lockBriefWidget) hideWidget(node, lockBriefWidget);
+
                 // Shrink the oversized multiline STRING widgets so the node
                 // header doesn't eat all the space before the DOM table.
                 shrinkMultilineWidget(node, "example_prompt", 64);
@@ -963,6 +969,31 @@ app.registerExtension({
                 briefLabelText.style.flex = "1 1 auto";
                 briefLabelText.textContent =
                     "Design brief — locks the LLM to the user's idea";
+                const briefLockBtn = document.createElement("button");
+                briefLockBtn.className = "lwm-btn lwm-btn-ghost";
+                briefLockBtn.style.fontSize = "10px";
+                briefLockBtn.style.padding = "3px 8px";
+                briefLockBtn.style.letterSpacing = "0";
+                briefLockBtn.style.textTransform = "none";
+                function syncBriefLockBtn() {
+                    const locked = !!(lockBriefWidget && lockBriefWidget.value);
+                    briefLockBtn.textContent =
+                        locked ? "🔒 Locked" : "🔓 Unlocked";
+                    briefLockBtn.title = locked
+                        ? "Brief is locked — the edited brief below is reused " +
+                          "every queue. Click to unlock and regenerate from " +
+                          "the LLM each queue."
+                        : "Brief is unlocked — the LLM regenerates it from " +
+                          "your idea every queue (edits below are " +
+                          "overwritten). Click to lock.";
+                }
+                briefLockBtn.addEventListener("click", () => {
+                    if (!lockBriefWidget) return;
+                    lockBriefWidget.value = !lockBriefWidget.value;
+                    syncBriefLockBtn();
+                    node.setDirtyCanvas(true, true);
+                });
+                syncBriefLockBtn();
                 const briefRegenBtn = document.createElement("button");
                 briefRegenBtn.textContent = "↻ Regenerate brief";
                 briefRegenBtn.title =
@@ -974,6 +1005,7 @@ app.registerExtension({
                 briefRegenBtn.style.letterSpacing = "0";
                 briefRegenBtn.style.textTransform = "none";
                 briefLabel.appendChild(briefLabelText);
+                briefLabel.appendChild(briefLockBtn);
                 briefLabel.appendChild(briefRegenBtn);
                 root.appendChild(briefLabel);
 
@@ -1462,6 +1494,31 @@ app.registerExtension({
                 };
                 updateManagerSize();
 
+                // Re-fit whenever the DOM content itself changes height (text
+                // wrapping, chips added, panels expanded) — without this the
+                // node only resized on the handful of events that called the
+                // updater explicitly, and grown content overlapped below the
+                // frame.
+                if (typeof ResizeObserver !== "undefined") {
+                    const ro = new ResizeObserver(() => updateManagerSize());
+                    ro.observe(root);
+                }
+
+                // When the user drags the corner, LiteGraph lets the frame
+                // shrink past the content. Clamp to the computed minimum so
+                // the body always fits inside the node.
+                const onResize = node.onResize;
+                node.onResize = function (size) {
+                    onResize?.apply(this, arguments);
+                    const min = node.computeSize();
+                    if (size) {
+                        if (size[0] < Math.max(min[0], 580)) {
+                            size[0] = Math.max(min[0], 580);
+                        }
+                        if (size[1] < min[1]) size[1] = min[1];
+                    }
+                };
+
                 const onConfigure = node.onConfigure;
                 node.onConfigure = function (info) {
                     onConfigure?.apply(this, arguments);
@@ -1759,6 +1816,30 @@ app.registerExtension({
                     });
                 };
                 updateBuilderSize();
+
+                // Auto-refit on any DOM size change (blocks added/removed,
+                // text wrapping, expanded panels). Without this, only the
+                // explicit `updateBuilderSize()` callsites resized the node
+                // and content could overlap below.
+                if (typeof ResizeObserver !== "undefined") {
+                    const ro = new ResizeObserver(() => updateBuilderSize());
+                    ro.observe(root);
+                }
+
+                // Prevent the user from dragging the frame below the content's
+                // natural size — LiteGraph otherwise lets them shrink past it,
+                // leaving the DOM body overflowing the visible node.
+                const onResize = node.onResize;
+                node.onResize = function (size) {
+                    onResize?.apply(this, arguments);
+                    const min = node.computeSize();
+                    if (size) {
+                        if (size[0] < Math.max(min[0], 560)) {
+                            size[0] = Math.max(min[0], 560);
+                        }
+                        if (size[1] < min[1]) size[1] = min[1];
+                    }
+                };
 
                 const onConfigure = node.onConfigure;
                 node.onConfigure = function (info) {
