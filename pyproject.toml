@@ -17,12 +17,12 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Repository = "https://github.com/YOUR_GITHUB_USER/comfyui-llm-wildcard-manager"
-Issues = "https://github.com/YOUR_GITHUB_USER/comfyui-llm-wildcard-manager/issues"
+Repository = "https://github.com/pclshm/comfyui-llm-wildcard-manager"
+Issues = "https://github.com/pclshm/comfyui-llm-wildcard-manager/issues"
 
 # https://docs.comfy.org/registry/specifications
 [tool.comfy]
-PublisherId = "TODO_publisher_id"
+PublisherId = "animan-d-lofi"
 DisplayName = "LLM Wildcard Manager"
 Icon = ""
 Tags = ["wildcards", "llm", "ollama", "openai", "prompt"]

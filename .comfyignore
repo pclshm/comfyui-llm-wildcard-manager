@@ -1,0 +1,27 @@
+# Files excluded from the published Comfy Registry archive.
+# Syntax matches .gitignore (https://git-scm.com/docs/gitignore) and
+# layers on top of it.
+
+# Dev / tooling
+.claude/
+.github/
+.vscode/
+.idea/
+
+# Python build / cache artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Local runtime / test artifacts (node creates its own at runtime)
+wildcards/
+*.log
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
