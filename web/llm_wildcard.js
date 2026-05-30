@@ -99,6 +99,11 @@ function toSnakeCase(s) {
 function hideWidget(node, widget) {
     widget.computeSize = () => [0, -4];
     widget.type = "hidden_" + widget.type;
+    // The legacy type-rename trick isn't honored by ComfyUI's newer frontend
+    // for native toggles (e.g. the BOOLEAN lock_brief checkbox), which leaves
+    // them rendered. `hidden` is the flag the modern frontend respects; set
+    // both so the widget stays out of the layout on old and new UIs alike.
+    widget.hidden = true;
     if (widget.element) widget.element.style.display = "none";
 }
 
